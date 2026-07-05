@@ -1,0 +1,21 @@
+[package]
+name = "sentinela-config"
+version = "0.1.0"
+description = "sentinela-config — the shikumi-typed config surface (mirrors the pleme.gitops nix option surface)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+shikumi = { git = "https://github.com/pleme-io/shikumi" }
+sentinela-core = { path = "../sentinela-core" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+serde_yaml = "0.9"

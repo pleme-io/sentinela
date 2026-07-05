@@ -1,0 +1,24 @@
+[package]
+name = "sentinela-core"
+version = "0.1.0"
+description = "sentinela-core — the injectable, testable algebra of the Darwin GitOps node-sync daemon (comin-parity)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `MockEnv` outside `cfg(test)` for integration tests + downstream
+# consumers that want to drive the FSM without side effects.
+mock = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
