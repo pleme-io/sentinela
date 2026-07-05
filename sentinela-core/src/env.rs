@@ -112,6 +112,8 @@ mod mock {
         probes: RefCell<std::collections::VecDeque<ProbeResult>>,
         build_result: RefCell<Result<(), EnvError>>,
         switch_result: RefCell<Result<Generation, EnvError>>,
+        persist_result: RefCell<Result<(), EnvError>>,
+        load_result: RefCell<Option<Result<ReceiptChain, EnvError>>>,
         chain: RefCell<ReceiptChain>,
         clock_ms: RefCell<u64>,
         pub builds: RefCell<Vec<Rev>>,
@@ -125,6 +127,8 @@ mod mock {
                 probes: RefCell::new(std::collections::VecDeque::new()),
                 build_result: RefCell::new(Ok(())),
                 switch_result: RefCell::new(Ok(Generation(1))),
+                persist_result: RefCell::new(Ok(())),
+                load_result: RefCell::new(None),
                 chain: RefCell::new(ReceiptChain::new()),
                 clock_ms: RefCell::new(0),
                 builds: RefCell::new(Vec::new()),
@@ -158,6 +162,20 @@ mod mock {
             *self.switch_result.borrow_mut() = r;
         }
 
+        /// Program the outcome of subsequent `persist_chain` calls (to
+        /// exercise the receipt-IO failure path — the persist-after-switch
+        /// hole the happy-path tests missed).
+        pub fn set_persist_result(&self, r: Result<(), EnvError>) {
+            *self.persist_result.borrow_mut() = r;
+        }
+
+        /// Force `load_chain` to return this exact result (to exercise a
+        /// chain-load error). When `None` (default), `load_chain` returns
+        /// the in-memory chain.
+        pub fn set_load_result(&self, r: Option<Result<ReceiptChain, EnvError>>) {
+            *self.load_result.borrow_mut() = r;
+        }
+
         /// Set the clock.
         pub fn set_now_ms(&self, ms: u64) {
             *self.clock_ms.borrow_mut() = ms;
@@ -189,10 +207,14 @@ mod mock {
         }
 
         fn load_chain(&self) -> Result<ReceiptChain, EnvError> {
+            if let Some(forced) = self.load_result.borrow().as_ref() {
+                return forced.clone();
+            }
             Ok(self.chain.borrow().clone())
         }
 
         fn persist_chain(&self, chain: &ReceiptChain) -> Result<(), EnvError> {
+            self.persist_result.borrow().clone()?;
             *self.persists.borrow_mut() += 1;
             *self.chain.borrow_mut() = chain.clone();
             Ok(())

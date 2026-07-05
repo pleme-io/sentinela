@@ -32,7 +32,7 @@
 //! - **receipt-before-idle** — a successful switch persists its receipt
 //!   before the tick returns; the persisted chain is the source of truth.
 
-use crate::env::{GitopsEnv, LoopConfig};
+use crate::env::{EnvError, GitopsEnv, LoopConfig};
 use crate::receipt::{Generation, Outcome, ReceiptChain};
 use crate::rev::Rev;
 
@@ -87,6 +87,13 @@ pub enum TickOutcome {
         built: Rev,
         /// The newer HEAD that superseded it mid-build.
         newer: Rev,
+    },
+    /// The post-build re-probe could not re-confirm HEAD (empty answer —
+    /// e.g. the branch was deleted/reset mid-build). Fail-closed: the
+    /// built rev was NOT activated; retry next cadence.
+    ReprobeInconclusive {
+        /// The rev that was built but not activated.
+        built: Rev,
     },
     /// The switch failed after a clean build; receipt recorded.
     SwitchFailed {
@@ -151,7 +158,7 @@ impl Sentinela {
         };
 
         // Diff — skip-if-unchanged against the last *activated* rev.
-        let chain = match env.load_chain() {
+        let mut chain = match env.load_chain() {
             Ok(c) => c,
             Err(e) => {
                 return self.fail_closed(env, TickOutcome::ProbeError { error: e.to_string() });
@@ -164,55 +171,95 @@ impl Sentinela {
         // Decide → build rev-pinned.
         if let Err(e) = env.build(&head) {
             let out = TickOutcome::BuildFailed { rev: head.clone(), error: e.to_string() };
-            self.record(env, chain, head, Outcome::Failed { error: e.to_string() });
+            // Best-effort attest (the system is unchanged, so a persist
+            // failure here corrupts nothing).
+            let _ = self.record(&mut chain, env, head, Outcome::Failed { error: e.to_string() });
             return self.enter_cooldown(env, out);
         }
 
-        // Post-build freshness re-check (no-downgrade). If HEAD moved
-        // during the build, defer — never activate a now-stale rev.
+        // Post-build freshness re-check (no-downgrade + fail-closed). We
+        // activate ONLY when the re-probe re-confirms HEAD == the rev we
+        // just built. A moved HEAD, a vanished branch, or a probe error
+        // must NOT activate a rev we can no longer confirm is HEAD.
         match env.probe_head() {
-            Ok(Some(newer)) if newer != head => {
+            // Re-confirmed still HEAD → fall through to activation.
+            Ok(Some(confirmed)) if confirmed == head => {}
+            // HEAD moved during the build → defer; the newer rev deploys
+            // next tick (no cooldown — deferral is not a failure).
+            Ok(Some(newer)) => {
                 let out = TickOutcome::Deferred { built: head.clone(), newer: newer.clone() };
-                self.record(env, chain, head, Outcome::Deferred { newer });
-                // Deferral is not a failure — deploy the newer rev next
-                // tick on the normal cadence (no cooldown).
+                let _ = self.record(&mut chain, env, head, Outcome::Deferred { newer });
                 self.state = State::Idle;
                 return out;
             }
-            // HEAD unchanged, still Some(head): proceed. A re-probe error
-            // or empty answer is treated conservatively as "unchanged"
-            // (we already have a good build of `head`); activation
-            // proceeds because the pre-build probe succeeded.
-            _ => {}
+            // Empty re-probe (branch deleted/reset mid-build). Fail-closed:
+            // cannot confirm HEAD → do not activate. Retry next cadence
+            // (transient branch state, no cooldown).
+            Ok(None) => {
+                tracing::warn!(
+                    rev = head.short(),
+                    "post-build re-probe empty — not activating (fail-closed)"
+                );
+                self.state = State::Idle;
+                return TickOutcome::ReprobeInconclusive { built: head };
+            }
+            // Re-probe errored → cannot confirm freshness. Fail-closed +
+            // cooldown (a health problem that must back off, symmetric with
+            // build/switch failures).
+            Err(e) => {
+                return self.enter_cooldown(env, TickOutcome::ProbeError { error: e.to_string() });
+            }
         }
 
-        // Act → switch.
+        // Act → switch (re-check confirmed head is still HEAD).
         match env.switch(&head) {
             Ok(generation) => {
-                // Attest before idle — the receipt is recorded (and
-                // persisted) before the tick returns Deployed.
-                self.record(env, chain, head.clone(), Outcome::Activated { generation });
-                self.state = State::Idle;
-                TickOutcome::Deployed { rev: head, generation }
+                // Attest before idle. A persist failure would leave the
+                // on-disk chain behind the real system → a re-deploy loop
+                // on the next skip-if-unchanged check; treat it as a
+                // (cooling-down) failure, never a silent Deployed.
+                match self.record(&mut chain, env, head.clone(), Outcome::Activated { generation }) {
+                    Ok(()) => {
+                        self.state = State::Idle;
+                        TickOutcome::Deployed { rev: head, generation }
+                    }
+                    Err(e) => {
+                        let out = TickOutcome::SwitchFailed {
+                            rev: head.clone(),
+                            error: ["activated, but receipt persist failed: ", &e.to_string()]
+                                .concat(),
+                        };
+                        self.enter_cooldown(env, out)
+                    }
+                }
             }
             Err(e) => {
                 let out = TickOutcome::SwitchFailed { rev: head.clone(), error: e.to_string() };
-                self.record(env, chain, head, Outcome::Failed { error: e.to_string() });
+                let _ = self.record(&mut chain, env, head, Outcome::Failed { error: e.to_string() });
                 self.enter_cooldown(env, out)
             }
         }
     }
 
-    /// Append `outcome` for `rev` to `chain` and persist. Best-effort:
-    /// a persist failure is logged, never fatal (the next tick reloads).
-    fn record<E: GitopsEnv>(&self, env: &E, mut chain: ReceiptChain, rev: Rev, outcome: Outcome) {
+    /// Append `outcome` for `rev` to `chain` and persist. Returns the
+    /// persist result so the caller can distinguish a durable receipt
+    /// (safe to report Deployed + idle) from a persist failure (the chain
+    /// would fall behind the real system → must cool down, never loop).
+    ///
+    /// # Errors
+    /// The [`EnvError`] from `persist_chain`.
+    fn record<E: GitopsEnv>(
+        &self,
+        chain: &mut ReceiptChain,
+        env: &E,
+        rev: Rev,
+        outcome: Outcome,
+    ) -> Result<(), EnvError> {
         let receipt = chain.next_receipt(rev, outcome, env.now_unix_ms());
-        // `append` cannot fail here — `next_receipt` builds a correctly
-        // linked receipt for this exact chain.
+        // `append` cannot fail — `next_receipt` builds a correctly linked
+        // receipt for this exact chain.
         let _ = chain.append(receipt);
-        if let Err(e) = env.persist_chain(&chain) {
-            tracing::error!(error = %e, "sentinela: failed to persist receipt chain");
-        }
+        env.persist_chain(chain)
     }
 
     /// Fail-closed helper for probe/load errors: enter cooldown, return
@@ -354,6 +401,90 @@ mod tests {
             s.tick(&env),
             TickOutcome::Deployed { rev: rev(1), generation: Generation(1) }
         );
+    }
+
+    #[test]
+    fn persist_failure_after_switch_cools_down_and_does_not_loop() {
+        // The critical hole the happy-path tests missed: a switch succeeds
+        // but the receipt cannot be persisted. Must NOT return Deployed
+        // (which would let skip-if-unchanged re-deploy forever); must cool
+        // down and surface the failure.
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.set_persist_result(Err(EnvError::ReceiptIo("disk full".into())));
+        env.set_now_ms(1_000);
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        // Switch ran, but the outcome is a cooling-down failure, not Deployed.
+        assert_eq!(*env.switches.borrow(), vec![rev(1)]);
+        assert!(matches!(out, TickOutcome::SwitchFailed { .. }), "got {out:?}");
+        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 2_000 });
+        // The chain was NOT advanced (persist failed) — so no false
+        // "already deployed" claim next tick.
+        assert!(env.chain().last_activated_rev().is_none());
+    }
+
+    #[test]
+    fn reprobe_error_after_build_fails_closed_and_cools_down() {
+        // Pre-build probe ok (rev 1); post-build re-probe errors. Must NOT
+        // switch (can't confirm freshness) and must cool down.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Err(EnvError::ProbeFailed("timeout".into())),
+        ]);
+        env.set_now_ms(3_000);
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        assert_eq!(*env.builds.borrow(), vec![rev(1)]);
+        assert!(env.switches.borrow().is_empty(), "must not activate when re-probe is uncertain");
+        assert!(matches!(out, TickOutcome::ProbeError { .. }));
+        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 4_000 });
+    }
+
+    #[test]
+    fn reprobe_empty_after_build_is_inconclusive_no_switch() {
+        // Post-build re-probe returns None (branch vanished/reset). Must
+        // NOT activate; retry next cadence (no cooldown).
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(None)]);
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        assert_eq!(*env.builds.borrow(), vec![rev(1)]);
+        assert!(env.switches.borrow().is_empty(), "must not activate an unconfirmable rev");
+        assert_eq!(out, TickOutcome::ReprobeInconclusive { built: rev(1) });
+        assert_eq!(s.state(), &State::Idle);
+    }
+
+    #[test]
+    fn chain_load_error_fails_closed_and_cools_down() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1)))]);
+        env.set_load_result(Some(Err(EnvError::ReceiptIo("corrupt".into()))));
+        env.set_now_ms(500);
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        assert!(env.builds.borrow().is_empty(), "a chain-load error deploys nothing");
+        assert!(env.switches.borrow().is_empty());
+        assert!(matches!(out, TickOutcome::ProbeError { .. }));
+        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 1_500 });
+    }
+
+    #[test]
+    fn failed_rev_retries_the_same_rev_after_cooldown() {
+        // A build failure records a Failed receipt + cools down; once the
+        // cooldown elapses the SAME rev is retried (skip-if-unchanged does
+        // not fire, because the last *activated* rev is still None).
+        let env = MockEnv::default();
+        env.push_probe(Ok(Some(rev(1)))); // tick 1: build fails
+        env.set_build_result(Err(EnvError::BuildFailed("transient".into())));
+        env.set_now_ms(0);
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::BuildFailed { .. }));
+        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 1_000 });
+        // Cooldown elapses; build now succeeds → same rev deploys.
+        env.set_build_result(Ok(()));
+        env.set_now_ms(1_000);
+        env.push_probe(Ok(Some(rev(1)))); // pre-build
+        env.push_probe(Ok(Some(rev(1)))); // re-probe
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(1)));
+        assert_eq!(env.chain().last_activated_rev(), Some(&rev(1)));
     }
 
     #[test]

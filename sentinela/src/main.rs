@@ -98,6 +98,9 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::Deferred { built, newer } => {
             tracing::info!(built = built.short(), newer = newer.short(), "deferred (HEAD moved mid-build)");
         }
+        TickOutcome::ReprobeInconclusive { built } => {
+            tracing::warn!(built = built.short(), "post-build re-probe empty — not activated (fail-closed)");
+        }
         TickOutcome::Unresolvable => tracing::warn!("HEAD unresolvable (fail-closed)"),
         TickOutcome::ProbeError { error } => tracing::warn!(%error, "probe error (fail-closed)"),
         TickOutcome::BuildFailed { rev, error } => {
