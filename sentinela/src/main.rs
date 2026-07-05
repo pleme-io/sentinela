@@ -39,6 +39,9 @@ enum Cmd {
     Status,
     /// Verify the receipt chain; exit non-zero if broken.
     Verify,
+    /// Resolve the configured branch HEAD (git ls-remote) and print it —
+    /// no build, no switch. A safe dry-run of the probe half.
+    Probe,
     /// Run exactly one cycle and print the typed outcome, then exit.
     TickOnce,
 }
@@ -64,7 +67,27 @@ fn main() -> std::process::ExitCode {
         Cmd::Run => run(cfg),
         Cmd::Status => status(&cfg),
         Cmd::Verify => verify(&cfg),
+        Cmd::Probe => probe(&cfg),
         Cmd::TickOnce => tick_once(&cfg),
+    }
+}
+
+/// Resolve + print the branch HEAD (no build/switch) — a safe dry-run.
+fn probe(cfg: &SentinelaConfig) -> std::process::ExitCode {
+    let env = RealEnv::new(cfg.clone());
+    match env.probe_head() {
+        Ok(Some(rev)) => {
+            println!("{rev}");
+            std::process::ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            tracing::warn!(branch = %cfg.rev_probe.branch, "HEAD unresolvable (empty ls-remote)");
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "probe failed");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
