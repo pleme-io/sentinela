@@ -104,6 +104,36 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     let env = RealEnv::new(cfg);
     let mut sentinela = Sentinela::new(loop_cfg);
     tracing::info!(poll_seconds = poll.as_secs(), "sentinela: daemon started");
+
+    // ── ★ ANNOUNCE THE STREAK AT STARTUP ──────────────────────────────────
+    // A restart is the one moment we are guaranteed to write to the log, so
+    // it is the moment to say whether this loop has been WORKING. Without
+    // this the only startup evidence is "daemon started", which reads
+    // identically whether the last tick activated cleanly or the last four
+    // thousand failed. MEASURED on ryn 2026-08-02: 4136 consecutive
+    // failures across 27.9 days, and 15 `daemon started` lines in that same
+    // log — every restart had the number available and printed none of it.
+    match env.load_chain() {
+        Ok(chain) => {
+            let streak = chain.consecutive_failures();
+            let last_ok = chain
+                .last_activated_rev()
+                .map_or_else(|| "never".to_owned(), |r| r.short().to_owned());
+            if streak == 0 {
+                tracing::info!(last_activated = %last_ok, "gitops: converged");
+            } else {
+                tracing::error!(
+                    consecutive_failures = streak,
+                    last_activated = %last_ok,
+                    "gitops: DEGRADED — this node is not tracking the branch"
+                );
+            }
+        }
+        // Unreadable chain is itself worth saying out loud: it means the
+        // audit trail — the only durable record of whether we converge —
+        // cannot be consulted.
+        Err(e) => tracing::error!(error = %e, "gitops: receipt chain unreadable"),
+    }
     loop {
         let outcome = sentinela.tick(&env);
         log_outcome(&outcome);
