@@ -120,6 +120,25 @@ impl ReceiptChain {
             .map(|r| &r.rev)
     }
 
+    /// How many receipts at the tail of the chain are *not* activations —
+    /// the current unbroken failure streak. `0` when the head activated
+    /// cleanly (or the chain is empty).
+    ///
+    /// This is the number that makes a silent reconciler loud. A daemon
+    /// failing every tick looks exactly like a quiet healthy one from the
+    /// outside: same empty terminal, same absent alert. MEASURED on ryn
+    /// 2026-08-02, this chain read 4136 failed / 1 activated across 27.9
+    /// days — every tick since seq 0 had failed and nothing said so.
+    /// Report it wherever an operator already looks.
+    #[must_use]
+    pub fn consecutive_failures(&self) -> usize {
+        self.entries
+            .iter()
+            .rev()
+            .take_while(|r| !r.is_activated())
+            .count()
+    }
+
     /// Number of receipts.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -238,6 +257,31 @@ mod tests {
         c.append(c.next_receipt(rev(3), Outcome::Deferred { newer: rev(4) }, 3)).unwrap();
         // The last *activated* rev is still rev(1), not the failed/deferred later ones.
         assert_eq!(c.last_activated_rev().unwrap(), &rev(1));
+    }
+
+    #[test]
+    fn consecutive_failures_counts_the_tail_streak_only() {
+        let mut c = ReceiptChain::new();
+        assert_eq!(c.consecutive_failures(), 0, "empty chain has no streak");
+
+        c.append(c.next_receipt(rev(1), Outcome::Failed { error: "a".into() }, 1)).unwrap();
+        c.append(c.next_receipt(rev(2), Outcome::Failed { error: "b".into() }, 2)).unwrap();
+        assert_eq!(c.consecutive_failures(), 2);
+
+        // An activation resets the streak — this is the whole point: the
+        // number must fall to 0 the moment the loop recovers, or a stale
+        // alarm trains the operator to ignore it.
+        c.append(c.next_receipt(rev(3), Outcome::Activated { generation: Generation(3) }, 3)).unwrap();
+        assert_eq!(c.consecutive_failures(), 0);
+
+        // Only the TAIL streak counts, not the two failures before rev(3).
+        c.append(c.next_receipt(rev(4), Outcome::Failed { error: "c".into() }, 4)).unwrap();
+        assert_eq!(c.consecutive_failures(), 1);
+
+        // Deferred is not an activation, so it extends the streak rather
+        // than clearing it — a deferral means nothing was deployed.
+        c.append(c.next_receipt(rev(5), Outcome::Deferred { newer: rev(6) }, 5)).unwrap();
+        assert_eq!(c.consecutive_failures(), 2);
     }
 
     #[test]

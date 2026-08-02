@@ -156,6 +156,7 @@ fn status(cfg: &SentinelaConfig) -> std::process::ExitCode {
         "flake_url": cfg.flake_url,
         "branch": cfg.rev_probe.branch,
         "receipts": chain.len(),
+        "consecutive_failures": chain.consecutive_failures(),
         "chain_verified": verified,
         "last_activated_rev": chain.last_activated_rev().map(sentinela_core::Rev::as_str),
         "head": chain.head(),
