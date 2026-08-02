@@ -12,6 +12,7 @@
 
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{EnvError, Generation, GitopsEnv, ReceiptChain, Rev};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,6 +101,32 @@ impl RealEnv {
         // under every launcher — plist, `sentinela run` by hand, a test
         // harness — instead of only the one plist we happen to ship.
         cmd.current_dir(self.rebuild_cwd());
+        // ── ★ DETACH: THE SWITCH OUTLIVES US ON PURPOSE ──────────────────
+        // We are a launchd job, and the activation we spawn will reach
+        // nix-darwin's "setting up launchd services" step, which for a
+        // generation that changes OUR OWN plist does:
+        //     launchctl unload <our plist>   # kills this job's process tree
+        //     cp -f <new plist> ...          # never reached
+        //     launchctl load -w <new plist>  # never reached
+        // As a CHILD of that job, darwin-rebuild is killed mid-activation —
+        // so the machine is left half-switched, the plist is never
+        // replaced, and the daemon is never re-bootstrapped. It stays down
+        // silently until someone runs `launchctl bootstrap` by hand.
+        //
+        // OBSERVED on ryn 2026-08-02: stderr ends abruptly at
+        // "user defaults..." — the step immediately before launchd
+        // services — with 15 `daemon started` entries recording the
+        // restart loop that produced. sentinela could never deploy a
+        // generation that updated sentinela.
+        //
+        // Its own process group takes the child out of the tree launchd
+        // reaps, so the activation runs to completion and the new plist is
+        // installed even though we die partway through. We lose only the
+        // receipt for that tick: the next start re-probes, sees the rev is
+        // still not the last ACTIVATED one, and converges again — this
+        // time without a plist change, so it survives and attests. One
+        // extra cycle, self-healing, instead of a wedged loop.
+        cmd.process_group(0);
         for a in &self.cfg.extra_rebuild_args {
             cmd.arg(a);
         }
