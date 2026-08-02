@@ -173,7 +173,7 @@ impl Sentinela {
             let out = TickOutcome::BuildFailed { rev: head.clone(), error: e.to_string() };
             // Best-effort attest (the system is unchanged, so a persist
             // failure here corrupts nothing).
-            let _ = self.record(&mut chain, env, head, Outcome::Failed { error: e.to_string() });
+            let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
             return self.enter_cooldown(env, out);
         }
 
@@ -235,7 +235,7 @@ impl Sentinela {
             }
             Err(e) => {
                 let out = TickOutcome::SwitchFailed { rev: head.clone(), error: e.to_string() };
-                let _ = self.record(&mut chain, env, head, Outcome::Failed { error: e.to_string() });
+                let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
                 self.enter_cooldown(env, out)
             }
         }

@@ -19,16 +19,63 @@ impl std::fmt::Display for Generation {
     }
 }
 
+/// Ceiling on the error text one failed receipt retains.
+///
+/// ── ★ WHY A FAILING LOOP MUST NOT WRITE ITS OWN WEIGHT TO DISK ──────────
+/// The chain is append-only and never pruned — pruning the front would
+/// break the BLAKE3 links that make it tamper-evident, which is the whole
+/// point of it. So every byte written is permanent, and an unbounded error
+/// string means a *failing* loop grows the chain fastest.
+///
+/// MEASURED on ryn 2026-08-02: 4136 consecutive failures, each embedding a
+/// full multi-line nix error, produced a **31 MB** receipts.json (~7.5 KB
+/// per receipt). `sentinela status` parses all of it on every call, and
+/// that call is now on the `fleet rebuild` path — so the outage was also
+/// quietly taxing every rebuild.
+///
+/// A nix failure puts its signal in the first lines; the tail is store
+/// paths and dependency chatter already reproducible from the rev. 2 KiB
+/// keeps the diagnosis and drops the bulk.
+pub const MAX_ERROR_BYTES: usize = 2048;
+
 /// The result of a deploy attempt, as recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Outcome {
     /// Activated cleanly to this generation.
     Activated { generation: Generation },
-    /// The build or activation failed (message retained).
+    /// The build or activation failed (message retained, bounded — build
+    /// via [`Outcome::failed`] rather than constructing this directly).
     Failed { error: String },
     /// A newer HEAD landed mid-build; this rev was deferred, not activated.
     Deferred { newer: Rev },
+}
+
+impl Outcome {
+    /// A `Failed` outcome whose retained text is bounded to
+    /// [`MAX_ERROR_BYTES`], truncated on a char boundary with an explicit
+    /// marker so a reader knows the text was cut rather than that the build
+    /// stopped talking.
+    ///
+    /// TIER: only-mitigated, not unrepresentable — `Failed { error }` stays
+    /// publicly constructible (tests build it directly), so this bounds the
+    /// production path rather than making an oversized receipt impossible.
+    #[must_use]
+    pub fn failed(error: impl Into<String>) -> Self {
+        let mut e: String = error.into();
+        if e.len() > MAX_ERROR_BYTES {
+            // Walk back to a char boundary; `floor_char_boundary` is still
+            // unstable, so do it by hand rather than risk a panic on a
+            // multi-byte split.
+            let mut cut = MAX_ERROR_BYTES;
+            while cut > 0 && !e.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            e.truncate(cut);
+            e.push_str("\n… [truncated]");
+        }
+        Self::Failed { error: e }
+    }
 }
 
 /// One entry in the deploy chain.
@@ -257,6 +304,36 @@ mod tests {
         c.append(c.next_receipt(rev(3), Outcome::Deferred { newer: rev(4) }, 3)).unwrap();
         // The last *activated* rev is still rev(1), not the failed/deferred later ones.
         assert_eq!(c.last_activated_rev().unwrap(), &rev(1));
+    }
+
+    #[test]
+    fn failed_bounds_the_retained_error_text() {
+        // The real shape: 4136 of these, each holding a full nix error,
+        // made a 31 MB append-only chain that can never be pruned.
+        let huge = "error: builder failed\n".repeat(5000);
+        assert!(huge.len() > MAX_ERROR_BYTES * 10);
+        let Outcome::Failed { error } = Outcome::failed(huge) else {
+            panic!("must stay a Failed outcome");
+        };
+        assert!(error.len() <= MAX_ERROR_BYTES + 32, "got {} bytes", error.len());
+        // The diagnosis survives; only the bulk is dropped.
+        assert!(error.starts_with("error: builder failed"));
+        assert!(error.ends_with("… [truncated]"), "cut must be explicit");
+    }
+
+    #[test]
+    fn failed_leaves_short_errors_untouched_and_never_splits_a_char() {
+        let short = Outcome::failed("boom");
+        assert_eq!(short, Outcome::Failed { error: "boom".to_owned() });
+
+        // A multi-byte char straddling the cut must not panic or produce
+        // invalid UTF-8 — the reason the boundary walk is hand-rolled.
+        let multi = "é".repeat(MAX_ERROR_BYTES);
+        let Outcome::Failed { error } = Outcome::failed(multi) else {
+            panic!("must stay a Failed outcome");
+        };
+        assert!(error.len() <= MAX_ERROR_BYTES + 32);
+        assert!(std::str::from_utf8(error.as_bytes()).is_ok());
     }
 
     #[test]

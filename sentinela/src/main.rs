@@ -119,7 +119,16 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
             let last_ok = chain
                 .last_activated_rev()
                 .map_or_else(|| "never".to_owned(), |r| r.short().to_owned());
-            if streak == 0 {
+            // An empty chain has a zero streak, so a naive `streak == 0`
+            // reports a loop that has NEVER deployed as converged. Absence
+            // of failure is not evidence of convergence; only an activation
+            // is. Seen for real on cid 2026-08-02, freshly migrated onto
+            // this engine: receipts=0, streak=0, last_activated=never.
+            if chain.is_empty() {
+                tracing::warn!(
+                    "gitops: no deploy recorded yet — expected on a freshly-enrolled node"
+                );
+            } else if streak == 0 {
                 tracing::info!(last_activated = %last_ok, "gitops: converged");
             } else {
                 tracing::error!(
