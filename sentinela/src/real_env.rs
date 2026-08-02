@@ -67,10 +67,39 @@ impl RealEnv {
         }
     }
 
+    /// Where `darwin-rebuild` is run from. See [`Self::run_darwin_rebuild`]
+    /// — this is load-bearing, not incidental.
+    fn rebuild_cwd(&self) -> &Path {
+        Path::new(&self.cfg.state_dir)
+    }
+
     fn run_darwin_rebuild(&self, verb: &str, rev: &Rev) -> Result<std::process::Output, EnvError> {
         let flake_ref = self.flake_ref(rev);
         let mut cmd = Command::new(DARWIN_REBUILD);
         cmd.arg(verb).arg("--flake").arg(&flake_ref);
+        // ── ★ THE REBUILD MUST RUN FROM A WRITABLE DIRECTORY ──────────────
+        // `darwin-rebuild` appends `--no-link` for every action EXCEPT
+        // `build`, so `build` alone drops a `./result` symlink into the
+        // process's cwd. A launchd daemon with no `WorkingDirectory` key
+        // inherits cwd `/` — the read-only macOS system volume — so the
+        // build succeeds and then dies placing the symlink:
+        //     error: creating symlink '/result.tmp-79472-16807'
+        //       -> '/nix/store/…-darwin-system-25.11…': Read-only file system
+        //
+        // MEASURED on ryn 2026-08-02: the closure built correctly and was
+        // byte-identical to the generation a manual `nix run .#rebuild` had
+        // just activated. Only placing the symlink failed — so this reads as
+        // "build failed" in the receipt chain while the build was in fact
+        // fine, which is why it survived so long undiagnosed.
+        //
+        // Passing `--no-link` ourselves is NOT an option: darwin-rebuild's
+        // argument parser ends in a catch-all that rejects anything it does
+        // not recognize (`unknown option '--no-link'`, exit 1), and it does
+        // not forward that flag. Anchoring cwd is the fix, and it belongs
+        // HERE rather than in the launchd plist so the daemon is correct
+        // under every launcher — plist, `sentinela run` by hand, a test
+        // harness — instead of only the one plist we happen to ship.
+        cmd.current_dir(self.rebuild_cwd());
         for a in &self.cfg.extra_rebuild_args {
             cmd.arg(a);
         }
@@ -255,6 +284,30 @@ mod tests {
         assert_eq!(
             env.flake_ref(&rev),
             "github:pleme-io/nix/0123456789abcdef0123456789abcdef01234567#ryn"
+        );
+    }
+
+    #[test]
+    fn rebuild_cwd_is_the_state_dir_never_the_inherited_root() {
+        // `darwin-rebuild build` writes a `./result` symlink into its cwd,
+        // and a launchd daemon inherits cwd `/`, which is read-only on
+        // macOS. The rebuild therefore has to be anchored to a directory we
+        // know is writable — the state dir we already own.
+        //
+        // HONEST SCOPE: this pins the helper, not the `Command` wiring.
+        // Deleting the `cmd.current_dir(...)` call in `run_darwin_rebuild`
+        // would still pass, because a `Command`'s cwd is not observable
+        // without spawning `darwin-rebuild` for real. Tier: only-mitigated.
+        let cfg = SentinelaConfig {
+            state_dir: "/var/log/pleme-gitops".to_owned(),
+            ..SentinelaConfig::default()
+        };
+        let env = RealEnv::new(cfg);
+        assert_eq!(env.rebuild_cwd(), Path::new("/var/log/pleme-gitops"));
+        assert_ne!(
+            env.rebuild_cwd(),
+            Path::new("/"),
+            "cwd `/` is the read-only system volume — the bug this guards"
         );
     }
 }
