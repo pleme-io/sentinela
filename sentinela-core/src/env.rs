@@ -24,6 +24,14 @@ pub enum EnvError {
     /// `darwin-rebuild switch` failed for the rev.
     #[error("switch failed: {0}")]
     SwitchFailed(String),
+    /// The machine-wide rebuild lock (`/tmp/fleet-rebuild.lock`, shared with
+    /// `fleet rebuild`) is held by another process — an operator rebuild is
+    /// in progress. The payload names the holder. NOT a failure: the FSM
+    /// defers the switch (no receipt, no cooldown) and retries on a bounded
+    /// cadence, so the daemon stands aside while the operator owns the
+    /// machine instead of racing their activation state.
+    #[error("switch deferred: another rebuild holds the machine lock ({0})")]
+    SwitchBusy(String),
     /// Reading or writing the receipt chain failed.
     #[error("receipt store io: {0}")]
     ReceiptIo(String),

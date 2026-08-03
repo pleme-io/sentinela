@@ -102,6 +102,16 @@ pub enum TickOutcome {
         /// The switch error message.
         error: String,
     },
+    /// The switch was NOT attempted: an operator `fleet rebuild` holds the
+    /// machine-wide rebuild lock, so this tick stood aside. Not a failure —
+    /// no receipt, no cooldown — just a courtesy deferral that converges
+    /// the moment the operator finishes. The built rev stays pending.
+    SwitchDeferred {
+        /// The rev that was built and is awaiting its switch.
+        rev: Rev,
+        /// Who holds the machine lock (`pid N · user` from the lock file).
+        holder: String,
+    },
     /// Activated a rev that is a verified ANCESTOR of the current HEAD —
     /// the starvation escape. Forward progress, deliberately not the newest
     /// rev; the next tick converges toward `newer`.
@@ -137,6 +147,7 @@ impl TickOutcome {
             Self::Deferred { .. } => "deferred",
             Self::ReprobeInconclusive { .. } => "reprobeInconclusive",
             Self::SwitchFailed { .. } => "switchFailed",
+            Self::SwitchDeferred { .. } => "switchDeferred",
             Self::DeployedBehind { .. } => "deployedBehind",
             Self::Deployed { .. } => "deployed",
         }
@@ -169,6 +180,17 @@ impl TickOutcome {
         /// churn loop. One second keeps the fast path fast and still bounds
         /// the worst case to something a human can see in the log.
         const DEFERRED_RETRY_SECS: u64 = 1;
+        /// A lock-held deferral retries slower than a branch deferral. The
+        /// two share the "converge soon" shape, but a `Deferred` waits on a
+        /// NEWER rev (each retry builds fresh work) while a
+        /// `SwitchDeferred` waits on the OPERATOR's lock — the rev is
+        /// unchanged, so a 1s retry would re-run the same cache-hit build
+        /// dozens of times a minute for the whole operator hold. An operator
+        /// rebuild owns the machine for minutes; 30s bounds that churn to a
+        /// couple of builds a minute and still converges within half a
+        /// minute of them finishing. A bound, not a preference — see the
+        /// `next_delay` doc.
+        const SWITCH_DEFERRED_RETRY_SECS: u64 = 30;
 
         let poll = std::time::Duration::from_secs(cfg.poll_seconds.max(1));
         match self {
@@ -176,6 +198,9 @@ impl TickOutcome {
             // so converge toward it now rather than after a full poll.
             Self::Deferred { .. } | Self::DeployedBehind { .. } => {
                 std::time::Duration::from_secs(DEFERRED_RETRY_SECS)
+            }
+            Self::SwitchDeferred { .. } => {
+                std::time::Duration::from_secs(SWITCH_DEFERRED_RETRY_SECS)
             }
             // Everything else waits a normal cycle. Note `CoolingDown` is
             // deliberately NOT lengthened here: the cooldown is a gate inside
@@ -209,6 +234,7 @@ impl TickOutcome {
             Self::Unchanged { rev }
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
+            | Self::SwitchDeferred { rev, .. }
             | Self::Deployed { rev, .. } => Some(rev),
             Self::Deferred { newer, .. } | Self::DeployedBehind { newer, .. } => Some(newer),
             Self::ReprobeInconclusive { built } => Some(built),
@@ -510,6 +536,20 @@ impl Sentinela {
                     }
                 }
             }
+            Err(EnvError::SwitchBusy(holder)) => {
+                // NOT a failure: an operator `fleet rebuild` owns the
+                // machine-wide rebuild lock right now. Stand aside — no
+                // receipt (nothing changed), no cooldown (nothing broke) —
+                // and retry on the bounded deferral cadence so the rev
+                // converges the moment the operator finishes.
+                tracing::info!(
+                    rev = rev.short(),
+                    holder = %holder,
+                    "switch deferred: another rebuild holds the machine lock"
+                );
+                self.state = State::Idle;
+                TickOutcome::SwitchDeferred { rev, holder }
+            }
             Err(e) => {
                 let out = TickOutcome::SwitchFailed {
                     rev: rev.clone(),
@@ -653,6 +693,15 @@ mod tests {
                 }),
                 "switchFailed",
                 Some(rev(6)),
+            ),
+            (
+                Box::new(|| {
+                    let e = MockEnv::with_probes(vec![Ok(Some(rev(7))), Ok(Some(rev(7)))]);
+                    e.set_switch_result(Err(EnvError::SwitchBusy("pid 42 · drzzln".into())));
+                    e
+                }),
+                "switchDeferred",
+                Some(rev(7)),
             ),
         ];
 
@@ -1066,6 +1115,74 @@ mod tests {
             &State::CoolingDown {
                 until_unix_ms: 21_000
             }
+        );
+    }
+
+    #[test]
+    fn a_lock_contended_switch_defers_instead_of_failing() {
+        // The operator owns the machine-wide rebuild lock. The daemon must
+        // stand aside — a deferral, not a failure: no receipt (nothing was
+        // attempted), no cooldown (nothing broke), state stays Idle so the
+        // next tick converges the moment the operator finishes.
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.set_switch_result(Err(EnvError::SwitchBusy("pid 42 · drzzln".into())));
+        env.set_now_ms(30_000);
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        assert_eq!(
+            out,
+            TickOutcome::SwitchDeferred {
+                rev: rev(1),
+                holder: "pid 42 · drzzln".into()
+            }
+        );
+        // The built rev WAS built (that is how we reached the switch).
+        assert_eq!(*env.builds.borrow(), vec![rev(1)]);
+        // The switch was ATTEMPTED (that is how the lock was found busy) —
+        // but no activation happened (the outcome is a deferral, never
+        // Deployed/DeployedBehind) and nothing was recorded.
+        assert_eq!(*env.switches.borrow(), vec![rev(1)], "switch attempted once");
+        assert!(env.chain().head().is_none(), "no receipt for a non-switch");
+        assert_eq!(
+            s.state(),
+            &State::Idle,
+            "lock contention is not a failure — no cooldown"
+        );
+        // The cadence is a bounded deferral, not the failure cooldown: a
+        // lock-held switch must retry well before a full poll, but not
+        // hammer the same cache-hit build at the 1s branch-race rate.
+        let c = cfg();
+        let delay = out.next_delay(&c);
+        assert!(
+            delay < std::time::Duration::from_secs(c.poll_seconds),
+            "a contended switch must retry soon, not wait a full poll"
+        );
+        assert!(
+            delay >= std::time::Duration::from_secs(1),
+            "a contended switch must not spin at the branch-race rate"
+        );
+    }
+
+    #[test]
+    fn a_lock_contended_switch_does_not_count_as_a_failure() {
+        // Two consecutive operator-holds must not trip the failure gate: the
+        // chain (the source of the `consecutive_failures` verdict) carries
+        // no Failed receipt for either, so the node is still "not broken,
+        // just standing aside".
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+        ]);
+        env.set_switch_result(Err(EnvError::SwitchBusy("pid 42 · drzzln".into())));
+        let mut s = Sentinela::new(cfg());
+        assert_eq!(s.tick(&env).kind(), "switchDeferred");
+        assert_eq!(s.tick(&env).kind(), "switchDeferred");
+        assert_eq!(
+            env.chain().consecutive_failures(),
+            0,
+            "a held lock is not a failure"
         );
     }
 

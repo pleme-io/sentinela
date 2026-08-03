@@ -1,2 +1,5 @@
 /target
 result
+
+# per-member target dirs (workspace uses root target/)
+**/target

@@ -12,6 +12,9 @@
 
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, Rev};
+use std::fs::File;
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,6 +26,24 @@ const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 /// `darwin-rebuild` from the running system (root, no sudo needed under
 /// the launchd daemon).
 const DARWIN_REBUILD: &str = "/run/current-system/sw/bin/darwin-rebuild";
+
+/// The one machine-wide rebuild lock — THE SAME absolute path `fleet
+/// rebuild` uses (`pleme-io/fleet/src/commands/rebuild.rs`), so an
+/// operator rebuild and the daemon's switch serialize against each other
+/// instead of racing activation state (the sops-nix `/run/secrets.d`
+/// generation-cleanup race fleet's lock documents).
+///
+/// ── ★ ABSOLUTE ON PURPOSE — `temp_dir()` SERIALIZES NOTHING ────────────
+/// macOS gives every user a per-user `$TMPDIR`, so `temp_dir()` resolves a
+/// DIFFERENT file per user and the "shared" lock serializes one user's
+/// shell sessions only. The root daemon's launchd job sets no `TMPDIR`, so
+/// it resolved yet another path — the exact race this lock exists to close
+/// was running with no contention at all (measured on ryn 2026-08-02, fully
+/// documented in fleet's `REBUILD_LOCK_PATH`). `/tmp` is the one
+/// machine-wide writable directory; `/private/tmp` is mode `1777` (sticky,
+/// world-writable), so both root and the operator can create and open this
+/// file and neither can unlink the other's.
+const REBUILD_LOCK_PATH: &str = "/tmp/fleet-rebuild.lock";
 
 /// The production environment. Owns the config; the receipt chain lives
 /// at `<state_dir>/receipts.json`.
@@ -268,6 +289,23 @@ impl GitopsEnv for RealEnv {
     }
 
     fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {
+        // ── ★ THE MACHINE-WIDE REBUILD LOCK, TAKEN ONLY FOR THE SWITCH ──
+        // An operator `fleet rebuild` holds `/tmp/fleet-rebuild.lock` for
+        // its whole build+switch, so a daemon switch and an operator switch
+        // must serialize: two concurrent activations raced on sops-nix's
+        // `/run/secrets.d/<generation>/` cleanup (the receipt fleet's lock
+        // documents). Fail-fast on contention — the FSM defers the tick and
+        // retries on its bounded cadence instead of this process blocking.
+        //
+        // HONEST RESIDUAL: the flock dies with us. If the launchd job is
+        // killed mid-switch (its own plist changing, the one path where
+        // `run_darwin_rebuild` detaches the child), the lock drops while the
+        // detached activation is still running — a window an operator switch
+        // could race. Rare (only on plist-changing generations), and the
+        // next tick re-converges; documented rather than engineered around,
+        // because fixing it would require holding the lock in a child we
+        // deliberately orphan.
+        let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
         let out = self.run_darwin_rebuild("switch", rev)?;
         if !out.status.success() {
             return Err(EnvError::SwitchFailed(
@@ -320,6 +358,62 @@ impl GitopsEnv for RealEnv {
 }
 
 // ── pure decision helpers (unit-tested; the impure methods wrap these) ──
+
+/// Acquire the machine-wide rebuild lock, fail-fast.
+///
+/// Returns the locked file — holding it serializes [`GitopsEnv::switch`]
+/// against an operator `fleet rebuild` (both sides open the same
+/// `/tmp/fleet-rebuild.lock`). Returns [`EnvError::SwitchBusy`] naming the
+/// current holder when another process already owns it.
+///
+/// ── ★ FAIL-FAST ON PURPOSE, NEVER A BLOCKING `lock_exclusive` ──────────
+/// Fleet blocks indefinitely here because the waiter is a human operator
+/// who wants to know the other party will finish. The daemon is a LOOP: a
+/// tick that blocks until an operator's multi-minute rebuild finishes would
+/// publish no liveness pulse for the whole hold — the one failure shape
+/// this codebase refuses to reintroduce (see `Phase`/`InFlight` in the core
+/// and the gate's `STALE_AFTER_POLLS`). So the daemon takes the lock only
+/// if it is free, and the FSM turns a busy lock into a bounded deferral
+/// (`TickOutcome::SwitchDeferred`) that stands aside and retries.
+///
+/// The `build` verb deliberately does NOT take this lock: it is pure nix
+/// store work (already serialized by the store's own locking), and holding
+/// it across a half-hour build would block the operator for no safety gain.
+fn acquire_switch_lock(lock_path: &Path) -> Result<File, EnvError> {
+    use fs4::fs_std::FileExt;
+    let mut file = File::options()
+        .create(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| {
+            EnvError::SwitchBusy(format!("cannot open rebuild lock at {}: {e}", lock_path.display()))
+        })?;
+    // Cross-user reachability: whoever creates the file first owns it, and
+    // the other party still has to open it for WRITE to take an exclusive
+    // flock. A default 0644 would hand the first creator a permanent
+    // monopoly — the root daemon creates it, the operator's rebuild then
+    // dies on EACCES instead of waiting. Best-effort: a pre-existing file
+    // owned by the other user cannot be chmod'd by us, and that is fine —
+    // it is already 0666 from its own creation. Never fatal.
+    let _ = std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o666));
+    if FileExt::try_lock_exclusive(&file).is_err() {
+        // Name the holder so a log line (and, on the operator side, fleet's
+        // "Another rebuild is already in progress (…)" waiter) can tell a
+        // live peer from a wedged one.
+        let holder = std::fs::read_to_string(lock_path)
+            .map(|h| h.trim().to_owned())
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Err(EnvError::SwitchBusy(holder));
+    }
+    // Stamp our identity for the next waiter — including a waiting
+    // operator, who should read "the daemon owns the machine right now".
+    let holder = format!("pid {} · sentinela", std::process::id());
+    let _ = file.set_len(0);
+    let _ = file.write_all(holder.as_bytes());
+    Ok(file)
+}
 
 /// Inject `x-access-token:<token>` basic-auth into an https git URL, via
 /// the typed [`Url`] builder (no string surgery of the scheme).
@@ -447,5 +541,61 @@ mod tests {
             Path::new("/"),
             "cwd `/` is the read-only system volume — the bug this guards"
         );
+    }
+
+    // ── the machine-wide rebuild lock ────────────────────────────────
+
+    #[test]
+    fn the_rebuild_lock_path_is_the_same_absolute_path_fleet_uses() {
+        // THE coordination contract. Sentinela's switch serializes against
+        // an operator `fleet rebuild` ONLY if both open the same file.
+        // Fleet's constant is `/tmp/fleet-rebuild.lock` — absolute and
+        // machine-wide, because macOS's per-user `$TMPDIR` makes
+        // `temp_dir()` serialize nothing (the ryn 2026-08-02 lesson). If
+        // either side drifts from this string, the activation race the lock
+        // exists to close silently returns. Pinned verbatim, not
+        // constructed.
+        assert_eq!(REBUILD_LOCK_PATH, "/tmp/fleet-rebuild.lock");
+    }
+
+    #[test]
+    fn a_held_lock_reports_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let _first = acquire_switch_lock(&path).expect("first acquisition");
+        let err = acquire_switch_lock(&path).expect_err("a held lock must defer");
+        let expected = format!("pid {} · sentinela", std::process::id());
+        assert_eq!(
+            err,
+            EnvError::SwitchBusy(expected),
+            "the holder stamp written by the first acquisition must be read back"
+        );
+    }
+
+    #[test]
+    fn an_uncontended_lock_is_acquired_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        {
+            let _g = acquire_switch_lock(&path).expect("first acquisition");
+            assert!(
+                acquire_switch_lock(&path).is_err(),
+                "the lock must be held while the guard is alive"
+            );
+        }
+        acquire_switch_lock(&path)
+            .expect("the lock must release when the guard drops");
+    }
+
+    #[test]
+    fn the_lock_file_is_group_and_other_writable() {
+        // Cross-user flock needs a 0666 file: the daemon (root) and the
+        // operator both create it, and whoever comes second must still be
+        // able to open it for WRITE to take the exclusive flock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let _g = acquire_switch_lock(&path).expect("acquire");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666, "a default 0644 would hand the creator a monopoly");
     }
 }

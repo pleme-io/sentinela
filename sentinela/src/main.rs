@@ -226,6 +226,13 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::SwitchFailed { rev, error } => {
             tracing::error!(rev = rev.short(), %error, "switch failed");
         }
+        TickOutcome::SwitchDeferred { rev, holder } => {
+            tracing::info!(
+                rev = rev.short(),
+                holder = %holder,
+                "switch deferred — another rebuild holds the machine lock; standing aside"
+            );
+        }
         TickOutcome::CoolingDown { remaining_ms } => {
             tracing::debug!(remaining_ms, "cooling down");
         }
