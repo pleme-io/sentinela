@@ -275,6 +275,33 @@ fn status(cfg: &SentinelaConfig, gate: bool) -> std::process::ExitCode {
         "poll_seconds": cfg.poll_seconds,
         "last_tick_at_unix_ms": beat.as_ref().map(|b| b.at_unix_ms),
         "last_tick_outcome": beat.as_ref().map(|b| b.outcome.clone()),
+        // ── ★ PHASE + VERDICT CROSS THE WIRE, NOT JUST THE TYPE ──────────
+        // `Phase` was added 2026-08-02 after a healthy 12m02s build reported
+        // "the loop is stopped" against a 180s budget. `convergence_gate`
+        // below was taught to match on it and has been right ever since.
+        //
+        // This document was NOT, and that is how the same false alarm
+        // recurred on cid 2026-08-03: `fleet rebuild` re-derives the verdict
+        // from `last_tick_at_unix_ms` + `poll_seconds`, and `phase` was
+        // absent here — so the field that makes the question decidable never
+        // crossed the process boundary. A 29-minute darwin build published
+        // `last_tick_outcome: "building"` and was reported STOPPED.
+        //
+        // Publishing `phase` alone would let a consumer get it right. That is
+        // not enough: it also lets the next consumer get it WRONG, in a new
+        // way, and the whole point is that this verdict is decided ONCE. So
+        // `converged` is the SAME `convergence_gate` the `--gate` exit code
+        // uses — one function, one answer, every reader.
+        "phase": beat.as_ref().map(|b| b.phase),
+        "converged": convergence_gate(
+            &beat,
+            env.now_unix_ms(),
+            cfg.poll_seconds,
+            chain.consecutive_failures(),
+            verified,
+        )
+        .map_or_else(|why| serde_json::json!({"ok": false, "why": why}),
+                     |()| serde_json::json!({"ok": true, "why": null})),
         "head_rev": beat
             .as_ref()
             .and_then(|b| b.head_rev.as_ref())
@@ -399,6 +426,42 @@ mod gate_tests {
     const POLL: u64 = 60;
     /// Wall clock used by every case; the numbers below are offsets from it.
     const NOW_MS: u64 = 1_785_724_816_000;
+
+    /// The cid 2026-08-03 recurrence, pinned at the level it actually broke.
+    ///
+    /// `Phase` was added 2026-08-02 and `convergence_gate` has matched on it
+    /// correctly ever since — the tests below already prove that. What was
+    /// NOT proven is that the verdict SURVIVES THE WIRE: `status` published
+    /// neither `phase` nor a verdict, so `fleet rebuild` re-derived one from
+    /// `last_tick_at_unix_ms` + `poll_seconds` and reproduced the exact bug
+    /// that had just been fixed one layer down. A 29-minute darwin build
+    /// reported STOPPED while it was converging normally.
+    ///
+    /// So this asserts the two verdicts AGREE on the case that separates
+    /// them. If `status` ever stops carrying the phase-aware answer, the
+    /// in-flight arm here goes red — which is the only thing that would have
+    /// caught the recurrence.
+    #[test]
+    fn a_build_longer_than_the_stale_budget_is_never_reported_stopped() {
+        let budget_ms = 3 * POLL * 1000;
+        // Well past the budget — 29 minutes, the measured cid case.
+        let ancient = NOW_MS - (29 * 60 * 1000);
+        assert!(
+            ancient < NOW_MS - budget_ms,
+            "the fixture must exceed the budget"
+        );
+
+        assert!(
+            convergence_gate(&in_flight_beat_at(ancient), NOW_MS, POLL, 0, true).is_ok(),
+            "a tick still inside its build has not missed a cycle — it is doing the work"
+        );
+
+        // The same timestamp with a RESOLVED phase IS stopped. Without this
+        // half the test would pass on a gate that ignored staleness entirely.
+        let err = convergence_gate(&beat_at(ancient), NOW_MS, POLL, 0, true)
+            .expect_err("a finished tick that old means the loop stopped");
+        assert!(err.contains("stopped"), "got: {err}");
+    }
 
     fn beat_at(ms: u64) -> Option<Heartbeat> {
         Some(Heartbeat {
