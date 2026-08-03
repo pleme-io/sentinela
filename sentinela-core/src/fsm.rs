@@ -1141,7 +1141,11 @@ mod tests {
         // The switch was ATTEMPTED (that is how the lock was found busy) —
         // but no activation happened (the outcome is a deferral, never
         // Deployed/DeployedBehind) and nothing was recorded.
-        assert_eq!(*env.switches.borrow(), vec![rev(1)], "switch attempted once");
+        assert_eq!(
+            *env.switches.borrow(),
+            vec![rev(1)],
+            "switch attempted once"
+        );
         assert!(env.chain().head().is_none(), "no receipt for a non-switch");
         assert_eq!(
             s.state(),

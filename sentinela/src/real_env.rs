@@ -386,7 +386,10 @@ fn acquire_switch_lock(lock_path: &Path) -> Result<File, EnvError> {
         .write(true)
         .open(lock_path)
         .map_err(|e| {
-            EnvError::SwitchBusy(format!("cannot open rebuild lock at {}: {e}", lock_path.display()))
+            EnvError::SwitchBusy(format!(
+                "cannot open rebuild lock at {}: {e}",
+                lock_path.display()
+            ))
         })?;
     // Cross-user reachability: whoever creates the file first owns it, and
     // the other party still has to open it for WRITE to take an exclusive
@@ -583,8 +586,7 @@ mod tests {
                 "the lock must be held while the guard is alive"
             );
         }
-        acquire_switch_lock(&path)
-            .expect("the lock must release when the guard drops");
+        acquire_switch_lock(&path).expect("the lock must release when the guard drops");
     }
 
     #[test]
@@ -596,6 +598,9 @@ mod tests {
         let path = dir.path().join("lock");
         let _g = acquire_switch_lock(&path).expect("acquire");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o666, "a default 0644 would hand the creator a monopoly");
+        assert_eq!(
+            mode, 0o666,
+            "a default 0644 would hand the creator a monopoly"
+        );
     }
 }

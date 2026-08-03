@@ -27,6 +27,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 url = "2"
 serde_json = { workspace = true }
+# The same advisory-flock crate `fleet` uses for its rebuild lock, so both
+# parties take the same `/tmp/fleet-rebuild.lock` against the same open
+# file description semantics on macOS.
+fs4 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
