@@ -260,13 +260,26 @@ impl ReceiptChain {
     /// out loud in different words than "DEGRADED". MEASURED on ryn
     /// 2026-08-02: a 12m02s darwin build against a branch whose median
     /// inter-commit gap that evening was under 7 minutes.
+    /// ── ★ EXHAUSTIVE `match`, NOT `==` ───────────────────────────────────
+    /// This read `r.health() == Health::Benign`. An equality test is a hole in
+    /// the very invariant [`Outcome::health`] exists to hold: adding a
+    /// `Health` variant compile-errors at `health()` and at
+    /// [`Self::consecutive_failures`] (both wildcard-free `match`es) but
+    /// **silently compiles here**, defaulting the new variant to "not a
+    /// deferral" with nobody asked. Caught 2026-08-02, in code landed hours
+    /// earlier — the exhaustive matches elsewhere made it *look* sealed.
+    /// Every consumer of the classification must be a `match` with no `_` arm,
+    /// or the seal is only as strong as its weakest reader.
     #[must_use]
     pub fn consecutive_deferrals(&self) -> usize {
-        self.entries
-            .iter()
-            .rev()
-            .take_while(|r| r.health() == Health::Benign)
-            .count()
+        let mut benign = 0;
+        for r in self.entries.iter().rev() {
+            match r.health() {
+                Health::Benign => benign += 1,
+                Health::Converged | Health::Broken => break,
+            }
+        }
+        benign
     }
 
     /// Number of receipts.

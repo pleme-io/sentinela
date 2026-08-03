@@ -309,12 +309,27 @@ fn convergence_gate(
     };
     let silent_ms = now_unix_ms.saturating_sub(beat.at_unix_ms);
     let budget_ms = STALE_AFTER_POLLS * poll_seconds.max(1) * 1000;
-    if silent_ms > budget_ms {
-        return Err(format!(
-            "no tick for {}s (budget {}s) — the loop is stopped, not idle",
-            silent_ms / 1000,
-            budget_ms / 1000
-        ));
+    // ── ★ A BUILD IS NOT SILENCE ─────────────────────────────────────────
+    // The poll budget answers "should another tick have happened by now?",
+    // which is only a question about a loop BETWEEN ticks. A tick that is
+    // still running has not missed anything — it is doing the work. Judging
+    // an in-flight pulse against the poll budget is what made a healthy
+    // 12m02s build report "the loop is stopped" against a 180s budget on ryn
+    // 2026-08-02, and any build longer than two polls was un-gateable.
+    //
+    // Matched with NO wildcard arm: a future phase must be classified here
+    // rather than silently inheriting the stopped-loop verdict.
+    match beat.phase {
+        sentinela_core::Phase::InFlight => {}
+        sentinela_core::Phase::Resolved => {
+            if silent_ms > budget_ms {
+                return Err(format!(
+                    "no tick for {}s (budget {}s) — the loop is stopped, not idle",
+                    silent_ms / 1000,
+                    budget_ms / 1000
+                ));
+            }
+        }
     }
     if consecutive_failures > 0 {
         return Err(format!("{consecutive_failures} consecutive failed ticks"));
@@ -366,9 +381,63 @@ mod gate_tests {
         Some(Heartbeat {
             at_unix_ms: ms,
             outcome: "unchanged".to_owned(),
+            phase: sentinela_core::Phase::Resolved,
             head_rev: None,
             poll_seconds: POLL,
         })
+    }
+
+    /// A pulse from a tick that is still inside its build.
+    fn in_flight_beat_at(ms: u64) -> Option<Heartbeat> {
+        Some(Heartbeat {
+            at_unix_ms: ms,
+            outcome: "building".to_owned(),
+            phase: sentinela_core::Phase::InFlight,
+            head_rev: None,
+            poll_seconds: POLL,
+        })
+    }
+
+    #[test]
+    fn a_long_build_is_not_a_stopped_loop() {
+        // THE REGRESSION TEST FOR THE FALSE VERDICT. Measured on ryn
+        // 2026-08-02: a 12m02s build produced 722s of silence against a 180s
+        // budget (STALE_AFTER_POLLS 3 × poll 60), and the gate reported "the
+        // loop is stopped, not idle" while the loop was converging normally.
+        // 722s is far past the budget on purpose — the point is that the
+        // phase, not the elapsed time, decides.
+        let silent_ms = 722_000;
+        assert!(
+            silent_ms > 3 * POLL * 1000,
+            "the scenario must exceed the budget, or this proves nothing"
+        );
+        assert_eq!(
+            convergence_gate(
+                &in_flight_beat_at(NOW_MS - silent_ms),
+                NOW_MS,
+                POLL,
+                0,
+                true
+            ),
+            Ok(()),
+            "a build in flight is work, not silence"
+        );
+        // And the same silence from a RESOLVED tick is still a stopped loop —
+        // otherwise the fix would have deleted the check rather than scoped it.
+        assert!(
+            convergence_gate(&beat_at(NOW_MS - silent_ms), NOW_MS, POLL, 0, true).is_err(),
+            "a resolved tick that old IS a stopped loop"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_pulse_does_not_mask_a_real_failure_streak() {
+        // The phase exempts a build from the STALENESS check only. A loop
+        // that is building while its last ticks failed is still degraded.
+        assert!(
+            convergence_gate(&in_flight_beat_at(NOW_MS - 722_000), NOW_MS, POLL, 3, true).is_err(),
+            "in-flight must not suppress the failure-streak verdict"
+        );
     }
 
     /// ── ★ THE CASE THE OLD SURFACE GOT WRONG ─────────────────────────────

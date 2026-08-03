@@ -53,12 +53,60 @@ pub enum EnvError {
 /// fail-closed path. A reader compares `at_unix_ms` against the poll
 /// interval: silence beyond a few intervals is a STOPPED loop, which is a
 /// failure, not an absence of news.
+/// Whether a pulse reports a tick that FINISHED or one still running.
+///
+/// ── ★ WHY A LONG BUILD MUST NOT LOOK LIKE A DEAD LOOP ────────────────────
+/// A pulse used to be written only after the tick resolved, so the whole
+/// build was silent. MEASURED on ryn 2026-08-02: a 12m02s darwin build
+/// produced 722s of silence against a 180s staleness budget
+/// (`STALE_AFTER_POLLS = 3` × `poll_seconds` 60), so `status --gate` reported
+/// *"the loop is stopped, not idle"* while the loop was converging normally.
+/// Any build longer than two poll intervals was structurally un-gateable, and
+/// the wrong verdict was produced by the tool rather than by the reader — it
+/// took a human down the wrong diagnosis for an hour.
+///
+/// So the phase is a TYPE, not a sentinel value in `outcome`: consumers
+/// `match` on it, and a new phase is a compile error at every reader rather
+/// than an unrecognised string that silently takes the wrong branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// The tick finished; `outcome` names what it did.
+    ///
+    /// The default on purpose: a heartbeat written before this field existed
+    /// deserializes as a completed tick, which is what it was.
+    #[default]
+    Resolved,
+    /// The tick is inside a build that had not returned when this was
+    /// written. `outcome` names the PENDING action, not a completed one.
+    InFlight,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Heartbeat {
     /// When this tick completed, unix-millis from the env's clock.
     pub at_unix_ms: u64,
     /// The [`crate::TickOutcome`] variant name — what the loop did.
+    ///
+    /// When [`Self::phase`] is [`Phase::InFlight`] this is the pending
+    /// action (`"building"`) rather than a resolved variant. That is a
+    /// deliberate, documented widening of this field's namespace: the
+    /// alternative — leaving the previous tick's resolved outcome in place
+    /// while a build runs — publishes a value that is simply false for the
+    /// current tick, and the external `fleet` consumer would read it as
+    /// current. A reader that must distinguish the two cases matches
+    /// [`Self::phase`]; a reader that only wants "what is it doing" gets a
+    /// true answer either way.
     pub outcome: String,
+    /// Whether this pulse reports a finished tick or one still in flight.
+    ///
+    /// `#[serde(default)]` is load-bearing, not tidiness: `load_heartbeat`
+    /// swallows a parse error into `None`, and the gate reports `None` as
+    /// *"no heartbeat has ever been published"*. Without the default, the
+    /// first run after an upgrade would read every pre-existing heartbeat as
+    /// corrupt and report a live loop as never-having-run.
+    #[serde(default)]
+    pub phase: Phase,
     /// Branch HEAD as observed by THIS tick, when the tick got far enough
     /// to observe one. `None` on a probe error or an unresolvable HEAD:
     /// we did not measure it, so we do not report one.

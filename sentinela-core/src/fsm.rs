@@ -196,6 +196,7 @@ impl Sentinela {
         let beat = Heartbeat {
             at_unix_ms: env.now_unix_ms(),
             outcome: outcome.kind().to_owned(),
+            phase: crate::env::Phase::Resolved,
             head_rev: outcome.observed_head().cloned(),
             poll_seconds: self.cfg.poll_seconds,
         };
@@ -254,6 +255,36 @@ impl Sentinela {
         if chain.last_activated_rev() == Some(&head) {
             return TickOutcome::Unchanged { rev: head };
         }
+
+        // ── ★ PULSE BEFORE THE BUILD, NOT ONLY AFTER IT ──────────────────
+        // `env.build` is the long pole — measured at 12m02s on ryn — and the
+        // wrapper's pulse lands only once it RETURNS. That left the whole
+        // build window with no pulse and no log line, so an observer could
+        // not tell a healthy long build from a hung process, and
+        // `convergence_gate` actively reported "the loop is stopped" against
+        // its 180s budget. Publishing here makes the in-flight tick a thing
+        // that EXISTS in the record rather than an absence to be interpreted.
+        //
+        // Best-effort and deliberately not propagated, exactly like the
+        // wrapper's: a loop that cannot write its pulse has still done its
+        // work, and a read-only state dir must never stop a deploy.
+        //
+        // Placement is inside the body, so unlike the wrapper this IS
+        // bypassable by a future early return added above it. That is the
+        // honest tier — only-mitigated, not structural — and it is why the
+        // gate treats a MISSING in-flight pulse as "judge by the poll
+        // budget" rather than trusting this to always be here.
+        let in_flight = Heartbeat {
+            at_unix_ms: env.now_unix_ms(),
+            outcome: "building".to_owned(),
+            phase: crate::env::Phase::InFlight,
+            head_rev: Some(head.clone()),
+            poll_seconds: self.cfg.poll_seconds,
+        };
+        if let Err(e) = env.write_heartbeat(&in_flight) {
+            tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");
+        }
+        tracing::info!(rev = head.short(), "build started");
 
         // Decide → build rev-pinned.
         if let Err(e) = env.build(&head) {
@@ -419,7 +450,7 @@ mod tests {
     /// `tick_inner`'s body and every early-returning arm here goes red
     /// (7 of 9), which is exactly why it is a wrapper.
     #[test]
-    fn every_tick_outcome_publishes_exactly_one_heartbeat() {
+    fn the_final_pulse_of_every_tick_is_its_resolved_outcome() {
         // (env-builder, expected outcome kind, expected observed head)
         let cases: Vec<(Box<dyn Fn() -> MockEnv>, &str, Option<Rev>)> = vec![
             (
@@ -478,24 +509,42 @@ mod tests {
             assert_eq!(out.kind(), expected_kind, "wrong outcome for this case");
 
             let beats = env.heartbeats.borrow();
+            // ── ★ RESTATED 2026-08-02: the FINAL pulse is the resolved one ──
+            // This asserted `beats.len() == 1`. A tick that builds now
+            // publishes an in-flight pulse first, so the count is 1 or 2 —
+            // but the invariant the wrapper actually guarantees is unchanged
+            // and is the one worth pinning: whatever else a tick emits, the
+            // LAST thing it says is its resolved outcome. Loosening this to
+            // `last()` keeps the wrapper-cannot-be-bypassed property; asserting
+            // a count would have pinned an implementation detail instead.
+            let last = beats.last().expect("every tick must publish a pulse");
             assert_eq!(
-                beats.len(),
-                1,
-                "outcome `{expected_kind}` published {} heartbeats, expected exactly 1",
-                beats.len()
+                last.phase,
+                crate::env::Phase::Resolved,
+                "outcome `{expected_kind}` left an in-flight pulse as its last word"
             );
-            assert_eq!(beats[0].outcome, expected_kind);
+            assert_eq!(last.outcome, expected_kind);
+            // Any earlier pulse in the same tick must be in-flight — a second
+            // RESOLVED pulse would mean the tick reported twice.
+            for b in &beats[..beats.len() - 1] {
+                assert_eq!(
+                    b.phase,
+                    crate::env::Phase::InFlight,
+                    "a non-final pulse must be in-flight, got `{}`",
+                    b.outcome
+                );
+            }
             // The cadence travels with the pulse. Without it a reader holds
             // a perfectly good heartbeat and still cannot judge staleness,
             // which is what `fleet convergence` hit on its first run against
             // a live node: it printed the tick's age and "no poll interval"
             // in the same document.
             assert_eq!(
-                beats[0].poll_seconds, 60,
+                last.poll_seconds, 60,
                 "every heartbeat must carry the interval it is judged against"
             );
             assert_eq!(
-                beats[0].head_rev, expected_head,
+                last.head_rev, expected_head,
                 "outcome `{expected_kind}` reported the wrong observed head"
             );
         }
@@ -513,9 +562,24 @@ mod tests {
         let out = s.tick(&env);
         assert_eq!(out.kind(), "unchanged");
         let beats = env.heartbeats.borrow();
-        assert_eq!(beats.len(), 2, "an idle loop must still prove it is alive");
-        assert_eq!(beats[1].outcome, "unchanged");
-        assert_eq!(beats[1].head_rev, Some(rev(1)));
+        // The first tick BUILDS (in-flight + resolved), the second is idle
+        // (resolved only) — so the count is 3, not 2. What matters is that an
+        // idle tick still proves it is alive, which the last pulse carries.
+        assert!(
+            beats.len() >= 2,
+            "an idle loop must still prove it is alive"
+        );
+        let last = beats.last().expect("pulse");
+        assert_eq!(last.outcome, "unchanged");
+        assert_eq!(last.phase, crate::env::Phase::Resolved);
+        assert_eq!(last.head_rev, Some(rev(1)));
+        // The deploying tick announced itself before its build.
+        assert!(
+            beats
+                .iter()
+                .any(|b| b.phase == crate::env::Phase::InFlight && b.outcome == "building"),
+            "a tick that builds must publish an in-flight pulse first"
+        );
         drop(beats);
 
         // CoolingDown: fail, then tick again inside the cooldown window.

@@ -24,7 +24,7 @@ mod fsm;
 mod receipt;
 mod rev;
 
-pub use env::{EnvError, GitopsEnv, Heartbeat, LoopConfig};
+pub use env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
 pub use fsm::{Sentinela, State, TickOutcome};
 pub use receipt::{
     ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, Outcome, ReceiptChain,
