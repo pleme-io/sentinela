@@ -4667,9 +4667,9 @@
         "preBuild": "export CARGO_CRATE_NAME=same_file;"
       }
     },
-    "sentinela-0.1.2": {
+    "sentinela-0.1.3": {
       "name": "sentinela",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4702,7 +4702,7 @@
         },
         {
           "name": "sentinela_config",
-          "package_key": "sentinela-config-0.1.2",
+          "package_key": "sentinela-config-0.1.3",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4712,7 +4712,7 @@
         },
         {
           "name": "sentinela_core",
-          "package_key": "sentinela-core-0.1.2",
+          "package_key": "sentinela-core-0.1.3",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4799,13 +4799,13 @@
       "crate_renames": {
         "sentinela-config": [
           {
-            "version": "0.1.2",
+            "version": "0.1.3",
             "rename": "sentinela_config"
           }
         ],
         "sentinela-core": [
           {
-            "version": "0.1.2",
+            "version": "0.1.3",
             "rename": "sentinela_core"
           }
         ],
@@ -4818,18 +4818,18 @@
       },
       "build_rust_crate_args": {
         "crateName": "sentinela",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "edition": "2024",
         "crateRenames": {
           "sentinela-config": [
             {
-              "version": "0.1.2",
+              "version": "0.1.3",
               "rename": "sentinela_config"
             }
           ],
           "sentinela-core": [
             {
-              "version": "0.1.2",
+              "version": "0.1.3",
               "rename": "sentinela_core"
             }
           ],
@@ -4844,9 +4844,9 @@
         "preBuild": "export CARGO_CRATE_NAME=sentinela;"
       }
     },
-    "sentinela-config-0.1.2": {
+    "sentinela-config-0.1.3": {
       "name": "sentinela-config",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4864,7 +4864,7 @@
       "runtime_dependencies": [
         {
           "name": "sentinela_core",
-          "package_key": "sentinela-core-0.1.2",
+          "package_key": "sentinela-core-0.1.3",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4899,19 +4899,19 @@
       "crate_renames": {
         "sentinela-core": [
           {
-            "version": "0.1.2",
+            "version": "0.1.3",
             "rename": "sentinela_core"
           }
         ]
       },
       "build_rust_crate_args": {
         "crateName": "sentinela-config",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "edition": "2024",
         "crateRenames": {
           "sentinela-core": [
             {
-              "version": "0.1.2",
+              "version": "0.1.3",
               "rename": "sentinela_core"
             }
           ]
@@ -4922,9 +4922,9 @@
         "preBuild": "export CARGO_CRATE_NAME=sentinela_config;"
       }
     },
-    "sentinela-core-0.1.2": {
+    "sentinela-core-0.1.3": {
       "name": "sentinela-core",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4999,7 +4999,7 @@
       "crate_renames": {},
       "build_rust_crate_args": {
         "crateName": "sentinela-core",
-        "version": "0.1.2",
+        "version": "0.1.3",
         "edition": "2024",
         "features": [
           "mock"
@@ -8100,11 +8100,11 @@
       }
     }
   },
-  "root_crate": "sentinela-core-0.1.2",
+  "root_crate": "sentinela-core-0.1.3",
   "workspace_members": [
-    "sentinela-core-0.1.2",
-    "sentinela-config-0.1.2",
-    "sentinela-0.1.2"
+    "sentinela-core-0.1.3",
+    "sentinela-config-0.1.3",
+    "sentinela-0.1.3"
   ],
   "flake_metadata": {
     "sentinela": {
@@ -9925,7 +9925,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-0.1.2": {
+      "sentinela-0.1.3": {
         "runtime_dependencies": [
           {
             "name": "clap",
@@ -9942,7 +9942,7 @@
           },
           {
             "name": "sentinela_config",
-            "package_key": "sentinela-config-0.1.2",
+            "package_key": "sentinela-config-0.1.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9952,7 +9952,7 @@
           },
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.2",
+            "package_key": "sentinela-core-0.1.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -10038,11 +10038,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-config-0.1.2": {
+      "sentinela-config-0.1.3": {
         "runtime_dependencies": [
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.2",
+            "package_key": "sentinela-core-0.1.3",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -10076,7 +10076,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-core-0.1.2": {
+      "sentinela-core-0.1.3": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -13645,9 +13645,9 @@
       }
     }
   },
-  "cargo_lock_sha256": "b9f0ffeee1b6af075a860ccab2acb1f508ae8fa6a9448f7d40c294df2ccb28fd",
+  "cargo_lock_sha256": "4247f8dc16a9257f5c4b0f5236da6e1376fda84284a54c996eb1883732077afd",
   "manifest_sha256": {
-    "Cargo.toml": "318ed1b653a24626a173138cd92f209dc7bd565e45742360cc480559aef328e5",
+    "Cargo.toml": "2ce27442a5504386e1ae2b290c6d46412d303da79272099307cd230f4304a48a",
     "sentinela-config/Cargo.toml": "0d1817a1ead3d5e3b3d4011d2085a803adf42a39e44c1683cc21af0416ad0618",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
     "sentinela/Cargo.toml": "0af74c86fd680c0a3eb1a9d25dc0fa1e8b972322d69c3d2f53353eaa4c5a5ea5"
