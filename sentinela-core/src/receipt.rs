@@ -213,7 +213,13 @@ impl ReceiptChain {
             Some(h) => (h.seq + 1, h.content_hash()),
             None => (0, GENESIS_HASH.to_owned()),
         };
-        DeployReceipt { seq, rev, outcome, at_unix_ms, prev_hash }
+        DeployReceipt {
+            seq,
+            rev,
+            outcome,
+            at_unix_ms,
+            prev_hash,
+        }
     }
 
     /// Append a receipt that was built via [`next_receipt`](Self::next_receipt).
@@ -229,7 +235,11 @@ impl ReceiptChain {
             None => (0, GENESIS_HASH.to_owned()),
         };
         if receipt.seq != want_seq {
-            return Err(ChainError::SeqGap { index, got: receipt.seq, want: want_seq });
+            return Err(ChainError::SeqGap {
+                index,
+                got: receipt.seq,
+                want: want_seq,
+            });
         }
         if receipt.prev_hash != want_prev {
             return Err(ChainError::BrokenLink { index });
@@ -251,7 +261,11 @@ impl ReceiptChain {
                 None => (0, GENESIS_HASH.to_owned()),
             };
             if r.seq != want_seq {
-                return Err(ChainError::SeqGap { index, got: r.seq, want: want_seq });
+                return Err(ChainError::SeqGap {
+                    index,
+                    got: r.seq,
+                    want: want_seq,
+                });
             }
             if r.prev_hash != want_prev {
                 return Err(ChainError::BrokenLink { index });
@@ -281,12 +295,24 @@ mod tests {
     #[test]
     fn append_links_and_increments_seq() {
         let mut c = ReceiptChain::new();
-        let r0 = c.next_receipt(rev(1), Outcome::Activated { generation: Generation(10) }, 1000);
+        let r0 = c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(10),
+            },
+            1000,
+        );
         assert_eq!(r0.seq, 0);
         assert_eq!(r0.prev_hash, GENESIS_HASH);
         c.append(r0).unwrap();
 
-        let r1 = c.next_receipt(rev(2), Outcome::Activated { generation: Generation(11) }, 2000);
+        let r1 = c.next_receipt(
+            rev(2),
+            Outcome::Activated {
+                generation: Generation(11),
+            },
+            2000,
+        );
         assert_eq!(r1.seq, 1);
         assert_ne!(r1.prev_hash, GENESIS_HASH);
         c.append(r1).unwrap();
@@ -299,9 +325,24 @@ mod tests {
     #[test]
     fn last_activated_skips_failed_and_deferred() {
         let mut c = ReceiptChain::new();
-        c.append(c.next_receipt(rev(1), Outcome::Activated { generation: Generation(1) }, 1)).unwrap();
-        c.append(c.next_receipt(rev(2), Outcome::Failed { error: "boom".into() }, 2)).unwrap();
-        c.append(c.next_receipt(rev(3), Outcome::Deferred { newer: rev(4) }, 3)).unwrap();
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(1),
+            },
+            1,
+        ))
+        .unwrap();
+        c.append(c.next_receipt(
+            rev(2),
+            Outcome::Failed {
+                error: "boom".into(),
+            },
+            2,
+        ))
+        .unwrap();
+        c.append(c.next_receipt(rev(3), Outcome::Deferred { newer: rev(4) }, 3))
+            .unwrap();
         // The last *activated* rev is still rev(1), not the failed/deferred later ones.
         assert_eq!(c.last_activated_rev().unwrap(), &rev(1));
     }
@@ -315,7 +356,11 @@ mod tests {
         let Outcome::Failed { error } = Outcome::failed(huge) else {
             panic!("must stay a Failed outcome");
         };
-        assert!(error.len() <= MAX_ERROR_BYTES + 32, "got {} bytes", error.len());
+        assert!(
+            error.len() <= MAX_ERROR_BYTES + 32,
+            "got {} bytes",
+            error.len()
+        );
         // The diagnosis survives; only the bulk is dropped.
         assert!(error.starts_with("error: builder failed"));
         assert!(error.ends_with("… [truncated]"), "cut must be explicit");
@@ -324,7 +369,12 @@ mod tests {
     #[test]
     fn failed_leaves_short_errors_untouched_and_never_splits_a_char() {
         let short = Outcome::failed("boom");
-        assert_eq!(short, Outcome::Failed { error: "boom".to_owned() });
+        assert_eq!(
+            short,
+            Outcome::Failed {
+                error: "boom".to_owned()
+            }
+        );
 
         // A multi-byte char straddling the cut must not panic or produce
         // invalid UTF-8 — the reason the boundary walk is hand-rolled.
@@ -341,62 +391,134 @@ mod tests {
         let mut c = ReceiptChain::new();
         assert_eq!(c.consecutive_failures(), 0, "empty chain has no streak");
 
-        c.append(c.next_receipt(rev(1), Outcome::Failed { error: "a".into() }, 1)).unwrap();
-        c.append(c.next_receipt(rev(2), Outcome::Failed { error: "b".into() }, 2)).unwrap();
+        c.append(c.next_receipt(rev(1), Outcome::Failed { error: "a".into() }, 1))
+            .unwrap();
+        c.append(c.next_receipt(rev(2), Outcome::Failed { error: "b".into() }, 2))
+            .unwrap();
         assert_eq!(c.consecutive_failures(), 2);
 
         // An activation resets the streak — this is the whole point: the
         // number must fall to 0 the moment the loop recovers, or a stale
         // alarm trains the operator to ignore it.
-        c.append(c.next_receipt(rev(3), Outcome::Activated { generation: Generation(3) }, 3)).unwrap();
+        c.append(c.next_receipt(
+            rev(3),
+            Outcome::Activated {
+                generation: Generation(3),
+            },
+            3,
+        ))
+        .unwrap();
         assert_eq!(c.consecutive_failures(), 0);
 
         // Only the TAIL streak counts, not the two failures before rev(3).
-        c.append(c.next_receipt(rev(4), Outcome::Failed { error: "c".into() }, 4)).unwrap();
+        c.append(c.next_receipt(rev(4), Outcome::Failed { error: "c".into() }, 4))
+            .unwrap();
         assert_eq!(c.consecutive_failures(), 1);
 
         // Deferred is not an activation, so it extends the streak rather
         // than clearing it — a deferral means nothing was deployed.
-        c.append(c.next_receipt(rev(5), Outcome::Deferred { newer: rev(6) }, 5)).unwrap();
+        c.append(c.next_receipt(rev(5), Outcome::Deferred { newer: rev(6) }, 5))
+            .unwrap();
         assert_eq!(c.consecutive_failures(), 2);
     }
 
     #[test]
     fn append_rejects_seq_gap() {
         let mut c = ReceiptChain::new();
-        let mut bad = c.next_receipt(rev(1), Outcome::Activated { generation: Generation(1) }, 1);
+        let mut bad = c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(1),
+            },
+            1,
+        );
         bad.seq = 5;
-        assert!(matches!(c.append(bad).unwrap_err(), ChainError::SeqGap { got: 5, want: 0, .. }));
+        assert!(matches!(
+            c.append(bad).unwrap_err(),
+            ChainError::SeqGap {
+                got: 5,
+                want: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn append_rejects_broken_link() {
         let mut c = ReceiptChain::new();
-        c.append(c.next_receipt(rev(1), Outcome::Activated { generation: Generation(1) }, 1)).unwrap();
-        let mut bad = c.next_receipt(rev(2), Outcome::Activated { generation: Generation(2) }, 2);
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(1),
+            },
+            1,
+        ))
+        .unwrap();
+        let mut bad = c.next_receipt(
+            rev(2),
+            Outcome::Activated {
+                generation: Generation(2),
+            },
+            2,
+        );
         bad.prev_hash = GENESIS_HASH.to_owned();
-        assert!(matches!(c.append(bad).unwrap_err(), ChainError::BrokenLink { index: 1 }));
+        assert!(matches!(
+            c.append(bad).unwrap_err(),
+            ChainError::BrokenLink { index: 1 }
+        ));
     }
 
     #[test]
     fn verify_catches_tampered_middle_receipt() {
         let mut c = ReceiptChain::new();
-        c.append(c.next_receipt(rev(1), Outcome::Activated { generation: Generation(1) }, 1)).unwrap();
-        c.append(c.next_receipt(rev(2), Outcome::Activated { generation: Generation(2) }, 2)).unwrap();
-        c.append(c.next_receipt(rev(3), Outcome::Activated { generation: Generation(3) }, 3)).unwrap();
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(1),
+            },
+            1,
+        ))
+        .unwrap();
+        c.append(c.next_receipt(
+            rev(2),
+            Outcome::Activated {
+                generation: Generation(2),
+            },
+            2,
+        ))
+        .unwrap();
+        c.append(c.next_receipt(
+            rev(3),
+            Outcome::Activated {
+                generation: Generation(3),
+            },
+            3,
+        ))
+        .unwrap();
         c.verify().unwrap();
         // Tamper with the middle receipt's rev — the following receipt's
         // prev_hash no longer matches → BrokenLink.
         let mut tampered = c.clone();
         tampered.entries[1].rev = rev(99);
-        assert!(matches!(tampered.verify().unwrap_err(), ChainError::BrokenLink { index: 2 }));
+        assert!(matches!(
+            tampered.verify().unwrap_err(),
+            ChainError::BrokenLink { index: 2 }
+        ));
     }
 
     #[test]
     fn chain_serde_roundtrips_and_reverifies() {
         let mut c = ReceiptChain::new();
-        c.append(c.next_receipt(rev(1), Outcome::Activated { generation: Generation(7) }, 111)).unwrap();
-        c.append(c.next_receipt(rev(2), Outcome::Deferred { newer: rev(3) }, 222)).unwrap();
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(7),
+            },
+            111,
+        ))
+        .unwrap();
+        c.append(c.next_receipt(rev(2), Outcome::Deferred { newer: rev(3) }, 222))
+            .unwrap();
         let json = serde_json::to_string(&c).unwrap();
         let back: ReceiptChain = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);

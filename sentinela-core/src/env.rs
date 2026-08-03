@@ -63,6 +63,15 @@ pub struct Heartbeat {
     /// to observe one. `None` on a probe error or an unresolvable HEAD:
     /// we did not measure it, so we do not report one.
     pub head_rev: Option<Rev>,
+    /// The loop's poll interval, in seconds.
+    ///
+    /// Published WITH the pulse because a reader cannot judge staleness
+    /// from a timestamp alone — "last tick 400s ago" is healthy at an
+    /// hourly cadence and dead at a 60s one. Without it every consumer
+    /// either guesses (manufacturing a verdict from a number nobody wrote)
+    /// or reports `unknown` while holding a perfectly good heartbeat.
+    /// Measured on the first consumer, which did exactly the latter.
+    pub poll_seconds: u64,
 }
 
 /// FSM tunables (mirrors the operator-facing `pleme.gitops` surface that
@@ -72,6 +81,10 @@ pub struct LoopConfig {
     /// How long to cool down after a failure before the next probe, in
     /// milliseconds. During cooldown the loop touches nothing.
     pub cooldown_after_failure_ms: u64,
+    /// Seconds between cycles. The FSM does not sleep — the caller does —
+    /// but it stamps every heartbeat with this so a reader never has to
+    /// guess the cadence it is judging staleness against.
+    pub poll_seconds: u64,
 }
 
 impl Default for LoopConfig {
@@ -79,7 +92,10 @@ impl Default for LoopConfig {
         // A failed activation is usually a transient build/network fault;
         // back off five minutes before retrying so a broken HEAD does not
         // hammer the builder.
-        Self { cooldown_after_failure_ms: 5 * 60 * 1000 }
+        Self {
+            cooldown_after_failure_ms: 5 * 60 * 1000,
+            poll_seconds: 60,
+        }
     }
 }
 
@@ -251,10 +267,7 @@ mod mock {
 
     impl GitopsEnv for MockEnv {
         fn probe_head(&self) -> Result<Option<Rev>, EnvError> {
-            self.probes
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or(Ok(None))
+            self.probes.borrow_mut().pop_front().unwrap_or(Ok(None))
         }
 
         fn build(&self, rev: &Rev) -> Result<(), EnvError> {

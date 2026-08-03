@@ -24,7 +24,11 @@ use std::time::Duration;
 #[command(name = "sentinela", version, about)]
 struct Cli {
     /// Path to the rendered config yaml (the nix module writes this).
-    #[arg(long, env = "SENTINELA_CONFIG", default_value = "/etc/pleme-gitops/config.yaml")]
+    #[arg(
+        long,
+        env = "SENTINELA_CONFIG",
+        default_value = "/etc/pleme-gitops/config.yaml"
+    )]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -164,10 +168,17 @@ fn log_outcome(outcome: &TickOutcome) {
         }
         TickOutcome::Unchanged { rev } => tracing::debug!(rev = rev.short(), "unchanged"),
         TickOutcome::Deferred { built, newer } => {
-            tracing::info!(built = built.short(), newer = newer.short(), "deferred (HEAD moved mid-build)");
+            tracing::info!(
+                built = built.short(),
+                newer = newer.short(),
+                "deferred (HEAD moved mid-build)"
+            );
         }
         TickOutcome::ReprobeInconclusive { built } => {
-            tracing::warn!(built = built.short(), "post-build re-probe empty — not activated (fail-closed)");
+            tracing::warn!(
+                built = built.short(),
+                "post-build re-probe empty — not activated (fail-closed)"
+            );
         }
         TickOutcome::Unresolvable => tracing::warn!("HEAD unresolvable (fail-closed)"),
         TickOutcome::ProbeError { error } => tracing::warn!(%error, "probe error (fail-closed)"),
@@ -337,6 +348,7 @@ mod gate_tests {
             at_unix_ms: ms,
             outcome: "unchanged".to_owned(),
             head_rev: None,
+            poll_seconds: POLL,
         })
     }
 

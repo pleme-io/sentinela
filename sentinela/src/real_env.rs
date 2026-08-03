@@ -59,7 +59,14 @@ impl RealEnv {
 
     /// The `<flake_url>/<rev>#<hostname>` flake ref for a rev-pinned build.
     fn flake_ref(&self, rev: &Rev) -> String {
-        [&self.cfg.flake_url, "/", rev.as_str(), "#", &self.cfg.hostname].concat()
+        [
+            &self.cfg.flake_url,
+            "/",
+            rev.as_str(),
+            "#",
+            &self.cfg.hostname,
+        ]
+        .concat()
     }
 
     /// Resolve the probe URL, injecting a token when configured.
@@ -198,8 +205,7 @@ impl GitopsEnv for RealEnv {
     fn load_chain(&self) -> Result<ReceiptChain, EnvError> {
         let path = self.receipts_path();
         match std::fs::read_to_string(&path) {
-            Ok(s) => serde_yaml::from_str(&s)
-                .map_err(|e| EnvError::ReceiptIo(e.to_string())),
+            Ok(s) => serde_yaml::from_str(&s).map_err(|e| EnvError::ReceiptIo(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReceiptChain::new()),
             Err(e) => Err(EnvError::ReceiptIo(e.to_string())),
         }

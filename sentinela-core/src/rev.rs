@@ -99,7 +99,10 @@ mod tests {
 
     #[test]
     fn rejects_long() {
-        assert!(matches!(Rev::parse(&"a".repeat(41)).unwrap_err(), RevError::BadLength(41)));
+        assert!(matches!(
+            Rev::parse(&"a".repeat(41)).unwrap_err(),
+            RevError::BadLength(41)
+        ));
     }
 
     #[test]

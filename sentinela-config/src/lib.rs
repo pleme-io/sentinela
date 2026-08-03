@@ -38,14 +38,22 @@ impl RevProbeConfig {
     /// Zero-opinion floor.
     #[must_use]
     pub fn bare() -> Self {
-        Self { git_url: String::new(), branch: String::new(), token_file: None }
+        Self {
+            git_url: String::new(),
+            branch: String::new(),
+            token_file: None,
+        }
     }
 
     /// Shipped: `main`, no token (public-repo default; the module sets a
     /// token_file for private repos).
     #[must_use]
     pub fn prescribed() -> Self {
-        Self { git_url: String::new(), branch: "main".to_owned(), token_file: None }
+        Self {
+            git_url: String::new(),
+            branch: "main".to_owned(),
+            token_file: None,
+        }
     }
 }
 
@@ -86,7 +94,14 @@ impl SentinelaConfig {
     /// The [`sentinela_core::LoopConfig`] derived from this surface.
     #[must_use]
     pub fn loop_config(&self) -> sentinela_core::LoopConfig {
-        sentinela_core::LoopConfig { cooldown_after_failure_ms: self.cooldown_after_failure_ms }
+        sentinela_core::LoopConfig {
+            cooldown_after_failure_ms: self.cooldown_after_failure_ms,
+            // The cadence travels WITH the pulse: a reader judging
+            // staleness from a timestamp alone cannot tell an hourly loop
+            // from a 60s one, and 400s of silence means opposite things
+            // under each.
+            poll_seconds: self.poll_seconds,
+        }
     }
 }
 
@@ -143,7 +158,10 @@ mod tests {
     #[test]
     fn loop_config_carries_cooldown() {
         let p = SentinelaConfig::prescribed_default();
-        assert_eq!(p.loop_config().cooldown_after_failure_ms, DEFAULT_COOLDOWN_MS);
+        assert_eq!(
+            p.loop_config().cooldown_after_failure_ms,
+            DEFAULT_COOLDOWN_MS
+        );
     }
 
     #[test]

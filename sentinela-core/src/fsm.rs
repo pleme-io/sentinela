@@ -165,7 +165,10 @@ impl Sentinela {
     /// A fresh loop in [`State::Idle`].
     #[must_use]
     pub fn new(cfg: LoopConfig) -> Self {
-        Self { state: State::Idle, cfg }
+        Self {
+            state: State::Idle,
+            cfg,
+        }
     }
 
     /// The current between-tick state.
@@ -194,6 +197,7 @@ impl Sentinela {
             at_unix_ms: env.now_unix_ms(),
             outcome: outcome.kind().to_owned(),
             head_rev: outcome.observed_head().cloned(),
+            poll_seconds: self.cfg.poll_seconds,
         };
         if let Err(e) = env.write_heartbeat(&beat) {
             tracing::warn!(error = %e, "sentinela: could not write heartbeat (loop is fine)");
@@ -208,7 +212,9 @@ impl Sentinela {
         if let State::CoolingDown { until_unix_ms } = self.state {
             let now = env.now_unix_ms();
             if now < until_unix_ms {
-                return TickOutcome::CoolingDown { remaining_ms: until_unix_ms - now };
+                return TickOutcome::CoolingDown {
+                    remaining_ms: until_unix_ms - now,
+                };
             }
             self.state = State::Idle;
         }
@@ -223,14 +229,26 @@ impl Sentinela {
                 tracing::warn!("sentinela: HEAD unresolvable — deploying nothing (fail-closed)");
                 return TickOutcome::Unresolvable;
             }
-            Err(e) => return self.fail_closed(env, TickOutcome::ProbeError { error: e.to_string() }),
+            Err(e) => {
+                return self.fail_closed(
+                    env,
+                    TickOutcome::ProbeError {
+                        error: e.to_string(),
+                    },
+                );
+            }
         };
 
         // Diff — skip-if-unchanged against the last *activated* rev.
         let mut chain = match env.load_chain() {
             Ok(c) => c,
             Err(e) => {
-                return self.fail_closed(env, TickOutcome::ProbeError { error: e.to_string() });
+                return self.fail_closed(
+                    env,
+                    TickOutcome::ProbeError {
+                        error: e.to_string(),
+                    },
+                );
             }
         };
         if chain.last_activated_rev() == Some(&head) {
@@ -239,7 +257,10 @@ impl Sentinela {
 
         // Decide → build rev-pinned.
         if let Err(e) = env.build(&head) {
-            let out = TickOutcome::BuildFailed { rev: head.clone(), error: e.to_string() };
+            let out = TickOutcome::BuildFailed {
+                rev: head.clone(),
+                error: e.to_string(),
+            };
             // Best-effort attest (the system is unchanged, so a persist
             // failure here corrupts nothing).
             let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
@@ -256,7 +277,10 @@ impl Sentinela {
             // HEAD moved during the build → defer; the newer rev deploys
             // next tick (no cooldown — deferral is not a failure).
             Ok(Some(newer)) => {
-                let out = TickOutcome::Deferred { built: head.clone(), newer: newer.clone() };
+                let out = TickOutcome::Deferred {
+                    built: head.clone(),
+                    newer: newer.clone(),
+                };
                 let _ = self.record(&mut chain, env, head, Outcome::Deferred { newer });
                 self.state = State::Idle;
                 return out;
@@ -276,7 +300,12 @@ impl Sentinela {
             // cooldown (a health problem that must back off, symmetric with
             // build/switch failures).
             Err(e) => {
-                return self.enter_cooldown(env, TickOutcome::ProbeError { error: e.to_string() });
+                return self.enter_cooldown(
+                    env,
+                    TickOutcome::ProbeError {
+                        error: e.to_string(),
+                    },
+                );
             }
         }
 
@@ -287,10 +316,18 @@ impl Sentinela {
                 // on-disk chain behind the real system → a re-deploy loop
                 // on the next skip-if-unchanged check; treat it as a
                 // (cooling-down) failure, never a silent Deployed.
-                match self.record(&mut chain, env, head.clone(), Outcome::Activated { generation }) {
+                match self.record(
+                    &mut chain,
+                    env,
+                    head.clone(),
+                    Outcome::Activated { generation },
+                ) {
                     Ok(()) => {
                         self.state = State::Idle;
-                        TickOutcome::Deployed { rev: head, generation }
+                        TickOutcome::Deployed {
+                            rev: head,
+                            generation,
+                        }
                     }
                     Err(e) => {
                         let out = TickOutcome::SwitchFailed {
@@ -303,7 +340,10 @@ impl Sentinela {
                 }
             }
             Err(e) => {
-                let out = TickOutcome::SwitchFailed { rev: head.clone(), error: e.to_string() };
+                let out = TickOutcome::SwitchFailed {
+                    rev: head.clone(),
+                    error: e.to_string(),
+                };
                 let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
                 self.enter_cooldown(env, out)
             }
@@ -340,7 +380,9 @@ impl Sentinela {
     /// Move to [`State::CoolingDown`] for `cooldown_after_failure_ms`.
     fn enter_cooldown<E: GitopsEnv>(&mut self, env: &E, out: TickOutcome) -> TickOutcome {
         let until = env.now_unix_ms() + self.cfg.cooldown_after_failure_ms;
-        self.state = State::CoolingDown { until_unix_ms: until };
+        self.state = State::CoolingDown {
+            until_unix_ms: until,
+        };
         out
     }
 }
@@ -355,7 +397,10 @@ mod tests {
     }
 
     fn cfg() -> LoopConfig {
-        LoopConfig { cooldown_after_failure_ms: 1000 }
+        LoopConfig {
+            cooldown_after_failure_ms: 1000,
+            poll_seconds: 60,
+        }
     }
 
     /// ── ★ LIVENESS IS ONLY REAL IF EVERY PATH REPORTS IT ─────────────────
@@ -392,9 +437,7 @@ mod tests {
                 None,
             ),
             (
-                Box::new(|| {
-                    MockEnv::with_probes(vec![Err(EnvError::ProbeFailed("boom".into()))])
-                }),
+                Box::new(|| MockEnv::with_probes(vec![Err(EnvError::ProbeFailed("boom".into()))])),
                 "probeError",
                 None,
             ),
@@ -442,6 +485,15 @@ mod tests {
                 beats.len()
             );
             assert_eq!(beats[0].outcome, expected_kind);
+            // The cadence travels with the pulse. Without it a reader holds
+            // a perfectly good heartbeat and still cannot judge staleness,
+            // which is what `fleet convergence` hit on its first run against
+            // a live node: it printed the tick's age and "no poll interval"
+            // in the same document.
+            assert_eq!(
+                beats[0].poll_seconds, 60,
+                "every heartbeat must carry the interval it is judged against"
+            );
             assert_eq!(
                 beats[0].head_rev, expected_head,
                 "outcome `{expected_kind}` reported the wrong observed head"
@@ -514,7 +566,13 @@ mod tests {
         env.set_switch_result(Ok(Generation(42)));
         let mut s = Sentinela::new(cfg());
         let out = s.tick(&env);
-        assert_eq!(out, TickOutcome::Deployed { rev: rev(1), generation: Generation(42) });
+        assert_eq!(
+            out,
+            TickOutcome::Deployed {
+                rev: rev(1),
+                generation: Generation(42)
+            }
+        );
         assert_eq!(*env.builds.borrow(), vec![rev(1)]);
         assert_eq!(*env.switches.borrow(), vec![rev(1)]);
         // Receipt recorded before idle.
@@ -530,8 +588,14 @@ mod tests {
         let env = MockEnv::with_probes(vec![Ok(Some(rev(1)))]);
         {
             let mut c = ReceiptChain::new();
-            c.append(c.next_receipt(rev(1), Outcome::Activated { generation: Generation(1) }, 0))
-                .unwrap();
+            c.append(c.next_receipt(
+                rev(1),
+                Outcome::Activated {
+                    generation: Generation(1),
+                },
+                0,
+            ))
+            .unwrap();
             env.persist_chain(&c).unwrap();
         }
         let mut s = Sentinela::new(cfg());
@@ -548,12 +612,24 @@ mod tests {
         let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(2)))]);
         let mut s = Sentinela::new(cfg());
         let out = s.tick(&env);
-        assert_eq!(out, TickOutcome::Deferred { built: rev(1), newer: rev(2) });
+        assert_eq!(
+            out,
+            TickOutcome::Deferred {
+                built: rev(1),
+                newer: rev(2)
+            }
+        );
         assert_eq!(*env.builds.borrow(), vec![rev(1)]);
-        assert!(env.switches.borrow().is_empty(), "must not activate the stale rev");
+        assert!(
+            env.switches.borrow().is_empty(),
+            "must not activate the stale rev"
+        );
         assert_eq!(s.state(), &State::Idle);
         // The deferral is attested.
-        assert!(matches!(env.chain().head().unwrap().outcome, Outcome::Deferred { .. }));
+        assert!(matches!(
+            env.chain().head().unwrap().outcome,
+            Outcome::Deferred { .. }
+        ));
     }
 
     #[test]
@@ -571,9 +647,19 @@ mod tests {
         let env = MockEnv::with_probes(vec![Err(EnvError::ProbeFailed("net".into()))]);
         env.set_now_ms(5_000);
         let mut s = Sentinela::new(cfg());
-        assert_eq!(s.tick(&env), TickOutcome::ProbeError { error: "probe failed: net".into() });
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::ProbeError {
+                error: "probe failed: net".into()
+            }
+        );
         assert!(env.switches.borrow().is_empty());
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 6_000 });
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 6_000
+            }
+        );
     }
 
     #[test]
@@ -585,8 +671,16 @@ mod tests {
         let out = s.tick(&env);
         assert!(matches!(out, TickOutcome::BuildFailed { .. }));
         assert!(env.switches.borrow().is_empty());
-        assert!(matches!(env.chain().head().unwrap().outcome, Outcome::Failed { .. }));
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 11_000 });
+        assert!(matches!(
+            env.chain().head().unwrap().outcome,
+            Outcome::Failed { .. }
+        ));
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 11_000
+            }
+        );
     }
 
     #[test]
@@ -596,8 +690,16 @@ mod tests {
         env.set_now_ms(20_000);
         let mut s = Sentinela::new(cfg());
         assert!(matches!(s.tick(&env), TickOutcome::SwitchFailed { .. }));
-        assert!(matches!(env.chain().head().unwrap().outcome, Outcome::Failed { .. }));
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 21_000 });
+        assert!(matches!(
+            env.chain().head().unwrap().outcome,
+            Outcome::Failed { .. }
+        ));
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 21_000
+            }
+        );
     }
 
     #[test]
@@ -618,7 +720,10 @@ mod tests {
         env.set_now_ms(1000);
         assert_eq!(
             s.tick(&env),
-            TickOutcome::Deployed { rev: rev(1), generation: Generation(1) }
+            TickOutcome::Deployed {
+                rev: rev(1),
+                generation: Generation(1)
+            }
         );
     }
 
@@ -635,8 +740,16 @@ mod tests {
         let out = s.tick(&env);
         // Switch ran, but the outcome is a cooling-down failure, not Deployed.
         assert_eq!(*env.switches.borrow(), vec![rev(1)]);
-        assert!(matches!(out, TickOutcome::SwitchFailed { .. }), "got {out:?}");
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 2_000 });
+        assert!(
+            matches!(out, TickOutcome::SwitchFailed { .. }),
+            "got {out:?}"
+        );
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 2_000
+            }
+        );
         // The chain was NOT advanced (persist failed) — so no false
         // "already deployed" claim next tick.
         assert!(env.chain().last_activated_rev().is_none());
@@ -654,9 +767,17 @@ mod tests {
         let mut s = Sentinela::new(cfg());
         let out = s.tick(&env);
         assert_eq!(*env.builds.borrow(), vec![rev(1)]);
-        assert!(env.switches.borrow().is_empty(), "must not activate when re-probe is uncertain");
+        assert!(
+            env.switches.borrow().is_empty(),
+            "must not activate when re-probe is uncertain"
+        );
         assert!(matches!(out, TickOutcome::ProbeError { .. }));
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 4_000 });
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 4_000
+            }
+        );
     }
 
     #[test]
@@ -667,7 +788,10 @@ mod tests {
         let mut s = Sentinela::new(cfg());
         let out = s.tick(&env);
         assert_eq!(*env.builds.borrow(), vec![rev(1)]);
-        assert!(env.switches.borrow().is_empty(), "must not activate an unconfirmable rev");
+        assert!(
+            env.switches.borrow().is_empty(),
+            "must not activate an unconfirmable rev"
+        );
         assert_eq!(out, TickOutcome::ReprobeInconclusive { built: rev(1) });
         assert_eq!(s.state(), &State::Idle);
     }
@@ -679,10 +803,18 @@ mod tests {
         env.set_now_ms(500);
         let mut s = Sentinela::new(cfg());
         let out = s.tick(&env);
-        assert!(env.builds.borrow().is_empty(), "a chain-load error deploys nothing");
+        assert!(
+            env.builds.borrow().is_empty(),
+            "a chain-load error deploys nothing"
+        );
         assert!(env.switches.borrow().is_empty());
         assert!(matches!(out, TickOutcome::ProbeError { .. }));
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 1_500 });
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 1_500
+            }
+        );
     }
 
     #[test]
@@ -696,7 +828,12 @@ mod tests {
         env.set_now_ms(0);
         let mut s = Sentinela::new(cfg());
         assert!(matches!(s.tick(&env), TickOutcome::BuildFailed { .. }));
-        assert_eq!(s.state(), &State::CoolingDown { until_unix_ms: 1_000 });
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 1_000
+            }
+        );
         // Cooldown elapses; build now succeeds → same rev deploys.
         env.set_build_result(Ok(()));
         env.set_now_ms(1_000);
