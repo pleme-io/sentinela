@@ -179,6 +179,83 @@ impl GitopsEnv for RealEnv {
         Ok(parse_ls_remote(&stdout))
     }
 
+    fn is_ancestor(&self, ancestor: &Rev, descendant: &Rev) -> Result<bool, EnvError> {
+        // ── ★ ANSWERED FROM A LOCAL MIRROR, FAIL-CLOSED THROUGHOUT ────────
+        // `git ls-remote` cannot answer ancestry — it returns ref tips, not
+        // history — so this keeps a bare mirror under the state dir and asks
+        // `merge-base --is-ancestor` there. The mirror is a cache, never a
+        // source of truth: it is re-fetched every call, because a stale
+        // mirror answering "not an ancestor" merely defers (safe) while a
+        // stale mirror answering "ancestor" would activate on a fact we did
+        // not verify — so the failure directions are deliberately unequal.
+        //
+        // EVERY exit that is not a definite yes is a no. An unanswerable
+        // question must read as "do not activate", never as "probably fine":
+        // the whole point of the caller is that it is about to relax the
+        // strictest safety rule the loop has.
+        let url = self.probe_url()?;
+        let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
+
+        if !mirror.exists() {
+            let out = Command::new("git")
+                .arg("clone")
+                .arg("--bare")
+                .arg("--filter=blob:none")
+                .arg(&url)
+                .arg(&mirror)
+                .output()
+                .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+            if !out.status.success() {
+                return Err(EnvError::AncestryFailed(
+                    String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                ));
+            }
+        }
+
+        // Fetch both revs explicitly. A branch fetch is not enough: the rev
+        // we built may already have been superseded, and on a force-push it
+        // may be unreachable from any ref at all — which is exactly the case
+        // that must answer "not an ancestor" rather than error out into a
+        // retry loop.
+        let fetch = Command::new("git")
+            .arg("--git-dir")
+            .arg(&mirror)
+            .arg("fetch")
+            .arg("--quiet")
+            .arg(&url)
+            .arg(format!(
+                "+refs/heads/{}:refs/heads/probe",
+                self.cfg.rev_probe.branch
+            ))
+            .output()
+            .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+        if !fetch.status.success() {
+            return Err(EnvError::AncestryFailed(
+                String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
+            ));
+        }
+
+        // `--is-ancestor` is exit-code-only: 0 = yes, 1 = no, anything else
+        // (including a rev this mirror has never heard of) is an ERROR and
+        // must not be read as either answer.
+        let out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&mirror)
+            .arg("merge-base")
+            .arg("--is-ancestor")
+            .arg(ancestor.as_str())
+            .arg(descendant.as_str())
+            .output()
+            .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(EnvError::AncestryFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            )),
+        }
+    }
+
     fn build(&self, rev: &Rev) -> Result<(), EnvError> {
         let out = self.run_darwin_rebuild("build", rev)?;
         if out.status.success() {

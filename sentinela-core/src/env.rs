@@ -32,6 +32,11 @@ pub enum EnvError {
     /// reported so the silence has a cause.
     #[error("heartbeat io: {0}")]
     HeartbeatIo(String),
+    /// An ancestry question could not be answered. ALWAYS fail-closed: an
+    /// unanswerable "is this a forward move?" must read as *no*, never as
+    /// *probably*.
+    #[error("ancestry check failed: {0}")]
+    AncestryFailed(String),
 }
 
 /// One tick's pulse: proof the loop was ALIVE at a moment, independent of
@@ -133,6 +138,26 @@ pub struct LoopConfig {
     /// but it stamps every heartbeat with this so a reader never has to
     /// guess the cadence it is judging staleness against.
     pub poll_seconds: u64,
+    /// How many consecutive deferrals before the loop will accept landing a
+    /// rev that is an ANCESTOR of HEAD rather than HEAD itself.
+    ///
+    /// ── ★ WHY A THRESHOLD AND NOT ALWAYS ─────────────────────────────────
+    /// Landing an ancestor is always *safe* (it is on the branch, and it is
+    /// forward for this node), but during normal operation it is not
+    /// *desirable*: it means deliberately activating a rev we already know
+    /// has been superseded, when simply deferring one tick would have landed
+    /// the newest. The strict rule is right when the loop is keeping up.
+    ///
+    /// It is only wrong when the loop CANNOT keep up — and a deferral streak
+    /// is exactly the measurement of that. So the strict semantics stay the
+    /// default and this relaxation is reachable only from the failure state
+    /// it exists to escape, which bounds its blast radius to the case where
+    /// today's alternative is starving forever.
+    ///
+    /// A BOUND, not a preference: it changes no program's meaning, only how
+    /// long the loop insists on the strictest form of progress before
+    /// accepting a weaker one. `0` disables the relaxation entirely.
+    pub land_ancestor_after_deferrals: usize,
 }
 
 impl Default for LoopConfig {
@@ -143,6 +168,11 @@ impl Default for LoopConfig {
         Self {
             cooldown_after_failure_ms: 5 * 60 * 1000,
             poll_seconds: 60,
+            // Two deferrals in a row is already ~25 minutes of building with
+            // nothing landed — long enough to be a pattern rather than one
+            // unlucky overlap, short enough that a node does not sit stale
+            // for an hour proving what it already knows.
+            land_ancestor_after_deferrals: 2,
         }
     }
 }
@@ -167,6 +197,32 @@ pub trait GitopsEnv {
     /// # Errors
     /// [`EnvError::BuildFailed`].
     fn build(&self, rev: &Rev) -> Result<(), EnvError>;
+
+    /// Is `ancestor` reachable from `descendant` — i.e. does the branch's
+    /// history at `descendant` CONTAIN `ancestor`?
+    ///
+    /// ── ★ THE FACT THE LOOP WAS MISSING ──────────────────────────────────
+    /// `probe_head` returns a bare rev, so the loop could only ever ask "is
+    /// the rev I built still HEAD?" — a strict equality against a moving
+    /// target. When a build takes longer than the interval between pushes
+    /// that question is PERMANENTLY unsatisfiable, and the node starves
+    /// while every build is thrown away. MEASURED on ryn 2026-08-02: a
+    /// 12m02s build against a branch whose median inter-commit gap was under
+    /// 7 minutes.
+    ///
+    /// "Still HEAD" is strictly stronger than "safe to activate". A rev that
+    /// is an ANCESTOR of the new HEAD is still on the branch — activating it
+    /// is a forward step, just not the newest one — whereas a rev the branch
+    /// moved *away* from (force-push, reset, revert) is the rollback the
+    /// no-downgrade rule exists to refuse. Only ancestry separates those two
+    /// cases, and `git ls-remote` structurally cannot answer it.
+    ///
+    /// Implementations MUST fail closed: any doubt is `Ok(false)` or an
+    /// [`EnvError::AncestryFailed`], never an optimistic `true`.
+    ///
+    /// # Errors
+    /// [`EnvError::AncestryFailed`] when the question could not be answered.
+    fn is_ancestor(&self, ancestor: &Rev, descendant: &Rev) -> Result<bool, EnvError>;
 
     /// Activate (`switch`) `rev`, returning the new generation.
     ///
@@ -236,6 +292,11 @@ mod mock {
         /// EVERY tick path published a pulse, not just the happy one.
         pub heartbeats: RefCell<Vec<super::Heartbeat>>,
         heartbeat_result: RefCell<Result<(), EnvError>>,
+        /// Every `(ancestor, descendant)` pair the FSM asked about, in
+        /// order — so a test can prove the loop asked the RIGHT question,
+        /// not merely that it got the answer it wanted.
+        pub ancestry_queries: RefCell<Vec<(Rev, Rev)>>,
+        ancestry_result: RefCell<Result<bool, EnvError>>,
     }
 
     impl Default for MockEnv {
@@ -253,6 +314,10 @@ mod mock {
                 persists: RefCell::new(0),
                 heartbeats: RefCell::new(Vec::new()),
                 heartbeat_result: RefCell::new(Ok(())),
+                ancestry_queries: RefCell::new(Vec::new()),
+                // Fail-closed by default: a test that does not program an
+                // answer must NOT accidentally exercise the relaxed path.
+                ancestry_result: RefCell::new(Ok(false)),
             }
         }
     }
@@ -308,6 +373,11 @@ mod mock {
 
         /// Program the heartbeat-write outcome — to prove a tick still
         /// succeeds when its pulse cannot be recorded.
+        /// Program the answer to every ancestry question.
+        pub fn set_ancestry_result(&self, r: Result<bool, EnvError>) {
+            *self.ancestry_result.borrow_mut() = r;
+        }
+
         pub fn set_heartbeat_result(&self, r: Result<(), EnvError>) {
             *self.heartbeat_result.borrow_mut() = r;
         }
@@ -321,6 +391,13 @@ mod mock {
         fn build(&self, rev: &Rev) -> Result<(), EnvError> {
             self.builds.borrow_mut().push(rev.clone());
             self.build_result.borrow().clone()
+        }
+
+        fn is_ancestor(&self, ancestor: &Rev, descendant: &Rev) -> Result<bool, EnvError> {
+            self.ancestry_queries
+                .borrow_mut()
+                .push((ancestor.clone(), descendant.clone()));
+            self.ancestry_result.borrow().clone()
         }
 
         fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {

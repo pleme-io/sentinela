@@ -188,6 +188,22 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::Deployed { rev, generation } => {
             tracing::info!(rev = rev.short(), generation = %generation, "deployed");
         }
+        TickOutcome::DeployedBehind {
+            rev,
+            generation,
+            newer,
+        } => {
+            // Deliberately its own line, not folded into "deployed": the node
+            // is now running a rev we already know is superseded, and an
+            // operator reading the log must be able to see that this was the
+            // starvation escape rather than a normal convergence.
+            tracing::info!(
+                rev = rev.short(),
+                generation = %generation,
+                newer = newer.short(),
+                "deployed an ancestor of HEAD to escape starvation; converging next tick"
+            );
+        }
         TickOutcome::Unchanged { rev } => tracing::debug!(rev = rev.short(), "unchanged"),
         TickOutcome::Deferred { built, newer } => {
             tracing::info!(

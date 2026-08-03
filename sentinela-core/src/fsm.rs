@@ -102,6 +102,17 @@ pub enum TickOutcome {
         /// The switch error message.
         error: String,
     },
+    /// Activated a rev that is a verified ANCESTOR of the current HEAD —
+    /// the starvation escape. Forward progress, deliberately not the newest
+    /// rev; the next tick converges toward `newer`.
+    DeployedBehind {
+        /// The activated rev (an ancestor of `newer`).
+        rev: Rev,
+        /// The new darwin generation.
+        generation: Generation,
+        /// The HEAD this activation is behind.
+        newer: Rev,
+    },
     /// Activated cleanly; receipt recorded before return.
     Deployed {
         /// The activated rev.
@@ -126,6 +137,7 @@ impl TickOutcome {
             Self::Deferred { .. } => "deferred",
             Self::ReprobeInconclusive { .. } => "reprobeInconclusive",
             Self::SwitchFailed { .. } => "switchFailed",
+            Self::DeployedBehind { .. } => "deployedBehind",
             Self::Deployed { .. } => "deployed",
         }
     }
@@ -160,7 +172,11 @@ impl TickOutcome {
 
         let poll = std::time::Duration::from_secs(cfg.poll_seconds.max(1));
         match self {
-            Self::Deferred { .. } => std::time::Duration::from_secs(DEFERRED_RETRY_SECS),
+            // Same reasoning as a deferral: a newer rev is already known,
+            // so converge toward it now rather than after a full poll.
+            Self::Deferred { .. } | Self::DeployedBehind { .. } => {
+                std::time::Duration::from_secs(DEFERRED_RETRY_SECS)
+            }
             // Everything else waits a normal cycle. Note `CoolingDown` is
             // deliberately NOT lengthened here: the cooldown is a gate inside
             // `tick_inner`, not a longer sleep, so the loop must keep ticking
@@ -194,7 +210,7 @@ impl TickOutcome {
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::Deployed { rev, .. } => Some(rev),
-            Self::Deferred { newer, .. } => Some(newer),
+            Self::Deferred { newer, .. } | Self::DeployedBehind { newer, .. } => Some(newer),
             Self::ReprobeInconclusive { built } => Some(built),
         }
     }
@@ -355,6 +371,62 @@ impl Sentinela {
             // HEAD moved during the build → defer; the newer rev deploys
             // next tick (no cooldown — deferral is not a failure).
             Ok(Some(newer)) => {
+                // ── ★ THE ESCAPE FROM STARVATION ─────────────────────────
+                // "Still HEAD" is strictly stronger than "safe to activate".
+                // When a build outlasts the interval between pushes, that
+                // stronger condition is PERMANENTLY unsatisfiable and the
+                // node starves — every build thrown away, forever. Measured
+                // on ryn 2026-08-02: a 12m02s build against a sub-7m median
+                // inter-commit gap.
+                //
+                // Two facts make landing `head` a FORWARD step rather than
+                // the rollback the no-downgrade rule refuses:
+                //   1. head is an ancestor of `newer` — the branch still
+                //      contains it, so this is a step along the same
+                //      history, merely not the newest one. A force-push,
+                //      reset or revert fails this, which is exactly the
+                //      2026-07-02 rollback the guard was written for.
+                //   2. head is a descendant of what this node last
+                //      activated — forward FOR THIS NODE, never backward.
+                //
+                // Both are required, both fail closed, and the whole path is
+                // gated on an actual deferral streak so normal operation
+                // keeps the strict rule. The post-build re-probe above is
+                // untouched: this does not weaken the guard, it adds a
+                // second, narrower door that only opens on the failure state
+                // the guard would otherwise trap us in.
+                let streak = chain.consecutive_deferrals();
+                let threshold = self.cfg.land_ancestor_after_deferrals;
+                if threshold > 0 && streak + 1 >= threshold {
+                    let forward_on_branch = env.is_ancestor(&head, &newer);
+                    let forward_for_node = match chain.last_activated_rev() {
+                        // Nothing activated yet: any rev on the branch is
+                        // forward for this node.
+                        None => Ok(true),
+                        Some(last) => env.is_ancestor(last, &head),
+                    };
+                    match (forward_on_branch, forward_for_node) {
+                        (Ok(true), Ok(true)) => {
+                            tracing::info!(
+                                rev = head.short(),
+                                newer = newer.short(),
+                                deferrals = streak,
+                                "starved: landing an ancestor of HEAD to make progress"
+                            );
+                            return self.activate(chain, env, head, Some(newer));
+                        }
+                        // Anything else — not an ancestor, a rollback, or an
+                        // unanswerable question — defers exactly as before.
+                        (a, b) => {
+                            if let Some(e) = a.as_ref().err().or_else(|| b.as_ref().err()) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "ancestry unanswerable — deferring (fail-closed)"
+                                );
+                            }
+                        }
+                    }
+                }
                 let out = TickOutcome::Deferred {
                     built: head.clone(),
                     newer: newer.clone(),
@@ -388,7 +460,24 @@ impl Sentinela {
         }
 
         // Act → switch (re-check confirmed head is still HEAD).
-        match env.switch(&head) {
+        self.activate(chain, env, head, None)
+    }
+
+    /// Switch to `rev` and attest, shared by the two paths that reach an
+    /// activation: the strict one (the re-probe re-confirmed `rev` is HEAD)
+    /// and the starvation escape (`rev` is a verified ancestor of HEAD).
+    ///
+    /// `behind` carries the newer HEAD when this is the escape path, so the
+    /// outcome can say so rather than presenting a knowingly-superseded rev
+    /// as a plain deploy.
+    fn activate<E: GitopsEnv>(
+        &mut self,
+        mut chain: ReceiptChain,
+        env: &E,
+        rev: Rev,
+        behind: Option<Rev>,
+    ) -> TickOutcome {
+        match env.switch(&rev) {
             Ok(generation) => {
                 // Attest before idle. A persist failure would leave the
                 // on-disk chain behind the real system → a re-deploy loop
@@ -397,19 +486,23 @@ impl Sentinela {
                 match self.record(
                     &mut chain,
                     env,
-                    head.clone(),
+                    rev.clone(),
                     Outcome::Activated { generation },
                 ) {
                     Ok(()) => {
                         self.state = State::Idle;
-                        TickOutcome::Deployed {
-                            rev: head,
-                            generation,
+                        match behind {
+                            None => TickOutcome::Deployed { rev, generation },
+                            Some(newer) => TickOutcome::DeployedBehind {
+                                rev,
+                                generation,
+                                newer,
+                            },
                         }
                     }
                     Err(e) => {
                         let out = TickOutcome::SwitchFailed {
-                            rev: head.clone(),
+                            rev: rev.clone(),
                             error: ["activated, but receipt persist failed: ", &e.to_string()]
                                 .concat(),
                         };
@@ -419,10 +512,10 @@ impl Sentinela {
             }
             Err(e) => {
                 let out = TickOutcome::SwitchFailed {
-                    rev: head.clone(),
+                    rev: rev.clone(),
                     error: e.to_string(),
                 };
-                let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
+                let _ = self.record(&mut chain, env, rev, Outcome::failed(e.to_string()));
                 self.enter_cooldown(env, out)
             }
         }
@@ -478,6 +571,20 @@ mod tests {
         LoopConfig {
             cooldown_after_failure_ms: 1000,
             poll_seconds: 60,
+            // OFF for the general cases, so the existing suite keeps proving
+            // the STRICT semantics. The starvation escape is exercised only
+            // by the tests that opt into it — a relaxation that silently
+            // applied everywhere would make every other assertion weaker
+            // without anyone noticing.
+            land_ancestor_after_deferrals: 0,
+        }
+    }
+
+    /// The same config with the starvation escape armed at `n` deferrals.
+    fn cfg_landing_after(n: usize) -> LoopConfig {
+        LoopConfig {
+            land_ancestor_after_deferrals: n,
+            ..cfg()
         }
     }
 
@@ -595,6 +702,113 @@ mod tests {
                 "outcome `{expected_kind}` reported the wrong observed head"
             );
         }
+    }
+
+    #[test]
+    fn a_starved_loop_lands_an_ancestor_and_makes_progress() {
+        // THE STARVATION SCENARIO. Every build finishes against a moved
+        // HEAD, so under the strict rule the node NEVER activates anything.
+        // Two probes per tick: pre-build and post-build.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))), // tick 1: built 1, HEAD moved to 2 → defer
+            Ok(Some(rev(2))),
+            Ok(Some(rev(3))), // tick 2: built 2, HEAD moved to 3 → armed
+        ]);
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg_landing_after(2));
+
+        let first = s.tick(&env);
+        assert_eq!(first.kind(), "deferred", "the first overlap still defers");
+        assert!(
+            env.switches.borrow().is_empty(),
+            "nothing may activate on the first deferral"
+        );
+
+        let second = s.tick(&env);
+        assert_eq!(
+            second.kind(),
+            "deployedBehind",
+            "a second consecutive deferral must escape, not starve"
+        );
+        assert_eq!(
+            *env.switches.borrow(),
+            vec![rev(2)],
+            "it must land the rev it BUILT, never the newer one it never built"
+        );
+        // And it asked the right questions, in the right direction.
+        let q = env.ancestry_queries.borrow();
+        assert!(
+            q.contains(&(rev(2), rev(3))),
+            "must ask: is the built rev an ancestor of HEAD? got {q:?}"
+        );
+    }
+
+    #[test]
+    fn a_force_push_is_refused_even_while_starving() {
+        // The 2026-07-02 rollback: HEAD moved to a rev that does NOT contain
+        // what we built. Landing it would be the downgrade the no-downgrade
+        // rule exists to refuse — starving is the correct answer here.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(3))),
+        ]);
+        env.set_ancestry_result(Ok(false)); // not an ancestor
+        let mut s = Sentinela::new(cfg_landing_after(2));
+        s.tick(&env);
+        let out = s.tick(&env);
+        assert_eq!(out.kind(), "deferred", "a non-ancestor must never land");
+        assert!(
+            env.switches.borrow().is_empty(),
+            "no activation may happen when ancestry says no"
+        );
+    }
+
+    #[test]
+    fn an_unanswerable_ancestry_question_defers_rather_than_guessing() {
+        // Fail-closed. The escape relaxes the strictest rule the loop has,
+        // so "I could not check" must read as "do not", never "probably".
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(3))),
+        ]);
+        env.set_ancestry_result(Err(EnvError::AncestryFailed("no network".into())));
+        let mut s = Sentinela::new(cfg_landing_after(2));
+        s.tick(&env);
+        let out = s.tick(&env);
+        assert_eq!(out.kind(), "deferred");
+        assert!(env.switches.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_escape_is_off_unless_armed_and_never_fires_early() {
+        // Threshold 0 disables it entirely: the strict rule forever, which
+        // is what every other test in this file relies on.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(3))),
+            Ok(Some(rev(3))),
+            Ok(Some(rev(4))),
+        ]);
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg()); // land_ancestor_after_deferrals: 0
+        for _ in 0..3 {
+            assert_eq!(s.tick(&env).kind(), "deferred");
+        }
+        assert!(
+            env.switches.borrow().is_empty(),
+            "disabled means disabled, however long the streak"
+        );
+        assert!(
+            env.ancestry_queries.borrow().is_empty(),
+            "a disabled escape must not even ASK — no network cost when off"
+        );
     }
 
     #[test]

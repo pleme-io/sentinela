@@ -77,12 +77,20 @@ pub struct SentinelaConfig {
     pub rev_probe: RevProbeConfig,
     /// Milliseconds to cool down after a failed build/switch/probe.
     pub cooldown_after_failure_ms: u64,
+    /// Consecutive deferrals before the loop will land a rev that is an
+    /// ANCESTOR of HEAD rather than HEAD itself — the escape from
+    /// starvation when a build outlasts the interval between pushes. `0`
+    /// keeps the strict "must still be HEAD" rule forever, and with it the
+    /// possibility of never converging on a busy branch.
+    pub land_ancestor_after_deferrals: usize,
 }
 
 /// Default poll cadence, seconds.
 pub const DEFAULT_POLL_SECONDS: u64 = 60;
 /// Default failure cooldown, milliseconds (5 minutes).
 pub const DEFAULT_COOLDOWN_MS: u64 = 5 * 60 * 1000;
+/// Default deferral streak before landing an ancestor of HEAD.
+pub const DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS: usize = 2;
 
 impl Default for SentinelaConfig {
     fn default() -> Self {
@@ -101,6 +109,7 @@ impl SentinelaConfig {
             // from a 60s one, and 400s of silence means opposite things
             // under each.
             poll_seconds: self.poll_seconds,
+            land_ancestor_after_deferrals: self.land_ancestor_after_deferrals,
         }
     }
 }
@@ -115,6 +124,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             extra_rebuild_args: Vec::new(),
             rev_probe: RevProbeConfig::bare(),
             cooldown_after_failure_ms: 0,
+            land_ancestor_after_deferrals: 0,
         }
     }
 
@@ -127,6 +137,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             extra_rebuild_args: Vec::new(),
             rev_probe: RevProbeConfig::prescribed(),
             cooldown_after_failure_ms: DEFAULT_COOLDOWN_MS,
+            land_ancestor_after_deferrals: DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS,
         }
     }
 }
@@ -162,6 +173,19 @@ mod tests {
             p.loop_config().cooldown_after_failure_ms,
             DEFAULT_COOLDOWN_MS
         );
+        // The starvation escape must reach the FSM, or the knob is decorative.
+        assert_eq!(
+            p.loop_config().land_ancestor_after_deferrals,
+            DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS
+        );
+        // `bare()` is zero-opinion: the relaxation is OFF unless something
+        // states it, so an un-prescribed config keeps the strict rule.
+        assert_eq!(
+            SentinelaConfig::bare()
+                .loop_config()
+                .land_ancestor_after_deferrals,
+            0
+        );
     }
 
     #[test]
@@ -178,6 +202,7 @@ mod tests {
                 token_file: Some("/run/tok".to_owned()),
             },
             cooldown_after_failure_ms: 300_000,
+            land_ancestor_after_deferrals: 2,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();
