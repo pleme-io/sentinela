@@ -130,6 +130,53 @@ impl TickOutcome {
         }
     }
 
+    /// How long the caller should sleep before the next tick.
+    ///
+    /// ── ★ THE CADENCE DECISION LIVES WITH THE OUTCOME ────────────────────
+    /// The FSM decides not to cool down after a deferral — `tick_inner`'s
+    /// deferral arm returns to `Idle` with the comment "deferral is not a
+    /// failure" — and then the caller slept a full `poll_seconds` anyway,
+    /// because `run()` had one `Duration` in scope and matched on nothing.
+    /// The FSM's decision had no way to reach the thing that controls
+    /// cadence, so it was silently overruled on every tick.
+    ///
+    /// Exhaustive with NO wildcard arm, exactly like [`Self::kind`]: a new
+    /// outcome must state its own cadence, and cannot inherit a default that
+    /// happens to be wrong for it.
+    ///
+    /// **Deliberately not a config knob.** These are bounds, not preferences
+    /// — no value here changes what the loop DOES, only how soon it looks
+    /// again — and a knob would freeze this shape as a public interface
+    /// before it has earned one.
+    #[must_use]
+    pub fn next_delay(&self, cfg: &LoopConfig) -> std::time::Duration {
+        /// After a deferral we ALREADY know a newer rev exists, so a full
+        /// poll is pure added latency on a loop that is losing a race. Not
+        /// zero, though: a cache-hit build can return in seconds, and a
+        /// zero-delay retry would then be an unbounded `ls-remote`+build
+        /// churn loop. One second keeps the fast path fast and still bounds
+        /// the worst case to something a human can see in the log.
+        const DEFERRED_RETRY_SECS: u64 = 1;
+
+        let poll = std::time::Duration::from_secs(cfg.poll_seconds.max(1));
+        match self {
+            Self::Deferred { .. } => std::time::Duration::from_secs(DEFERRED_RETRY_SECS),
+            // Everything else waits a normal cycle. Note `CoolingDown` is
+            // deliberately NOT lengthened here: the cooldown is a gate inside
+            // `tick_inner`, not a longer sleep, so the loop must keep ticking
+            // (and keep publishing a pulse) while it backs off. Sleeping the
+            // cooldown here instead would starve liveness reporting.
+            Self::CoolingDown { .. }
+            | Self::Unchanged { .. }
+            | Self::Unresolvable
+            | Self::ProbeError { .. }
+            | Self::BuildFailed { .. }
+            | Self::ReprobeInconclusive { .. }
+            | Self::SwitchFailed { .. }
+            | Self::Deployed { .. } => poll,
+        }
+    }
+
     /// Branch HEAD as this tick observed it, when it got far enough to
     /// observe one.
     ///
@@ -547,6 +594,48 @@ mod tests {
                 last.head_rev, expected_head,
                 "outcome `{expected_kind}` reported the wrong observed head"
             );
+        }
+    }
+
+    #[test]
+    fn a_deferral_retries_fast_and_everything_else_waits_a_poll() {
+        // The FSM already decided a deferral is not a failure and returns to
+        // Idle without cooling down — then the caller slept a full poll
+        // anyway, because `run()` had one Duration in scope and matched on
+        // nothing. This pins that the decision now travels with the outcome.
+        let c = cfg();
+        let poll = std::time::Duration::from_secs(c.poll_seconds);
+
+        let deferred = TickOutcome::Deferred {
+            built: rev(1),
+            newer: rev(2),
+        };
+        assert!(
+            deferred.next_delay(&c) < poll,
+            "a deferral already knows a newer rev exists — waiting a full poll is pure latency"
+        );
+        assert!(
+            !deferred.next_delay(&c).is_zero(),
+            "but not zero: a cache-hit build would make a zero-delay retry an unbounded churn loop"
+        );
+
+        // CoolingDown must still tick at the normal cadence. The cooldown is
+        // a gate INSIDE tick_inner, not a longer sleep — lengthening it here
+        // would starve the liveness pulse the gate reads.
+        assert_eq!(
+            TickOutcome::CoolingDown { remaining_ms: 1000 }.next_delay(&c),
+            poll,
+            "cooling down must keep ticking, or liveness reporting starves"
+        );
+        for o in [
+            TickOutcome::Unchanged { rev: rev(1) },
+            TickOutcome::Unresolvable,
+            TickOutcome::Deployed {
+                rev: rev(1),
+                generation: Generation(1),
+            },
+        ] {
+            assert_eq!(o.next_delay(&c), poll, "`{}` must wait a poll", o.kind());
         }
     }
 

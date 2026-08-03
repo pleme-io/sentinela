@@ -17,7 +17,6 @@ use real_env::RealEnv;
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{GitopsEnv, Sentinela, State, TickOutcome};
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// sentinela — Darwin GitOps node-sync daemon.
 #[derive(Parser)]
@@ -109,11 +108,19 @@ fn load_config(path: &PathBuf) -> Result<SentinelaConfig, String> {
 
 /// The daemon loop: one cycle, then sleep `poll_seconds`, forever.
 fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
-    let poll = Duration::from_secs(cfg.poll_seconds.max(1));
+    // ── ★ NO `poll` LOCAL ON PURPOSE ─────────────────────────────────────
+    // There used to be a `Duration` here and `sleep(poll)` below, which
+    // overruled the FSM's per-outcome cadence on every tick. Deleting it is
+    // the enforcement: the only `Duration` reachable at the sleep is the one
+    // the outcome produces, so "sleep the wrong interval" has no expression
+    // rather than being a rule someone has to remember.
     let loop_cfg = cfg.loop_config();
     let env = RealEnv::new(cfg);
     let mut sentinela = Sentinela::new(loop_cfg);
-    tracing::info!(poll_seconds = poll.as_secs(), "sentinela: daemon started");
+    tracing::info!(
+        poll_seconds = loop_cfg.poll_seconds,
+        "sentinela: daemon started"
+    );
 
     // ── ★ ANNOUNCE THE STREAK AT STARTUP ──────────────────────────────────
     // A restart is the one moment we are guaranteed to write to the log, so
@@ -171,7 +178,7 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     loop {
         let outcome = sentinela.tick(&env);
         log_outcome(&outcome);
-        std::thread::sleep(poll);
+        std::thread::sleep(outcome.next_delay(&loop_cfg));
     }
 }
 
