@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "sentinela-config",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sentinela-core",
  "serde",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "serde",

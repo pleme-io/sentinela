@@ -570,6 +570,16 @@
           "optional": false,
           "target": null,
           "tree": "target"
+        },
+        {
+          "name": "cpufeatures",
+          "package_key": "cpufeatures-0.3.0",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))",
+          "tree": "target"
         }
       ],
       "build_dependencies": [
@@ -2112,18 +2122,7 @@
       "links": null,
       "binaries": [],
       "lib_target": null,
-      "runtime_dependencies": [
-        {
-          "name": "core_foundation_sys",
-          "package_key": "core-foundation-sys-0.8.7",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": "cfg(target_vendor = \"apple\")",
-          "tree": "target"
-        }
-      ],
+      "runtime_dependencies": [],
       "build_dependencies": [],
       "crate_renames": {
         "core-foundation-sys": [
@@ -3541,33 +3540,13 @@
       "lib_target": null,
       "runtime_dependencies": [
         {
-          "name": "bitflags",
-          "package_key": "bitflags-2.13.0",
+          "name": "inotify",
+          "package_key": "inotify-0.11.2",
           "kind": "normal",
           "features": [],
-          "uses_default_features": true,
+          "uses_default_features": false,
           "optional": false,
-          "target": "cfg(target_os = \"macos\")",
-          "tree": "target"
-        },
-        {
-          "name": "kqueue",
-          "package_key": "kqueue-1.2.0",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-          "tree": "target"
-        },
-        {
-          "name": "kqueue",
-          "package_key": "kqueue-1.2.0",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": true,
-          "target": "cfg(target_os = \"macos\")",
+          "target": "cfg(any(target_os = \"linux\", target_os = \"android\"))",
           "tree": "target"
         },
         {
@@ -4504,6 +4483,37 @@
           "optional": false,
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "tree": "target"
+        },
+        {
+          "name": "linux_raw_sys",
+          "package_key": "linux-raw-sys-0.12.1",
+          "kind": "normal",
+          "features": [
+            "general",
+            "ioctl",
+            "no_std"
+          ],
+          "uses_default_features": false,
+          "optional": false,
+          "target": "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
+          "tree": "target"
+        },
+        {
+          "name": "linux_raw_sys",
+          "package_key": "linux-raw-sys-0.12.1",
+          "kind": "normal",
+          "features": [
+            "auxvec",
+            "elf",
+            "errno",
+            "general",
+            "ioctl",
+            "no_std"
+          ],
+          "uses_default_features": false,
+          "optional": false,
+          "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
+          "tree": "target"
         }
       ],
       "build_dependencies": [],
@@ -4523,6 +4533,10 @@
           }
         ],
         "linux-raw-sys": [
+          {
+            "version": "0.12.1",
+            "rename": "linux_raw_sys"
+          },
           {
             "version": "0.12.1",
             "rename": "linux_raw_sys"
@@ -4555,6 +4569,10 @@
             }
           ],
           "linux-raw-sys": [
+            {
+              "version": "0.12.1",
+              "rename": "linux_raw_sys"
+            },
             {
               "version": "0.12.1",
               "rename": "linux_raw_sys"
@@ -4649,9 +4667,9 @@
         "preBuild": "export CARGO_CRATE_NAME=same_file;"
       }
     },
-    "sentinela-0.1.0": {
+    "sentinela-0.1.1": {
       "name": "sentinela",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4684,7 +4702,7 @@
         },
         {
           "name": "sentinela_config",
-          "package_key": "sentinela-config-0.1.0",
+          "package_key": "sentinela-config-0.1.1",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4694,7 +4712,7 @@
         },
         {
           "name": "sentinela_core",
-          "package_key": "sentinela-core-0.1.0",
+          "package_key": "sentinela-core-0.1.1",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4781,13 +4799,13 @@
       "crate_renames": {
         "sentinela-config": [
           {
-            "version": "0.1.0",
+            "version": "0.1.1",
             "rename": "sentinela_config"
           }
         ],
         "sentinela-core": [
           {
-            "version": "0.1.0",
+            "version": "0.1.1",
             "rename": "sentinela_core"
           }
         ],
@@ -4800,18 +4818,18 @@
       },
       "build_rust_crate_args": {
         "crateName": "sentinela",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "edition": "2024",
         "crateRenames": {
           "sentinela-config": [
             {
-              "version": "0.1.0",
+              "version": "0.1.1",
               "rename": "sentinela_config"
             }
           ],
           "sentinela-core": [
             {
-              "version": "0.1.0",
+              "version": "0.1.1",
               "rename": "sentinela_core"
             }
           ],
@@ -4826,9 +4844,9 @@
         "preBuild": "export CARGO_CRATE_NAME=sentinela;"
       }
     },
-    "sentinela-config-0.1.0": {
+    "sentinela-config-0.1.1": {
       "name": "sentinela-config",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4846,7 +4864,7 @@
       "runtime_dependencies": [
         {
           "name": "sentinela_core",
-          "package_key": "sentinela-core-0.1.0",
+          "package_key": "sentinela-core-0.1.1",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -4881,19 +4899,19 @@
       "crate_renames": {
         "sentinela-core": [
           {
-            "version": "0.1.0",
+            "version": "0.1.1",
             "rename": "sentinela_core"
           }
         ]
       },
       "build_rust_crate_args": {
         "crateName": "sentinela-config",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "edition": "2024",
         "crateRenames": {
           "sentinela-core": [
             {
-              "version": "0.1.0",
+              "version": "0.1.1",
               "rename": "sentinela_core"
             }
           ]
@@ -4904,9 +4922,9 @@
         "preBuild": "export CARGO_CRATE_NAME=sentinela_config;"
       }
     },
-    "sentinela-core-0.1.0": {
+    "sentinela-core-0.1.1": {
       "name": "sentinela-core",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "edition": "2024",
       "source": {
         "kind": "path",
@@ -4981,7 +4999,7 @@
       "crate_renames": {},
       "build_rust_crate_args": {
         "crateName": "sentinela-core",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "edition": "2024",
         "features": [
           "mock"
@@ -8082,11 +8100,11 @@
       }
     }
   },
-  "root_crate": "sentinela-core-0.1.0",
+  "root_crate": "sentinela-core-0.1.1",
   "workspace_members": [
-    "sentinela-core-0.1.0",
-    "sentinela-config-0.1.0",
-    "sentinela-0.1.0"
+    "sentinela-core-0.1.1",
+    "sentinela-config-0.1.1",
+    "sentinela-0.1.1"
   ],
   "flake_metadata": {
     "sentinela": {
@@ -9907,7 +9925,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-0.1.0": {
+      "sentinela-0.1.1": {
         "runtime_dependencies": [
           {
             "name": "clap",
@@ -9924,7 +9942,7 @@
           },
           {
             "name": "sentinela_config",
-            "package_key": "sentinela-config-0.1.0",
+            "package_key": "sentinela-config-0.1.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9934,7 +9952,7 @@
           },
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.0",
+            "package_key": "sentinela-core-0.1.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -10020,11 +10038,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-config-0.1.0": {
+      "sentinela-config-0.1.1": {
         "runtime_dependencies": [
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.0",
+            "package_key": "sentinela-core-0.1.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -10058,7 +10076,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-core-0.1.0": {
+      "sentinela-core-0.1.1": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -13627,11 +13645,11 @@
       }
     }
   },
-  "cargo_lock_sha256": "adb50e510f08127a1c9fe7fa8f46c5d0161e1c3222ff1b140e51d98ce40095cc",
+  "cargo_lock_sha256": "1e723f35d00b355a5bb600c2d2ce5958a3d7b8527553ae4774a7ff315ea7a7d3",
   "manifest_sha256": {
-    "Cargo.toml": "318edcad2dc2ff4ad1c4e02bff4f34c24acbeb0d9826db5a63a845c5fda7002b",
-    "sentinela-config/Cargo.toml": "9204c18cd836cdfbd16617820916f34fe6afdc76f5fe48666eddfee70dea35b8",
-    "sentinela-core/Cargo.toml": "00391fd15882a7c3d30ac3404dd742b8d1687ce4c8a6d8b3e4292d91bde4983b",
-    "sentinela/Cargo.toml": "1ec6d7afd9069fe1aacd2572c57d448705d19a887aaff9aea9f8fd3f666b7c20"
+    "Cargo.toml": "c100a34867fdc76c9b37c03425f5db674611084cf04d16f3d2f25b2cd2941548",
+    "sentinela-config/Cargo.toml": "0d1817a1ead3d5e3b3d4011d2085a803adf42a39e44c1683cc21af0416ad0618",
+    "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
+    "sentinela/Cargo.toml": "0af74c86fd680c0a3eb1a9d25dc0fa1e8b972322d69c3d2f53353eaa4c5a5ea5"
   }
 }
