@@ -1,6 +1,6 @@
 [package]
 name = "sentinela-config"
-version = "0.1.0"
+version.workspace = true
 description = "sentinela-config — the shikumi-typed config surface (mirrors the pleme.gitops nix option surface)"
 edition.workspace = true
 rust-version.workspace = true

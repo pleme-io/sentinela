@@ -1,6 +1,6 @@
 [package]
 name = "sentinela"
-version = "0.1.0"
+version.workspace = true
 description = "sentinela — the pure-Rust Darwin GitOps node-sync daemon (the Mac peer of NixOS comin)"
 edition.workspace = true
 rust-version.workspace = true

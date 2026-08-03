@@ -3,6 +3,16 @@ resolver = "3"
 members = ["sentinela-core", "sentinela-config", "sentinela"]
 
 [workspace.package]
+# ── ★ THE ONE KEY auto-release NEEDS, AND IT WAS ABSENT ─────────────────
+# `pleme-io/actions/rust-workspace-bump` bumps the WORKSPACE version, so a
+# workspace that pins versions only per-member gives it nothing to bump:
+#     ERROR rust-workspace-bump: workspace.package.version not found
+# Every release run since 2026-08-02 failed on that line — including the
+# heartbeat work — while the repo itself was green, because a red release
+# is invisible from inside the repo. Members now inherit
+# (`version.workspace = true`), so the workspace version is the single
+# source and cannot drift member-to-member.
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT"
