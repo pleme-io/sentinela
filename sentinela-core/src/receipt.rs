@@ -68,28 +68,50 @@ impl Outcome {
     }
 
     /// A `Failed` outcome whose retained text is bounded to
-    /// [`MAX_ERROR_BYTES`], truncated on a char boundary with an explicit
-    /// marker so a reader knows the text was cut rather than that the build
-    /// stopped talking.
+    /// [`MAX_ERROR_BYTES`], cut on char boundaries with an explicit marker so
+    /// a reader knows the text was elided rather than that the build stopped
+    /// talking.
+    ///
+    /// Keeps BOTH ENDS. A build log carries its context at the head (what was
+    /// being built) and its diagnosis at the tail (why it stopped) — a
+    /// head-only cut therefore discards the only part anyone reads. Measured
+    /// on ryn 2026-08-03: a real receipt retained 2048 bytes of
+    /// `unpacking … into the Git cache` and ended at `err… [truncated]`,
+    /// leaving the failure undiagnosable from its own record.
     ///
     /// TIER: only-mitigated, not unrepresentable — `Failed { error }` stays
     /// publicly constructible (tests build it directly), so this bounds the
     /// production path rather than making an oversized receipt impossible.
     #[must_use]
     pub fn failed(error: impl Into<String>) -> Self {
-        let mut e: String = error.into();
-        if e.len() > MAX_ERROR_BYTES {
-            // Walk back to a char boundary; `floor_char_boundary` is still
-            // unstable, so do it by hand rather than risk a panic on a
-            // multi-byte split.
-            let mut cut = MAX_ERROR_BYTES;
-            while cut > 0 && !e.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            e.truncate(cut);
-            e.push_str("\n… [truncated]");
+        let e: String = error.into();
+        if e.len() <= MAX_ERROR_BYTES {
+            return Self::Failed { error: e };
         }
-        Self::Failed { error: e }
+
+        // A quarter for context, the rest for the diagnosis. The tail gets the
+        // larger share deliberately: the head is usually preamble.
+        let head_budget = MAX_ERROR_BYTES / 4;
+        let tail_budget = MAX_ERROR_BYTES - head_budget;
+
+        // `floor_char_boundary` / `ceil_char_boundary` are still unstable, so
+        // walk to a boundary by hand rather than risk a panic on a multi-byte
+        // split.
+        let mut head_end = head_budget;
+        while head_end > 0 && !e.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = e.len() - tail_budget;
+        while tail_start < e.len() && !e.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+
+        let elided = tail_start.saturating_sub(head_end);
+        let mut out = String::with_capacity(MAX_ERROR_BYTES + 48);
+        out.push_str(&e[..head_end]);
+        out.push_str(&format!("\n… [{elided} bytes elided] …\n"));
+        out.push_str(&e[tail_start..]);
+        Self::Failed { error: out }
     }
 }
 
@@ -447,19 +469,36 @@ mod tests {
     fn failed_bounds_the_retained_error_text() {
         // The real shape: 4136 of these, each holding a full nix error,
         // made a 31 MB append-only chain that can never be pruned.
-        let huge = "error: builder failed\n".repeat(5000);
+        // The fixture must have a DISTINCT head and tail. The previous one
+        // was a single line repeated, so head and tail were identical and the
+        // test passed under a head-only cut that discarded every real
+        // diagnosis — it asserted "the diagnosis survives" while being
+        // structurally unable to detect its loss.
+        let huge = format!(
+            "CONTEXT-HEAD building the system configuration\n{}error: THE-ACTUAL-DIAGNOSIS attribute 'foo' missing\n",
+            "unpacking 'github:pleme-io/x' into the Git cache...\n".repeat(5000),
+        );
         assert!(huge.len() > MAX_ERROR_BYTES * 10);
         let Outcome::Failed { error } = Outcome::failed(huge) else {
             panic!("must stay a Failed outcome");
         };
         assert!(
-            error.len() <= MAX_ERROR_BYTES + 32,
+            error.len() <= MAX_ERROR_BYTES + 48,
             "got {} bytes",
             error.len()
         );
-        // The diagnosis survives; only the bulk is dropped.
-        assert!(error.starts_with("error: builder failed"));
-        assert!(error.ends_with("… [truncated]"), "cut must be explicit");
+        // Both ends survive: the head says what was being built...
+        assert!(
+            error.starts_with("CONTEXT-HEAD"),
+            "context was dropped: {}",
+            &error[..error.len().min(80)]
+        );
+        // ...and the tail — the only part anyone actually reads — says why.
+        assert!(
+            error.contains("THE-ACTUAL-DIAGNOSIS"),
+            "the diagnosis was discarded, which is the whole defect this guards"
+        );
+        assert!(error.contains("bytes elided"), "the cut must be explicit");
     }
 
     #[test]
