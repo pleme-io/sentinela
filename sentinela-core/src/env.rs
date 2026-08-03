@@ -27,6 +27,42 @@ pub enum EnvError {
     /// Reading or writing the receipt chain failed.
     #[error("receipt store io: {0}")]
     ReceiptIo(String),
+    /// Writing the liveness heartbeat failed. Never fatal to a cycle — a
+    /// loop that cannot record its pulse must still do its job — but it is
+    /// reported so the silence has a cause.
+    #[error("heartbeat io: {0}")]
+    HeartbeatIo(String),
+}
+
+/// One tick's pulse: proof the loop was ALIVE at a moment, independent of
+/// whether it had anything to do.
+///
+/// ── ★ WHY A RECEIPT CANNOT SERVE AS A HEARTBEAT ─────────────────────────
+/// The receipt chain records *activations*. A healthy loop with nothing to
+/// do activates nothing for weeks, so its newest receipt is indefinitely
+/// old — meaning "last receipt was 27 days ago" is equally consistent with
+/// a perfectly converged node and a process that died 27 days ago.
+///
+/// That ambiguity is not theoretical. On 2026-08-02 cid's `status` printed
+/// `consecutive_failures: 0, chain_verified: true` from a chain whose head
+/// was a clean activation, while the LaunchDaemon had been dead since boot
+/// (exit 78 EX_CONFIG) and the node sat 14 commits behind origin/main.
+/// Every stored fact was true and the node was not reconciling.
+///
+/// So liveness gets its own record, written on EVERY tick including every
+/// fail-closed path. A reader compares `at_unix_ms` against the poll
+/// interval: silence beyond a few intervals is a STOPPED loop, which is a
+/// failure, not an absence of news.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Heartbeat {
+    /// When this tick completed, unix-millis from the env's clock.
+    pub at_unix_ms: u64,
+    /// The [`crate::TickOutcome`] variant name — what the loop did.
+    pub outcome: String,
+    /// Branch HEAD as observed by THIS tick, when the tick got far enough
+    /// to observe one. `None` on a probe error or an unresolvable HEAD:
+    /// we did not measure it, so we do not report one.
+    pub head_rev: Option<Rev>,
 }
 
 /// FSM tunables (mirrors the operator-facing `pleme.gitops` surface that
@@ -89,6 +125,19 @@ pub trait GitopsEnv {
 
     /// Current time as unix-millis — the only clock the core observes.
     fn now_unix_ms(&self) -> u64;
+
+    /// Record this tick's [`Heartbeat`], overwriting the previous one.
+    ///
+    /// Deliberately a REQUIRED method with no default. A defaulted no-op
+    /// would let a real env silently never publish a pulse, which is the
+    /// precise shape of the bug this exists to close — the reader would
+    /// see no heartbeat and could not distinguish "not implemented" from
+    /// "stopped".
+    ///
+    /// # Errors
+    /// [`EnvError::HeartbeatIo`]. Callers treat this as non-fatal: a tick
+    /// that did its work but could not write its pulse still succeeded.
+    fn write_heartbeat(&self, beat: &Heartbeat) -> Result<(), EnvError>;
 }
 
 #[cfg(any(test, feature = "mock"))]
@@ -119,6 +168,10 @@ mod mock {
         pub builds: RefCell<Vec<Rev>>,
         pub switches: RefCell<Vec<Rev>>,
         pub persists: RefCell<u32>,
+        /// Every heartbeat written, in order — so a test can prove that
+        /// EVERY tick path published a pulse, not just the happy one.
+        pub heartbeats: RefCell<Vec<super::Heartbeat>>,
+        heartbeat_result: RefCell<Result<(), EnvError>>,
     }
 
     impl Default for MockEnv {
@@ -134,6 +187,8 @@ mod mock {
                 builds: RefCell::new(Vec::new()),
                 switches: RefCell::new(Vec::new()),
                 persists: RefCell::new(0),
+                heartbeats: RefCell::new(Vec::new()),
+                heartbeat_result: RefCell::new(Ok(())),
             }
         }
     }
@@ -186,6 +241,12 @@ mod mock {
         pub fn chain(&self) -> ReceiptChain {
             self.chain.borrow().clone()
         }
+
+        /// Program the heartbeat-write outcome — to prove a tick still
+        /// succeeds when its pulse cannot be recorded.
+        pub fn set_heartbeat_result(&self, r: Result<(), EnvError>) {
+            *self.heartbeat_result.borrow_mut() = r;
+        }
     }
 
     impl GitopsEnv for MockEnv {
@@ -222,6 +283,12 @@ mod mock {
 
         fn now_unix_ms(&self) -> u64 {
             *self.clock_ms.borrow()
+        }
+
+        fn write_heartbeat(&self, beat: &super::Heartbeat) -> Result<(), EnvError> {
+            self.heartbeat_result.borrow().clone()?;
+            self.heartbeats.borrow_mut().push(beat.clone());
+            Ok(())
         }
     }
 }

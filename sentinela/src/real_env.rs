@@ -11,7 +11,7 @@
 //! ban): argv pieces are `concat`'d or built with typed builders.
 
 use sentinela_config::SentinelaConfig;
-use sentinela_core::{EnvError, Generation, GitopsEnv, ReceiptChain, Rev};
+use sentinela_core::{EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, Rev};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,6 +39,22 @@ impl RealEnv {
 
     fn receipts_path(&self) -> PathBuf {
         Path::new(&self.cfg.state_dir).join("receipts.json")
+    }
+
+    /// The liveness pulse, beside the chain. Separate file on purpose: it
+    /// is rewritten every tick (the chain is append-only and rarely
+    /// changes), and a reader that only wants "is this loop alive" must
+    /// not have to parse a chain that reached 31 MB on ryn.
+    pub fn heartbeat_path(&self) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join("heartbeat.json")
+    }
+
+    /// Read the last published pulse, if any. `None` means no heartbeat
+    /// has ever been written — which a reader must treat as "cannot tell",
+    /// never as healthy.
+    pub fn load_heartbeat(&self) -> Option<Heartbeat> {
+        let raw = std::fs::read_to_string(self.heartbeat_path()).ok()?;
+        serde_json::from_str(&raw).ok()
     }
 
     /// The `<flake_url>/<rev>#<hostname>` flake ref for a rev-pinned build.
@@ -205,6 +221,18 @@ impl GitopsEnv for RealEnv {
             .duration_since(UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0)
+    }
+
+    fn write_heartbeat(&self, beat: &Heartbeat) -> Result<(), EnvError> {
+        let path = self.heartbeat_path();
+        let body =
+            serde_json::to_string_pretty(beat).map_err(|e| EnvError::HeartbeatIo(e.to_string()))?;
+        // Same atomic write-then-rename as the chain: a reader must never
+        // catch a half-written pulse and conclude the loop is broken.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body.as_bytes()).map_err(|e| EnvError::HeartbeatIo(e.to_string()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| EnvError::HeartbeatIo(e.to_string()))?;
+        Ok(())
     }
 }
 

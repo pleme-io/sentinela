@@ -32,7 +32,7 @@
 //! - **receipt-before-idle** — a successful switch persists its receipt
 //!   before the tick returns; the persisted chain is the source of truth.
 
-use crate::env::{EnvError, GitopsEnv, LoopConfig};
+use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig};
 use crate::receipt::{Generation, Outcome, ReceiptChain};
 use crate::rev::Rev;
 
@@ -111,6 +111,48 @@ pub enum TickOutcome {
     },
 }
 
+impl TickOutcome {
+    /// The variant name, for the heartbeat and for logs. Exhaustive by
+    /// construction: a new variant is a compile error here, so it cannot
+    /// be published as an unnamed pulse.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::CoolingDown { .. } => "coolingDown",
+            Self::Unchanged { .. } => "unchanged",
+            Self::Unresolvable => "unresolvable",
+            Self::ProbeError { .. } => "probeError",
+            Self::BuildFailed { .. } => "buildFailed",
+            Self::Deferred { .. } => "deferred",
+            Self::ReprobeInconclusive { .. } => "reprobeInconclusive",
+            Self::SwitchFailed { .. } => "switchFailed",
+            Self::Deployed { .. } => "deployed",
+        }
+    }
+
+    /// Branch HEAD as this tick observed it, when it got far enough to
+    /// observe one.
+    ///
+    /// `None` for the three outcomes that never obtained a HEAD
+    /// (`CoolingDown`, `Unresolvable`, `ProbeError`) — reporting a
+    /// remembered rev there would be exactly the fabricate-an-unmeasured-
+    /// value mistake this whole change exists to remove. For `Deferred`
+    /// the answer is `newer`, not `built`: `newer` is what the re-probe
+    /// actually saw.
+    #[must_use]
+    pub fn observed_head(&self) -> Option<&Rev> {
+        match self {
+            Self::CoolingDown { .. } | Self::Unresolvable | Self::ProbeError { .. } => None,
+            Self::Unchanged { rev }
+            | Self::BuildFailed { rev, .. }
+            | Self::SwitchFailed { rev, .. }
+            | Self::Deployed { rev, .. } => Some(rev),
+            Self::Deferred { newer, .. } => Some(newer),
+            Self::ReprobeInconclusive { built } => Some(built),
+        }
+    }
+}
+
 /// The GitOps loop driver. Holds the between-tick [`State`] and the
 /// [`LoopConfig`]; is pure over a [`GitopsEnv`].
 #[derive(Debug, Clone)]
@@ -135,6 +177,33 @@ impl Sentinela {
     /// Run one cycle against `env`. See the module docs for the beat
     /// structure and the invariants each branch upholds.
     pub fn tick<E: GitopsEnv>(&mut self, env: &E) -> TickOutcome {
+        let outcome = self.tick_inner(env);
+        // ── ★ THE PULSE IS WRITTEN HERE, NOT INSIDE `tick_inner` ──────────
+        // `tick_inner` has nine return points and every one of them is a
+        // real outcome the operator needs counted as "the loop was alive".
+        // A `write_heartbeat` call at the end of the body would be skipped
+        // by all eight early returns, and — worse — the tenth return point
+        // someone adds later would skip it silently. A wrapper cannot be
+        // bypassed by adding a `return` to the body, so liveness reporting
+        // is structural rather than a rule contributors must remember.
+        //
+        // Best-effort by design: a loop that did its work but could not
+        // record its pulse has still done its work. The failure is logged,
+        // never propagated — a read-only state dir must not stop deploys.
+        let beat = Heartbeat {
+            at_unix_ms: env.now_unix_ms(),
+            outcome: outcome.kind().to_owned(),
+            head_rev: outcome.observed_head().cloned(),
+        };
+        if let Err(e) = env.write_heartbeat(&beat) {
+            tracing::warn!(error = %e, "sentinela: could not write heartbeat (loop is fine)");
+        }
+        outcome
+    }
+
+    /// The cycle proper. Every `return` here is a completed tick; the
+    /// heartbeat is applied by [`Sentinela::tick`], which wraps this.
+    fn tick_inner<E: GitopsEnv>(&mut self, env: &E) -> TickOutcome {
         // Cooldown gate — during a backoff the loop touches nothing.
         if let State::CoolingDown { until_unix_ms } = self.state {
             let now = env.now_unix_ms();
@@ -287,6 +356,156 @@ mod tests {
 
     fn cfg() -> LoopConfig {
         LoopConfig { cooldown_after_failure_ms: 1000 }
+    }
+
+    /// ── ★ LIVENESS IS ONLY REAL IF EVERY PATH REPORTS IT ─────────────────
+    /// Drives one tick into each terminal outcome and asserts a pulse was
+    /// published for it. The failure this closes is not hypothetical: cid's
+    /// daemon died and `status` kept reporting `consecutive_failures: 0,
+    /// chain_verified: true` from its last good receipt, because a stopped
+    /// loop writes nothing and a chain cannot record a tick that never ran.
+    ///
+    /// The valuable arms are the FAIL-CLOSED ones. A heartbeat that only
+    /// appears on success would leave a permanently-failing loop looking
+    /// dead and a dead loop looking failing — the two states we most need
+    /// to tell apart.
+    ///
+    /// Red run: move the `write_heartbeat` call from `tick` into the end of
+    /// `tick_inner`'s body and every early-returning arm here goes red
+    /// (7 of 9), which is exactly why it is a wrapper.
+    #[test]
+    fn every_tick_outcome_publishes_exactly_one_heartbeat() {
+        // (env-builder, expected outcome kind, expected observed head)
+        let cases: Vec<(Box<dyn Fn() -> MockEnv>, &str, Option<Rev>)> = vec![
+            (
+                Box::new(|| {
+                    let e = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+                    e.set_switch_result(Ok(Generation(7)));
+                    e
+                }),
+                "deployed",
+                Some(rev(1)),
+            ),
+            (
+                Box::new(|| MockEnv::with_probes(vec![Ok(None)])),
+                "unresolvable",
+                None,
+            ),
+            (
+                Box::new(|| {
+                    MockEnv::with_probes(vec![Err(EnvError::ProbeFailed("boom".into()))])
+                }),
+                "probeError",
+                None,
+            ),
+            (
+                Box::new(|| {
+                    let e = MockEnv::with_probes(vec![Ok(Some(rev(2)))]);
+                    e.set_build_result(Err(EnvError::BuildFailed("nope".into())));
+                    e
+                }),
+                "buildFailed",
+                Some(rev(2)),
+            ),
+            (
+                Box::new(|| MockEnv::with_probes(vec![Ok(Some(rev(3))), Ok(Some(rev(4)))])),
+                "deferred",
+                Some(rev(4)),
+            ),
+            (
+                Box::new(|| MockEnv::with_probes(vec![Ok(Some(rev(5))), Ok(None)])),
+                "reprobeInconclusive",
+                Some(rev(5)),
+            ),
+            (
+                Box::new(|| {
+                    let e = MockEnv::with_probes(vec![Ok(Some(rev(6))), Ok(Some(rev(6)))]);
+                    e.set_switch_result(Err(EnvError::SwitchFailed("denied".into())));
+                    e
+                }),
+                "switchFailed",
+                Some(rev(6)),
+            ),
+        ];
+
+        for (build_env, expected_kind, expected_head) in cases {
+            let env = build_env();
+            let mut s = Sentinela::new(cfg());
+            let out = s.tick(&env);
+            assert_eq!(out.kind(), expected_kind, "wrong outcome for this case");
+
+            let beats = env.heartbeats.borrow();
+            assert_eq!(
+                beats.len(),
+                1,
+                "outcome `{expected_kind}` published {} heartbeats, expected exactly 1",
+                beats.len()
+            );
+            assert_eq!(beats[0].outcome, expected_kind);
+            assert_eq!(
+                beats[0].head_rev, expected_head,
+                "outcome `{expected_kind}` reported the wrong observed head"
+            );
+        }
+    }
+
+    /// `Unchanged` and `CoolingDown` need a prior tick to reach, so they
+    /// get their own case — with the SECOND tick's pulse checked.
+    #[test]
+    fn the_quiet_outcomes_publish_a_pulse_too() {
+        // Unchanged: deploy, then probe the same rev again.
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.set_switch_result(Ok(Generation(1)));
+        let mut s = Sentinela::new(cfg());
+        s.tick(&env);
+        let out = s.tick(&env);
+        assert_eq!(out.kind(), "unchanged");
+        let beats = env.heartbeats.borrow();
+        assert_eq!(beats.len(), 2, "an idle loop must still prove it is alive");
+        assert_eq!(beats[1].outcome, "unchanged");
+        assert_eq!(beats[1].head_rev, Some(rev(1)));
+        drop(beats);
+
+        // CoolingDown: fail, then tick again inside the cooldown window.
+        let env2 = MockEnv::with_probes(vec![Err(EnvError::ProbeFailed("x".into()))]);
+        let mut s2 = Sentinela::new(cfg());
+        s2.tick(&env2);
+        let out2 = s2.tick(&env2);
+        assert_eq!(out2.kind(), "coolingDown");
+        let beats2 = env2.heartbeats.borrow();
+        assert_eq!(beats2.len(), 2, "a cooling loop is alive and must say so");
+        assert_eq!(beats2[1].outcome, "coolingDown");
+        assert_eq!(
+            beats2[1].head_rev, None,
+            "a cooling tick observed no HEAD and must not report one"
+        );
+    }
+
+    /// A loop that cannot record its pulse has still done its work. The
+    /// heartbeat is diagnostics, never a precondition for converging.
+    #[test]
+    fn a_heartbeat_write_failure_does_not_change_the_outcome() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.set_switch_result(Ok(Generation(9)));
+        env.set_heartbeat_result(Err(EnvError::HeartbeatIo("read-only fs".into())));
+        let mut s = Sentinela::new(cfg());
+        let out = s.tick(&env);
+        assert_eq!(
+            out,
+            TickOutcome::Deployed {
+                rev: rev(1),
+                generation: Generation(9)
+            }
+        );
+        assert!(
+            env.heartbeats.borrow().is_empty(),
+            "the write failed, so nothing was stored"
+        );
+        assert_eq!(
+            env.chain().last_activated_rev(),
+            Some(&rev(1)),
+            "but the deploy still happened"
+        );
     }
 
     #[test]
