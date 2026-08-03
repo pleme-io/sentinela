@@ -52,6 +52,21 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// What this outcome says about the loop's health — see [`Health`].
+    ///
+    /// **Deliberately exhaustive: do not add a `_` arm.** The absent wildcard
+    /// is the enforcement — a new variant becomes a compile error here until
+    /// somebody classifies it, which is what keeps every consumer of
+    /// "is this a failure?" in agreement.
+    #[must_use]
+    pub fn health(&self) -> Health {
+        match self {
+            Self::Activated { .. } => Health::Converged,
+            Self::Deferred { .. } => Health::Benign,
+            Self::Failed { .. } => Health::Broken,
+        }
+    }
+
     /// A `Failed` outcome whose retained text is bounded to
     /// [`MAX_ERROR_BYTES`], truncated on a char boundary with an explicit
     /// marker so a reader knows the text was cut rather than that the build
@@ -122,6 +137,37 @@ impl DeployReceipt {
     pub fn is_activated(&self) -> bool {
         matches!(self.outcome, Outcome::Activated { .. })
     }
+
+    /// What this receipt says about the loop's health.
+    #[must_use]
+    pub fn health(&self) -> Health {
+        self.outcome.health()
+    }
+}
+
+/// What one receipt says about the loop's health.
+///
+/// ── ★ THE ONE CLASSIFICATION, EXHAUSTIVE BY CONSTRUCTION ─────────────────
+/// [`Outcome::health`] matches every variant with **no wildcard arm**, so a
+/// new `Outcome` cannot be added without deciding what it means for health —
+/// the compiler refuses. That is the invariant: "is this a failure?" has
+/// exactly one answer, in one place, and it cannot drift.
+///
+/// It exists because it *did* drift. `fsm.rs` defers with the comment
+/// "no cooldown — deferral is not a failure", while `consecutive_failures`
+/// counted anything that was not an activation — so a deferral was
+/// simultaneously not-a-failure (FSM) and a failure (chain). MEASURED on ryn
+/// 2026-08-02: a healthy deferral moved the streak 4 → 5 and the startup
+/// banner declared DEGRADED while the loop was converging normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Health {
+    /// The node moved to this rev. The loop did its job.
+    Converged,
+    /// Nothing broke and nothing deployed — the loop declined on purpose.
+    Benign,
+    /// The loop tried to converge and could not.
+    Broken,
 }
 
 /// An append-only, verifiable chain of deploy receipts.
@@ -167,22 +213,59 @@ impl ReceiptChain {
             .map(|r| &r.rev)
     }
 
-    /// How many receipts at the tail of the chain are *not* activations —
-    /// the current unbroken failure streak. `0` when the head activated
-    /// cleanly (or the chain is empty).
+    /// How many [`Health::Broken`] receipts sit at the tail since the last
+    /// activation — the current unbroken *failure* streak. `0` when the head
+    /// activated cleanly (or the chain is empty).
     ///
     /// This is the number that makes a silent reconciler loud. A daemon
     /// failing every tick looks exactly like a quiet healthy one from the
     /// outside: same empty terminal, same absent alert. MEASURED on ryn
-    /// 2026-08-02, this chain read 4136 failed / 1 activated across 27.9
-    /// days — every tick since seq 0 had failed and nothing said so.
-    /// Report it wherever an operator already looks.
+    /// 2026-08-02, this chain read 4136 failed / 1 activated across the
+    /// preceding 27.9 days — every tick since seq 0 had failed and nothing
+    /// said so. (That streak is a *dated measurement*, not current state; it
+    /// was the read-only `./result` symlink bug, fixed by anchoring the
+    /// rebuild cwd.) Report it wherever an operator already looks.
+    ///
+    /// ── ★ A DEFERRAL IS TRANSPARENT, NOT A FAILURE ───────────────────────
+    /// [`Health::Benign`] receipts are skipped: they neither extend the
+    /// streak nor clear it. Counting them inflated the number on exactly the
+    /// repos where it matters most — a busy branch defers often and healthily
+    /// — and an alarm that fires while the loop is fine trains the operator
+    /// to ignore it, which is the failure this function exists to prevent.
+    /// Nor may a deferral *reset* the streak: nothing was fixed, so a real
+    /// failure underneath must stay visible. Use [`Self::consecutive_deferrals`]
+    /// for the distinct "building slower than the push cadence" condition.
     #[must_use]
     pub fn consecutive_failures(&self) -> usize {
+        let mut broken = 0;
+        for r in self.entries.iter().rev() {
+            match r.health() {
+                Health::Converged => break,
+                Health::Broken => broken += 1,
+                Health::Benign => {}
+            }
+        }
+        broken
+    }
+
+    /// How many [`Health::Benign`] receipts sit at the very tail — the
+    /// current unbroken *deferral* streak, ended by any activation or
+    /// failure. `0` unless the head is a deferral.
+    ///
+    /// This names a condition that previously had no name and masqueraded as
+    /// failure: the build takes longer than the interval between pushes, so
+    /// every build finishes against a HEAD that has already moved and defers
+    /// forever. Nothing is broken — the loop converges the moment the branch
+    /// goes quiet — but it is not converging *now*, and that is worth saying
+    /// out loud in different words than "DEGRADED". MEASURED on ryn
+    /// 2026-08-02: a 12m02s darwin build against a branch whose median
+    /// inter-commit gap that evening was under 7 minutes.
+    #[must_use]
+    pub fn consecutive_deferrals(&self) -> usize {
         self.entries
             .iter()
             .rev()
-            .take_while(|r| !r.is_activated())
+            .take_while(|r| r.health() == Health::Benign)
             .count()
     }
 
@@ -415,11 +498,109 @@ mod tests {
             .unwrap();
         assert_eq!(c.consecutive_failures(), 1);
 
-        // Deferred is not an activation, so it extends the streak rather
-        // than clearing it — a deferral means nothing was deployed.
+        // ── ★ CHANGED 2026-08-02: a deferral is TRANSPARENT ──────────────
+        // This previously asserted 2 — a deferral extended the streak. That
+        // contradicted `fsm.rs`, which defers with "no cooldown — deferral is
+        // not a failure", and it made the DEGRADED banner fire on healthy
+        // convergence (measured on ryn: streak 4 → 5 across a clean
+        // deferral). A deferral neither extends nor clears: the real failure
+        // at rev(4) must stay visible underneath it.
         c.append(c.next_receipt(rev(5), Outcome::Deferred { newer: rev(6) }, 5))
             .unwrap();
-        assert_eq!(c.consecutive_failures(), 2);
+        assert_eq!(
+            c.consecutive_failures(),
+            1,
+            "a deferral must not extend the failure streak"
+        );
+        assert_eq!(
+            c.consecutive_deferrals(),
+            1,
+            "but it is a deferral streak of 1"
+        );
+
+        // Still transparent when stacked, and still not masking rev(4).
+        c.append(c.next_receipt(rev(6), Outcome::Deferred { newer: rev(7) }, 6))
+            .unwrap();
+        assert_eq!(
+            c.consecutive_failures(),
+            1,
+            "deferrals never accumulate as failures"
+        );
+        assert_eq!(c.consecutive_deferrals(), 2);
+
+        // A real failure on top still counts, through the deferrals.
+        c.append(c.next_receipt(rev(7), Outcome::Failed { error: "d".into() }, 7))
+            .unwrap();
+        assert_eq!(
+            c.consecutive_failures(),
+            2,
+            "rev(4) and rev(7); rev(5)/rev(6) skipped"
+        );
+        assert_eq!(
+            c.consecutive_deferrals(),
+            0,
+            "a failure ends the deferral streak"
+        );
+    }
+
+    #[test]
+    fn health_classifies_every_outcome_variant() {
+        // `Outcome::health` has NO wildcard arm, so a new variant is a
+        // compile error until classified. This pins the three current
+        // answers so a silent reclassification is caught too.
+        assert_eq!(
+            Outcome::Activated {
+                generation: Generation(1)
+            }
+            .health(),
+            Health::Converged
+        );
+        assert_eq!(Outcome::Deferred { newer: rev(2) }.health(), Health::Benign);
+        assert_eq!(Outcome::failed("boom").health(), Health::Broken);
+    }
+
+    #[test]
+    fn a_healthy_deferring_loop_is_never_reported_as_degraded() {
+        // The regression this change exists to prevent: a busy branch where
+        // every build finishes against a moved HEAD. Nothing is broken, so
+        // `consecutive_failures` — the number the DEGRADED banner reads —
+        // must stay 0 however long the deferral run gets.
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(1),
+            },
+            1,
+        ))
+        .unwrap();
+        for i in 2..12u8 {
+            c.append(c.next_receipt(
+                rev(i),
+                Outcome::Deferred { newer: rev(i + 1) },
+                u64::from(i),
+            ))
+            .unwrap();
+        }
+        assert_eq!(c.consecutive_failures(), 0, "deferring is not degraded");
+        assert_eq!(
+            c.consecutive_deferrals(),
+            10,
+            "but it IS a 10-deep deferral streak"
+        );
+    }
+
+    #[test]
+    fn deferrals_before_any_activation_are_still_not_failures() {
+        // A freshly-enrolled node that defers on its first ticks has never
+        // deployed, but nothing has broken either — the never-deployed case
+        // is carried by `is_empty` / `last_activated_rev`, not by the streak.
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(rev(1), Outcome::Deferred { newer: rev(2) }, 1))
+            .unwrap();
+        assert_eq!(c.consecutive_failures(), 0);
+        assert_eq!(c.consecutive_deferrals(), 1);
+        assert_eq!(c.last_activated_rev(), None);
     }
 
     #[test]

@@ -134,18 +134,33 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
             // of failure is not evidence of convergence; only an activation
             // is. Seen for real on cid 2026-08-02, freshly migrated onto
             // this engine: receipts=0, streak=0, last_activated=never.
+            // ── ★ THREE STATES, NOT TWO ──────────────────────────────────
+            // "not converged" is not one condition. A loop whose builds FAIL
+            // needs a human; a loop that keeps DEFERRING because the branch
+            // moves faster than it can build needs nothing — it converges the
+            // moment pushing stops. Reporting both as DEGRADED is what trains
+            // an operator to ignore the word. Broken outranks starved: if
+            // anything is genuinely failing, say that first.
+            let deferrals = chain.consecutive_deferrals();
             if chain.is_empty() {
                 tracing::warn!(
                     "gitops: no deploy recorded yet — expected on a freshly-enrolled node"
                 );
-            } else if streak == 0 {
-                tracing::info!(last_activated = %last_ok, "gitops: converged");
-            } else {
+            } else if streak > 0 {
                 tracing::error!(
                     consecutive_failures = streak,
                     last_activated = %last_ok,
                     "gitops: DEGRADED — this node is not tracking the branch"
                 );
+            } else if deferrals > 0 {
+                tracing::warn!(
+                    consecutive_deferrals = deferrals,
+                    last_activated = %last_ok,
+                    "gitops: STARVED — each build finishes against a moved HEAD; \
+                     nothing is broken, the branch is moving faster than one build"
+                );
+            } else {
+                tracing::info!(last_activated = %last_ok, "gitops: converged");
             }
         }
         // Unreadable chain is itself worth saying out loud: it means the
@@ -227,6 +242,10 @@ fn status(cfg: &SentinelaConfig, gate: bool) -> std::process::ExitCode {
         "branch": cfg.rev_probe.branch,
         "receipts": chain.len(),
         "consecutive_failures": chain.consecutive_failures(),
+        // Deferrals are NOT failures (see ReceiptChain::consecutive_failures),
+        // so the streak alone can no longer answer "is it converging?". This
+        // is the other half: 0/0 is healthy, n/0 is broken, 0/n is starved.
+        "consecutive_deferrals": chain.consecutive_deferrals(),
         "chain_verified": verified,
         "last_activated_rev": chain.last_activated_rev().map(sentinela_core::Rev::as_str),
         "head": chain.head(),

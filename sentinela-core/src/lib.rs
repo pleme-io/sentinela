@@ -26,7 +26,9 @@ mod rev;
 
 pub use env::{EnvError, GitopsEnv, Heartbeat, LoopConfig};
 pub use fsm::{Sentinela, State, TickOutcome};
-pub use receipt::{ChainError, DeployReceipt, GENESIS_HASH, Generation, Outcome, ReceiptChain};
+pub use receipt::{
+    ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, Outcome, ReceiptChain,
+};
 pub use rev::{Rev, RevError};
 
 #[cfg(any(test, feature = "mock"))]
