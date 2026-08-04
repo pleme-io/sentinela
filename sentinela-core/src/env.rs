@@ -166,6 +166,38 @@ pub struct LoopConfig {
     /// long the loop insists on the strictest form of progress before
     /// accepting a weaker one. `0` disables the relaxation entirely.
     pub land_ancestor_after_deferrals: usize,
+    /// How many consecutive BUILD FAILURES before the loop will fall back to
+    /// the newest rev it already proved buildable — the second starvation
+    /// escape. `0` disables it.
+    ///
+    /// ── ★ THE HOLE THIS CLOSES: A BROKEN HEAD STARVES THE NODE FOREVER ───
+    /// `land_ancestor_after_deferrals` escapes the case where the loop cannot
+    /// keep up. It does NOT escape the case where HEAD simply does not build:
+    /// that path is `record → cooldown → retry the same broken rev`, which
+    /// makes no progress no matter how many times it runs, because the rev is
+    /// not going to start building on its own. A node can hold a rev it
+    /// already built and verified while HEAD stays red indefinitely.
+    ///
+    /// MEASURED on cid 2026-08-04. `8b7af29` built clean and deferred; two
+    /// commits then landed an unresolved git merge in `flake.lock` (16
+    /// conflict markers — JSON, so it fails at the parser), and every
+    /// subsequent tick failed in ~1–8s against that head. The node held
+    /// `8b7af29`, which BUILT, and would never have activated it — and that
+    /// rev carried a kubeconfig token re-seed the whole fleet was waiting on.
+    /// The break was upstream and human; the starvation was ours.
+    ///
+    /// Safety is IDENTICAL to the deferral escape and reuses its two proofs:
+    /// the candidate must be an ancestor of HEAD (forward along the same
+    /// history — a force-push or revert fails this) and a descendant of what
+    /// this node last activated (forward for this node). Both fail closed.
+    /// The candidate itself is never speculative: it is only ever a rev with
+    /// a receipt saying this node built it.
+    ///
+    /// Deliberately a SEPARATE knob from the deferral threshold: they escape
+    /// different traps and want different numbers. A deferral means the loop
+    /// is healthy but slow, so 2 is patient. A failure streak means HEAD is
+    /// red, where each extra attempt costs a full build and buys nothing.
+    pub land_last_good_after_failures: usize,
 }
 
 impl Default for LoopConfig {
@@ -181,6 +213,14 @@ impl Default for LoopConfig {
             // unlucky overlap, short enough that a node does not sit stale
             // for an hour proving what it already knows.
             land_ancestor_after_deferrals: 2,
+            // Three failures against the same head, at a 5-minute cooldown,
+            // is ~15 minutes of a red HEAD. Higher than the deferral
+            // threshold on purpose: a deferral is one healthy tick losing a
+            // race, while a failure may genuinely be transient (a flaky
+            // fetch, a substituter blip), and falling back on the FIRST one
+            // would trade a self-healing retry for a knowingly-stale deploy.
+            // Three is past where "transient" is a credible reading.
+            land_last_good_after_failures: 3,
         }
     }
 }

@@ -383,7 +383,27 @@ impl Sentinela {
             };
             // Best-effort attest (the system is unchanged, so a persist
             // failure here corrupts nothing).
-            let _ = self.record(&mut chain, env, head, Outcome::failed(e.to_string()));
+            let _ = self.record(&mut chain, env, head.clone(), Outcome::failed(e.to_string()));
+
+            // ── ★ THE SECOND ESCAPE: A RED HEAD MUST NOT STARVE THE NODE ──
+            // Retrying is the right first answer — most build failures are
+            // transient. It is the wrong LAST answer: a rev that fails to
+            // build does not repair itself, so past some streak every further
+            // tick is a full build spent to re-learn the same fact while a rev
+            // we ALREADY BUILT sits unactivated. See
+            // `land_last_good_after_failures` for the 2026-08-04 measurement
+            // that motivated this.
+            //
+            // The record above is written FIRST, deliberately: the streak this
+            // reads must include the failure we just had, so the threshold
+            // counts attempts rather than attempts-minus-one.
+            //
+            // Both ancestry proofs are the deferral escape's, unchanged and
+            // fail-closed. Nothing here weakens the strict path — a healthy
+            // loop never reaches this branch at all.
+            if let Some(out) = self.try_land_last_good(&mut chain, env, &head) {
+                return out;
+            }
             return self.enter_cooldown(env, out);
         }
 
@@ -487,6 +507,89 @@ impl Sentinela {
 
         // Act → switch (re-check confirmed head is still HEAD).
         self.activate(chain, env, head, None)
+    }
+
+    /// After a failed build against `head`, decide whether to fall back to
+    /// the newest rev this node already proved buildable.
+    ///
+    /// `Some(outcome)` means the fallback fired and `outcome` is the tick's
+    /// result; `None` means it did not, and the caller proceeds to its normal
+    /// cooldown. Returning the caller's outcome rather than a bool keeps the
+    /// "which activation happened" decision in ONE place — the fallback shares
+    /// [`Self::activate`], so it reports [`TickOutcome::DeployedBehind`] with
+    /// the same meaning the deferral escape gives it: a verified ancestor of
+    /// HEAD, landed knowingly.
+    ///
+    /// Every gate below fails closed — a missing candidate, an ancestry
+    /// question the network cannot answer, or a threshold not yet reached all
+    /// take the caller's cooldown path unchanged.
+    fn try_land_last_good<E: GitopsEnv>(
+        &mut self,
+        chain: &mut ReceiptChain,
+        env: &E,
+        head: &Rev,
+    ) -> Option<TickOutcome> {
+        let threshold = self.cfg.land_last_good_after_failures;
+        if threshold == 0 {
+            return None;
+        }
+        let streak = chain.consecutive_failures();
+        if streak < threshold {
+            return None;
+        }
+        // The candidate is never speculative: `last_built_unactivated_rev`
+        // only returns a rev carrying a receipt that this node built it, and
+        // only searches back to the last activation, so it is newer than what
+        // we run.
+        let candidate = chain.last_built_unactivated_rev()?.clone();
+        // Guard the degenerate case explicitly rather than relying on the
+        // ancestry calls: a rev is its own ancestor under `merge-base
+        // --is-ancestor`, so a candidate that IS head would otherwise pass
+        // both checks and re-attempt the switch of a rev we just failed to
+        // build. Cannot happen today (a failed build records `Failed`, never
+        // `Deferred`), which is exactly why it deserves a guard rather than a
+        // comment — the invariant lives in another function.
+        if candidate == *head {
+            return None;
+        }
+        // Forward along the same history: the branch must still contain the
+        // candidate. A force-push, reset or revert fails this — the rollback
+        // case the no-downgrade rule exists to refuse.
+        let forward_on_branch = env.is_ancestor(&candidate, head);
+        // Forward for THIS node: never activate something behind what we run.
+        let forward_for_node = match chain.last_activated_rev() {
+            None => Ok(true),
+            Some(last) => env.is_ancestor(last, &candidate),
+        };
+        match (forward_on_branch, forward_for_node) {
+            (Ok(true), Ok(true)) => {
+                tracing::info!(
+                    rev = candidate.short(),
+                    head = head.short(),
+                    failures = streak,
+                    "head will not build: landing the newest rev that did"
+                );
+                // `activate` consumes the chain (it appends + persists), and
+                // we hold it by reference. Taking it is sound precisely
+                // because this arm RETURNS the tick: the caller's `chain` is
+                // never read again on this path.
+                Some(self.activate(
+                    std::mem::take(chain),
+                    env,
+                    candidate,
+                    Some(head.clone()),
+                ))
+            }
+            (a, b) => {
+                if let Some(e) = a.as_ref().err().or_else(|| b.as_ref().err()) {
+                    tracing::warn!(
+                        error = %e,
+                        "ancestry unanswerable — not landing last-good (fail-closed)"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Switch to `rev` and attest, shared by the two paths that reach an
@@ -617,6 +720,12 @@ mod tests {
             // applied everywhere would make every other assertion weaker
             // without anyone noticing.
             land_ancestor_after_deferrals: 0,
+            // OFF for the same reason, and it matters MORE here: this escape
+            // fires from the build-failure path, which the general suite
+            // exercises constantly. Left on, a "build failed → cooldown" case
+            // could silently become "build failed → landed something else"
+            // and still pass a weaker assertion.
+            land_last_good_after_failures: 0,
         }
     }
 
@@ -626,6 +735,187 @@ mod tests {
             land_ancestor_after_deferrals: n,
             ..cfg()
         }
+    }
+
+    fn cfg_last_good_after(n: usize) -> LoopConfig {
+        LoopConfig {
+            land_last_good_after_failures: n,
+            ..cfg()
+        }
+    }
+
+    /// Drive the cid scenario up to (but not through) the threshold tick:
+    /// rev(1) builds and defers, then rev(2) becomes HEAD and never builds.
+    /// Returns the loop with `fails` failures already recorded against rev(2).
+    ///
+    /// The clock is advanced past each cooldown, because the point under test
+    /// is the FAILURE STREAK — a tick that returns `coolingDown` never reaches
+    /// the escape and would silently make the streak assertions vacuous.
+    fn starve_on_a_red_head(env: &MockEnv, threshold: usize, fails: u32) -> Sentinela {
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg_last_good_after(threshold));
+        assert_eq!(
+            s.tick(env).kind(),
+            "deferred",
+            "setup: rev(1) must build and defer, so a known-good exists"
+        );
+        env.set_build_result(Err(EnvError::BuildFailed(
+            "flake.lock: [json.exception.parse_error.101] parse error".to_owned(),
+        )));
+        for n in 1..=fails {
+            env.set_now_ms(u64::from(n) * 10_000);
+            let out = s.tick(env);
+            assert_eq!(
+                out.kind(),
+                "buildFailed",
+                "failure {n} is below the threshold and must simply retry"
+            );
+            assert!(
+                env.switches.borrow().is_empty(),
+                "nothing may be activated before the threshold is reached"
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn a_head_that_will_not_build_falls_back_to_the_newest_rev_that_did() {
+        // THE 2026-08-04 CID SCENARIO, as a test. rev(1) built clean and
+        // deferred; rev(2) then landed an unresolved git merge in flake.lock
+        // and could never build. The old code's answer was
+        // `cooldown → retry rev(2)` forever — a node holding a rev it had
+        // already built and verified, never activating it, for as long as
+        // main stayed red. The rev it was holding carried a kubeconfig token
+        // the fleet needed.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))), // tick 1: built 1, HEAD moved to 2 → defer
+            Ok(Some(rev(2))), // tick 2: 2 fails to build (streak 1)
+            Ok(Some(rev(2))), // tick 3: fails again    (streak 2)
+            Ok(Some(rev(2))), // tick 4: fails again    (streak 3) → escape
+        ]);
+        let mut s = starve_on_a_red_head(&env, 3, 2);
+
+        env.set_now_ms(30_000);
+        let out = s.tick(&env);
+        assert_eq!(
+            out.kind(),
+            "deployedBehind",
+            "a HEAD that cannot build must not starve the node forever"
+        );
+        assert_eq!(
+            *env.switches.borrow(),
+            vec![rev(1)],
+            "it must land the rev it BUILT — never the red HEAD it never built"
+        );
+        // It reports being behind rather than presenting this as a plain
+        // deploy: the operator must still see that HEAD is red.
+        match out {
+            TickOutcome::DeployedBehind { rev: r, newer, .. } => {
+                assert_eq!(r, rev(1));
+                assert_eq!(newer, rev(2), "the red HEAD must be named in the outcome");
+            }
+            other => panic!("expected DeployedBehind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_force_push_is_refused_even_while_a_red_head_starves_us() {
+        // Same starvation, but the known-good rev is NOT contained in HEAD —
+        // a force-push, reset or revert. Landing it would be the downgrade
+        // the no-downgrade rule exists to refuse, so continuing to fail is
+        // the CORRECT answer. This is the gate proving it still blocks: the
+        // only difference from the passing test is the ancestry answer.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        let mut s = starve_on_a_red_head(&env, 3, 2);
+
+        env.set_ancestry_result(Ok(false)); // HEAD no longer contains rev(1)
+        env.set_now_ms(30_000);
+        let out = s.tick(&env);
+        assert_eq!(
+            out.kind(),
+            "buildFailed",
+            "a non-ancestor must never land, even to escape starvation"
+        );
+        assert!(
+            env.switches.borrow().is_empty(),
+            "no activation may happen when ancestry says no"
+        );
+    }
+
+    #[test]
+    fn an_unanswerable_ancestry_question_refuses_the_fallback() {
+        // Fail-closed, symmetric with the deferral escape: "I could not
+        // check" must read as "do not", never "probably".
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        let mut s = starve_on_a_red_head(&env, 3, 2);
+
+        env.set_ancestry_result(Err(EnvError::ProbeFailed("network down".to_owned())));
+        env.set_now_ms(30_000);
+        assert_eq!(s.tick(&env).kind(), "buildFailed");
+        assert!(env.switches.borrow().is_empty(), "must not guess");
+    }
+
+    #[test]
+    fn a_red_head_with_nothing_ever_built_just_keeps_failing() {
+        // No deferral ever happened, so there is no proven-good rev to fall
+        // back TO. The escape must find no candidate and change nothing —
+        // the fallback may never invent a rev it has not built.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        env.set_ancestry_result(Ok(true));
+        env.set_build_result(Err(EnvError::BuildFailed("broken from the start".to_owned())));
+        let mut s = Sentinela::new(cfg_last_good_after(3));
+        for n in 1u32..=4 {
+            env.set_now_ms(u64::from(n) * 10_000);
+            assert_eq!(s.tick(&env).kind(), "buildFailed");
+        }
+        assert!(
+            env.switches.borrow().is_empty(),
+            "with nothing proven-good, there is nothing to land"
+        );
+    }
+
+    #[test]
+    fn the_fallback_is_off_when_its_threshold_is_zero() {
+        // `0` must keep the pre-0.1.9 behaviour exactly — retry the red head
+        // forever — so the relaxation is opt-out, not silently mandatory.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg_last_good_after(0));
+        assert_eq!(s.tick(&env).kind(), "deferred");
+        env.set_build_result(Err(EnvError::BuildFailed("red".to_owned())));
+        for n in 1u32..=4 {
+            env.set_now_ms(u64::from(n) * 10_000);
+            assert_eq!(s.tick(&env).kind(), "buildFailed");
+        }
+        assert!(
+            env.switches.borrow().is_empty(),
+            "threshold 0 must never take the escape"
+        );
     }
 
     /// ── ★ LIVENESS IS ONLY REAL IF EVERY PATH REPORTS IT ─────────────────

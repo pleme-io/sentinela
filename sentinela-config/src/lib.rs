@@ -83,6 +83,13 @@ pub struct SentinelaConfig {
     /// keeps the strict "must still be HEAD" rule forever, and with it the
     /// possibility of never converging on a busy branch.
     pub land_ancestor_after_deferrals: usize,
+    /// Consecutive BUILD FAILURES before the loop will fall back to the
+    /// newest rev it already proved buildable, instead of retrying a HEAD
+    /// that does not build. `0` keeps retrying the broken head forever —
+    /// which is what this daemon did before 0.1.9, and how a node can hold a
+    /// verified rev unactivated for as long as main stays red. See
+    /// `sentinela_core::LoopConfig::land_last_good_after_failures`.
+    pub land_last_good_after_failures: usize,
 }
 
 /// Default poll cadence, seconds.
@@ -91,6 +98,10 @@ pub const DEFAULT_POLL_SECONDS: u64 = 60;
 pub const DEFAULT_COOLDOWN_MS: u64 = 5 * 60 * 1000;
 /// Default deferral streak before landing an ancestor of HEAD.
 pub const DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS: usize = 2;
+/// Default build-failure streak before falling back to the last rev that
+/// built. Higher than the deferral threshold on purpose — a failure may be
+/// transient where a deferral is not.
+pub const DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES: usize = 3;
 
 impl Default for SentinelaConfig {
     fn default() -> Self {
@@ -110,6 +121,7 @@ impl SentinelaConfig {
             // under each.
             poll_seconds: self.poll_seconds,
             land_ancestor_after_deferrals: self.land_ancestor_after_deferrals,
+            land_last_good_after_failures: self.land_last_good_after_failures,
         }
     }
 }
@@ -125,6 +137,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             rev_probe: RevProbeConfig::bare(),
             cooldown_after_failure_ms: 0,
             land_ancestor_after_deferrals: 0,
+            land_last_good_after_failures: 0,
         }
     }
 
@@ -138,6 +151,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             rev_probe: RevProbeConfig::prescribed(),
             cooldown_after_failure_ms: DEFAULT_COOLDOWN_MS,
             land_ancestor_after_deferrals: DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS,
+            land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
         }
     }
 }
@@ -203,6 +217,7 @@ mod tests {
             },
             cooldown_after_failure_ms: 300_000,
             land_ancestor_after_deferrals: 2,
+            land_last_good_after_failures: 3,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();

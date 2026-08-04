@@ -235,6 +235,46 @@ impl ReceiptChain {
             .map(|r| &r.rev)
     }
 
+    /// The newest rev we BUILT successfully but did not activate, searching
+    /// back only as far as the last activation. `None` when the most recent
+    /// build-success is already the deployed rev, or nothing has built since.
+    ///
+    /// ── ★ WHY `Deferred` IS THE "KNOWN-GOOD" RECORD ──────────────────────
+    /// [`Outcome::Deferred`] is the only receipt that means *the build
+    /// succeeded and we chose not to activate* — a failed build records
+    /// [`Outcome::Failed`], and an activated one records
+    /// [`Outcome::Activated`]. So the deferral receipts ARE the ledger of
+    /// revs proven to build on this node, already written, needing no new
+    /// bookkeeping. This function just reads it.
+    ///
+    /// ── ★ WHY THE SCAN STOPS AT THE LAST ACTIVATION ──────────────────────
+    /// A deferral OLDER than what we last activated is behind this node, and
+    /// landing it would be the rollback the no-downgrade rule exists to
+    /// refuse. Stopping the scan at [`Health::Converged`] makes that
+    /// candidate unreachable STRUCTURALLY, so the caller's ancestry check is
+    /// a second gate rather than the only one — deliberate, because the
+    /// ancestry check can also answer "unanswerable" (network), and two
+    /// independent guards fail closed in different directions.
+    ///
+    /// Exhaustive `match`, no `_` arm — same reason as
+    /// [`Self::consecutive_deferrals`]: a new [`Health`] variant must be
+    /// classified here by a human, not defaulted to "not a candidate".
+    #[must_use]
+    pub fn last_built_unactivated_rev(&self) -> Option<&Rev> {
+        for r in self.entries.iter().rev() {
+            match r.health() {
+                // Proven to build, never activated → the candidate.
+                Health::Benign => return Some(&r.rev),
+                // Reached what this node is already running; anything older
+                // is backwards for us.
+                Health::Converged => return None,
+                // A failure says nothing about older revs — keep looking.
+                Health::Broken => {}
+            }
+        }
+        None
+    }
+
     /// How many [`Health::Broken`] receipts sit at the tail since the last
     /// activation — the current unbroken *failure* streak. `0` when the head
     /// activated cleanly (or the chain is empty).
