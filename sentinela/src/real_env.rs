@@ -174,11 +174,104 @@ impl RealEnv {
         for a in &self.cfg.extra_rebuild_args {
             cmd.arg(a);
         }
-        cmd.output().map_err(|e| match verb {
-            "switch" => EnvError::SwitchFailed(e.to_string()),
-            _ => EnvError::BuildFailed(e.to_string()),
-        })
+
+        // ── ★ CAPTURE TO A FILE, NEVER A PIPE — `output()` DEADLOCKS HERE ─
+        // `Command::output()` reads stdout/stderr to EOF and only then
+        // reaps. EOF arrives when the LAST holder of the write end closes
+        // it — not when our direct child exits. Combined with the
+        // `process_group(0)` above, that is a permanent hang: darwin-rebuild
+        // spawns grandchildren (nix, the activation scripts) which inherit
+        // the pipe, and detaching means they routinely outlive it. The
+        // direct child exits, becomes a zombie we never reap because we are
+        // still in the read, and `poll()` waits for an EOF that no longer
+        // has anyone to deliver it. There is no timeout anywhere in
+        // `output()`, so the tick never ends: no receipt, no cooldown, no
+        // retry, and a heartbeat frozen at `in_flight` forever.
+        //
+        // DIAGNOSED on cid 2026-08-04 from a live `sample(1)` of the wedged
+        // daemon:
+        //     Sentinela::tick → run_darwin_rebuild → Command::output
+        //       → read_output → poll
+        // with the direct child a zombie and zero nix build activity. It
+        // reads exactly like a slow build from the outside, which is why it
+        // survived: the operator-visible signal — "building, in_flight" —
+        // is identical to health.
+        //
+        // A file has no EOF contract to wait on. `wait()` returns when the
+        // direct child exits, no matter how many descendants still hold the
+        // descriptor, and a grandchild appending afterwards is harmless. The
+        // capture also keeps the failure text, which plain inheritance
+        // (writing straight to the daemon log) would have cost us.
+        run_captured(cmd, &self.rebuild_capture_path(verb))
+            .map_err(|e| Self::rebuild_err(verb, e.to_string()))
     }
+
+    /// Where one rebuild's merged output is captured. Per-verb rather than
+    /// per-run: the file is consumed and deleted at the end of the call, and
+    /// a stable name means a crash leaves exactly one inspectable artifact
+    /// instead of accumulating them in the state dir forever.
+    fn rebuild_capture_path(&self, verb: &str) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join(format!("rebuild-{verb}.out"))
+    }
+
+    /// The verb's error constructor — `switch` and `build` failures are
+    /// distinct outcomes and must not be collapsed.
+    fn rebuild_err(verb: &str, msg: String) -> EnvError {
+        match verb {
+            "switch" => EnvError::SwitchFailed(msg),
+            _ => EnvError::BuildFailed(msg),
+        }
+    }
+
+}
+
+/// Run `cmd` to completion with its stdout+stderr captured to `cap_path`,
+/// returning an [`std::process::Output`] whose `stderr` holds the (bounded)
+/// tail of that capture.
+///
+/// Free function, not a method, so the deadlock it exists to prevent is
+/// testable without a `RealEnv`, a config, or a real `darwin-rebuild` — see
+/// `a_leaked_grandchild_cannot_hang_the_rebuild`.
+fn run_captured(mut cmd: Command, cap_path: &Path) -> std::io::Result<std::process::Output> {
+    let f = File::create(cap_path)?;
+    let g = f.try_clone()?;
+    cmd.stdout(std::process::Stdio::from(f));
+    cmd.stderr(std::process::Stdio::from(g));
+    // Never inherit the daemon's stdin: a child that reads it would block on
+    // a descriptor nobody will ever write to.
+    cmd.stdin(std::process::Stdio::null());
+
+    let status = cmd.spawn()?.wait()?;
+
+    let captured = std::fs::read(cap_path).unwrap_or_default();
+    let _ = std::fs::remove_file(cap_path);
+    Ok(std::process::Output {
+        status,
+        // Merged into `stderr`: callers only ever read that field for the
+        // failure message, and nix splits diagnostics across both streams, so
+        // keeping them apart would drop half the reason.
+        stdout: Vec::new(),
+        stderr: tail_bytes(captured),
+    })
+}
+
+/// Keep the TAIL of a capture, bounded. A nix failure puts the reason at the
+/// END (the error, after however many thousand lines of build log), so
+/// truncating the head is what preserves the useful part. Bounded because
+/// this text reaches an `EnvError`, a receipt and a log line — an unbounded
+/// build log in the receipt chain would bloat every subsequent load of it.
+fn tail_bytes(mut v: Vec<u8>) -> Vec<u8> {
+    const MAX: usize = 16 * 1024;
+    if v.len() > MAX {
+        // Advance to a char boundary so the lossy decode downstream does not
+        // open with a replacement character.
+        let mut cut = v.len() - MAX;
+        while cut < v.len() && (v[cut] & 0xC0) == 0x80 {
+            cut += 1;
+        }
+        v = v.split_off(cut);
+    }
+    v
 }
 
 impl GitopsEnv for RealEnv {
@@ -459,6 +552,100 @@ fn current_generation() -> Option<Generation> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that FORK against the tests that assert an
+    /// flock is released.
+    ///
+    /// ── ★ A FORK TRANSIENTLY HOLDS EVERY OPEN DESCRIPTOR ─────────────────
+    /// `fork()` duplicates the whole descriptor table, so between fork and
+    /// exec the child owns a copy of any flock this process holds — CLOEXEC
+    /// closes it at EXEC, not at fork. A lock test running concurrently can
+    /// therefore observe a lock as still-held microseconds after its guard
+    /// dropped, and fail truthfully about a condition that is not a bug.
+    ///
+    /// MEASURED here 2026-08-04: adding the forking test took this binary
+    /// from 0/8 to 1/8 failing runs, always on the release assertion. The
+    /// flake is the TEST's, not the lock's, so it is fixed in the tests
+    /// rather than by weakening the assertion.
+    static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_leaked_grandchild_cannot_hang_the_rebuild() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // THE 2026-08-04 CID DEADLOCK, in miniature. `/bin/sh` exits at once
+        // but leaves a `sleep` holding the inherited stdout — precisely what
+        // darwin-rebuild does when its detached activation outlives it.
+        //
+        // Under the old `Command::output()` this blocks for the FULL sleep:
+        // output() reads to EOF, and EOF only arrives when the last holder
+        // of the write end closes it, not when our direct child exits. On
+        // cid the holder was a real activation and the wait was unbounded —
+        // the tick simply never ended.
+        //
+        // MEASURED 2026-08-04, same command both ways:
+        //     pipe capture (what output() does): 10.02s
+        //     file capture (what we do now):      0.01s
+        // Note you CANNOT verify that by swapping `run_captured` for
+        // `.output()` here: output() forces its own pipes, overriding the
+        // File stdio, so the capture comes back empty and this test fails on
+        // the content assertion long before it could hang. The timing above
+        // was taken against a standalone reproduction of the same POSIX
+        // mechanic, which is the honest way to state it.
+        //
+        // `process_group(0)` is set because it is what production does, and
+        // it is half the cause: detaching is exactly what lets grandchildren
+        // outlive the child.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 10 & echo started");
+        cmd.process_group(0);
+
+        let cap = std::env::temp_dir().join(format!(
+            "sentinela-capture-test-{}.out",
+            std::process::id()
+        ));
+        let t0 = std::time::Instant::now();
+        let out = run_captured(cmd, &cap).expect("capture run must not error");
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a leaked grandchild must not hold the rebuild open — took {elapsed:?}"
+        );
+        assert!(out.status.success(), "the direct child exited cleanly");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("started"),
+            "output must still be captured, not merely un-blocked"
+        );
+        assert!(
+            !cap.exists(),
+            "the capture file is consumed and cleaned up"
+        );
+    }
+
+    #[test]
+    fn a_capture_is_bounded_to_its_tail_on_a_char_boundary() {
+        // The reason lives at the END of a nix log, so the tail is what we
+        // keep — and the cut must land on a char boundary or the lossy
+        // decode opens with U+FFFD.
+        let big = "é".repeat(40 * 1024).into_bytes();
+        let kept = tail_bytes(big.clone());
+        assert!(kept.len() <= 16 * 1024, "must be bounded");
+        assert!(
+            big.ends_with(&kept),
+            "must keep the TAIL, never the head"
+        );
+        let s = String::from_utf8_lossy(&kept);
+        assert!(
+            !s.starts_with('\u{FFFD}'),
+            "must cut on a char boundary, got a replacement char"
+        );
+    }
+
+    #[test]
+    fn a_capture_smaller_than_the_bound_is_untouched() {
+        let small = b"error: flake.lock parse error".to_vec();
+        assert_eq!(tail_bytes(small.clone()), small);
+    }
+
     #[test]
     fn inject_token_builds_basic_auth_url() {
         let out = inject_token("https://github.com/pleme-io/nix", "TKN").unwrap();
@@ -563,6 +750,7 @@ mod tests {
 
     #[test]
     fn a_held_lock_reports_its_holder() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         let _first = acquire_switch_lock(&path).expect("first acquisition");
@@ -577,6 +765,7 @@ mod tests {
 
     #[test]
     fn an_uncontended_lock_is_acquired_and_released_on_drop() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         {
@@ -591,6 +780,7 @@ mod tests {
 
     #[test]
     fn the_lock_file_is_group_and_other_writable() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Cross-user flock needs a 0666 file: the daemon (root) and the
         // operator both create it, and whoever comes second must still be
         // able to open it for WRITE to take the exclusive flock.
