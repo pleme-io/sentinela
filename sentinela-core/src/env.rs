@@ -514,3 +514,79 @@ mod mock {
         }
     }
 }
+
+// ── ★ THE HEARTBEAT WIRE CONTRACT, PINNED FROM THE PRODUCER SIDE ──────────
+//
+// This pulse is read by a DIFFERENT REPO (`pleme-io/fleet`, the fleet MCP's
+// `convergence` reader), which necessarily carries its own view of these
+// fields. Two declarations of one wire format, free to drift — and drift here
+// is not cosmetic: the consumer decides whether a node reads `converged`,
+// `ineffective` or `unknown` from exactly these keys.
+//
+// WHY NOT ONE SHARED STRUCT, which is the obvious fix and is BLOCKED:
+//
+//   1. `sentinela-core` is NOT published to crates.io, and `fleet` IS a
+//      published crate. A git dependency in a published crate is the
+//      documented false-green-release trap in this fleet (a `git =` dep
+//      resolves locally and names a registry crate at publish time).
+//   2. The two views SHOULD differ. This struct is strict — `at_unix_ms: u64`,
+//      a typed `Phase`, a typed `Rev` — because the producer must not write a
+//      malformed pulse. The consumer's view is deliberately all-`Option` with
+//      `#[serde(default)]` so a pulse from an OLDER sentinela missing a field
+//      degrades that FIELD rather than the whole document. Forcing this struct
+//      on the reader would turn a degraded node into an unreadable one, which
+//      is strictly worse: "cannot parse" and "not converged" are different
+//      facts and the fleet reader is built to keep them apart.
+//
+// So the shared thing is the WIRE, not the type. This test pins the exact key
+// set the producer emits; `fleet` pins that the same golden sample reads with
+// every field populated. A rename or removal fails HERE; a reader that stops
+// consuming a field fails THERE. One literal, two enforcement points.
+//
+// Keep GOLDEN_PULSE byte-identical to fleet's copy
+// (src/commands/convergence.rs). If you change this struct's wire shape, both
+// tests must be updated in the same pass — that is the point.
+#[cfg(test)]
+mod wire_contract {
+    use super::*;
+
+    /// The canonical pulse, matching what `RealEnv::persist_heartbeat` writes.
+    /// Mirrored verbatim in `fleet`.
+    const GOLDEN_PULSE: &str = concat!(
+        r#"{"at_unix_ms":1785645747419,"outcome":"unchanged","phase":"resolved","#,
+        r#""head_rev":"cd136f04e14ea67bae9b53491099c63b88a1d3f6","poll_seconds":60}"#
+    );
+
+    #[test]
+    fn the_wire_key_set_is_exactly_what_the_consumer_expects() {
+        let hb: Heartbeat = serde_json::from_str(GOLDEN_PULSE).expect("golden pulse parses");
+        let v = serde_json::to_value(&hb).expect("re-serialises");
+        let obj = v.as_object().expect("an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["at_unix_ms", "head_rev", "outcome", "phase", "poll_seconds"],
+            "the wire key set changed. `pleme-io/fleet`'s convergence reader              names these keys in its own struct; adding, renaming or removing              one here without updating that reader silently changes what the              fleet MCP reports about every node."
+        );
+    }
+
+    #[test]
+    fn the_golden_pulse_round_trips_without_loss() {
+        // Guards the direction a key-set check cannot: values, not just names.
+        let hb: Heartbeat = serde_json::from_str(GOLDEN_PULSE).expect("parses");
+        assert_eq!(hb.at_unix_ms, 1_785_645_747_419);
+        assert_eq!(hb.outcome, "unchanged");
+        assert_eq!(hb.poll_seconds, 60);
+        assert!(hb.head_rev.is_some(), "a resolved pulse carries a head");
+    }
+
+    #[test]
+    fn an_older_pulse_missing_phase_still_parses() {
+        // `phase` carries #[serde(default)] for exactly this case: a node whose
+        // sentinela predates the field must remain readable, here and in fleet.
+        let old = r#"{"at_unix_ms":1,"outcome":"unchanged","head_rev":null,"poll_seconds":60}"#;
+        let hb: Heartbeat = serde_json::from_str(old).expect("an older pulse must parse");
+        assert_eq!(hb.phase, Phase::default());
+    }
+}
