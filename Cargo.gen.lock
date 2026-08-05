@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "48f7c028211c6f35e6edd3b48be2581ff1c2a4d8b75665ba4701c714872c7703",
+  "cargo_lock_sha256": "975bcb2e270fe6860bcd91f0686d9eb4346b55aa2a74e163bab11b36c1db0b90",
   "manifest_sha256": {
     "Cargo.toml": "86ede52510c93a4e49b1c7306962f4962203dfc3a051c89b6165bf164a164dce",
     "sentinela-config/Cargo.toml": "0d1817a1ead3d5e3b3d4011d2085a803adf42a39e44c1683cc21af0416ad0618",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
-    "sentinela/Cargo.toml": "050d2995c8667c625281fd30adb8c8fd1ad40efe358c116dc6903f370a14265f"
+    "sentinela/Cargo.toml": "ae19d3470afbc9953a6330073ebc6593fd60afa5054f395c9d6c95b229f080d4"
   },
   "target_resolves": {
     "base": {
@@ -196,6 +196,14 @@
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
+          "std"
+        ]
+      },
+      "bytes-1.12.1": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": [
+          "default",
           "std"
         ]
       },
@@ -439,6 +447,48 @@
           "std"
         ]
       },
+      "dirs-6.0.0": {
+        "runtime_dependencies": [
+          {
+            "name": "dirs_sys",
+            "package_key": "dirs-sys-0.5.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "dirs-sys-0.5.0": {
+        "runtime_dependencies": [
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": "cfg(unix)",
+            "tree": "target"
+          },
+          {
+            "name": "option_ext",
+            "package_key": "option-ext-0.2.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "displaydoc-0.2.6": {
         "runtime_dependencies": [
           {
@@ -515,6 +565,7 @@
         ],
         "build_dependencies": [],
         "features": [
+          "default",
           "std"
         ]
       },
@@ -1515,6 +1566,7 @@
         "features": [
           "default",
           "log",
+          "net",
           "os-ext",
           "os-poll"
         ]
@@ -1568,6 +1620,11 @@
           "race",
           "std"
         ]
+      },
+      "option-ext-0.2.0": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
       },
       "pear-0.2.9": {
         "runtime_dependencies": [
@@ -1860,18 +1917,6 @@
             "tree": "target"
           },
           {
-            "name": "rustix",
-            "package_key": "rustix-0.38.44",
-            "kind": "normal",
-            "features": [
-              "process"
-            ],
-            "uses_default_features": true,
-            "optional": false,
-            "target": null,
-            "tree": "target"
-          },
-          {
             "name": "sentinela_config",
             "package_key": "sentinela-config-0.1.11",
             "kind": "normal",
@@ -1950,6 +1995,16 @@
             "features": [
               "env-filter"
             ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tsunagu",
+            "package_key": "tsunagu-0.1.4",
+            "kind": "normal",
+            "features": [],
             "uses_default_features": true,
             "optional": false,
             "target": null,
@@ -2439,11 +2494,55 @@
           "std"
         ]
       },
+      "signal-hook-registry-1.4.8": {
+        "runtime_dependencies": [
+          {
+            "name": "errno",
+            "package_key": "errno-0.3.14",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "smallvec-1.15.2": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
           "const_generics"
+        ]
+      },
+      "socket2-0.6.5": {
+        "runtime_dependencies": [
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": "cfg(any(unix, target_os = \"wasi\"))",
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "all"
         ]
       },
       "stable_deref_trait-1.2.1": {
@@ -2502,6 +2601,50 @@
           "proc-macro",
           "visit",
           "visit-mut"
+        ]
+      },
+      "syn-3.0.3": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "unicode_ident",
+            "package_key": "unicode-ident-1.0.24",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "clone-impls",
+          "default",
+          "derive",
+          "full",
+          "parsing",
+          "printing",
+          "proc-macro"
         ]
       },
       "synstructure-0.13.2": {
@@ -2701,6 +2844,171 @@
         "features": [
           "zerovec"
         ]
+      },
+      "tokio-1.53.1": {
+        "runtime_dependencies": [
+          {
+            "name": "bytes",
+            "package_key": "bytes-1.12.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(all(tokio_unstable, target_os = \"linux\"))",
+            "tree": "target"
+          },
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(target_os = \"wasi\")",
+            "tree": "target"
+          },
+          {
+            "name": "libc",
+            "package_key": "libc-0.2.186",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(unix)",
+            "tree": "target"
+          },
+          {
+            "name": "mio",
+            "package_key": "mio-1.2.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": true,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "mio",
+            "package_key": "mio-1.2.1",
+            "kind": "normal",
+            "features": [
+              "os-ext",
+              "os-poll"
+            ],
+            "uses_default_features": false,
+            "optional": true,
+            "target": "cfg(all(tokio_unstable, target_os = \"linux\"))",
+            "tree": "target"
+          },
+          {
+            "name": "pin_project_lite",
+            "package_key": "pin-project-lite-0.2.17",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "signal_hook_registry",
+            "package_key": "signal-hook-registry-1.4.8",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(unix)",
+            "tree": "target"
+          },
+          {
+            "name": "socket2",
+            "package_key": "socket2-0.6.5",
+            "kind": "normal",
+            "features": [
+              "all"
+            ],
+            "uses_default_features": true,
+            "optional": true,
+            "target": "cfg(any(not(target_family = \"wasm\"), all(target_os = \"wasi\", not(target_env = \"p1\"))))",
+            "tree": "target"
+          },
+          {
+            "name": "tokio_macros",
+            "package_key": "tokio-macros-2.7.2",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "host"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "bytes",
+          "default",
+          "io-util",
+          "libc",
+          "macros",
+          "mio",
+          "net",
+          "rt",
+          "signal",
+          "signal-hook-registry",
+          "socket2",
+          "sync",
+          "time",
+          "tokio-macros",
+          "windows-sys"
+        ]
+      },
+      "tokio-macros-2.7.2": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-3.0.3",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
       },
       "toml-0.8.23": {
         "runtime_dependencies": [
@@ -3128,6 +3436,96 @@
           "thread_local",
           "tracing",
           "tracing-log"
+        ]
+      },
+      "tsunagu-0.1.4": {
+        "runtime_dependencies": [
+          {
+            "name": "dirs",
+            "package_key": "dirs-6.0.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "rustix",
+            "package_key": "rustix-0.38.44",
+            "kind": "normal",
+            "features": [
+              "process"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.53.1",
+            "kind": "normal",
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt",
+              "signal",
+              "sync",
+              "time"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default"
         ]
       },
       "uncased-0.9.10": {
@@ -6227,6 +6625,9 @@
       "edition": "2024",
       "build_script": "build.rs"
     },
+    "bytes-1.12.1": {
+      "edition": "2021"
+    },
     "cc-1.2.65": {
       "edition": "2018"
     },
@@ -6266,6 +6667,12 @@
     },
     "cpufeatures-0.3.0": {
       "edition": "2024"
+    },
+    "dirs-6.0.0": {
+      "edition": "2015"
+    },
+    "dirs-sys-0.5.0": {
+      "edition": "2015"
     },
     "displaydoc-0.2.6": {
       "edition": "2021",
@@ -6417,6 +6824,9 @@
     "once_cell-1.21.4": {
       "edition": "2021"
     },
+    "option-ext-0.2.0": {
+      "edition": "2015"
+    },
     "pear-0.2.9": {
       "edition": "2018"
     },
@@ -6524,8 +6934,14 @@
     "shlex-2.0.1": {
       "edition": "2018"
     },
+    "signal-hook-registry-1.4.8": {
+      "edition": "2015"
+    },
     "smallvec-1.15.2": {
       "edition": "2018"
+    },
+    "socket2-0.6.5": {
+      "edition": "2021"
     },
     "stable_deref_trait-1.2.1": {
       "edition": "2015"
@@ -6534,6 +6950,9 @@
       "edition": "2015"
     },
     "syn-2.0.118": {
+      "edition": "2021"
+    },
+    "syn-3.0.3": {
       "edition": "2021"
     },
     "synstructure-0.13.2": {
@@ -6555,6 +6974,13 @@
     },
     "tinystr-0.8.3": {
       "edition": "2021"
+    },
+    "tokio-1.53.1": {
+      "edition": "2021"
+    },
+    "tokio-macros-2.7.2": {
+      "edition": "2021",
+      "proc_macro": true
     },
     "toml-0.8.23": {
       "edition": "2021"
@@ -6583,6 +7009,9 @@
     },
     "tracing-subscriber-0.3.23": {
       "edition": "2018"
+    },
+    "tsunagu-0.1.4": {
+      "edition": "2024"
     },
     "uncased-0.9.10": {
       "edition": "2018",

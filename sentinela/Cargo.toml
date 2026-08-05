@@ -31,14 +31,10 @@ serde_json = { workspace = true }
 # parties take the same `/tmp/fleet-rebuild.lock` against the same open
 # file description semantics on macOS.
 fs4 = "0.9"
-# Process-group kill for the build deadline. The GROUP, not the pid:
-# `process_group(0)` makes the rebuild a group leader, and killing only the
-# leader would orphan exactly the descendants whose survival caused the 0.1.9
-# pipe deadlock. std has no process-group kill and shelling out to `kill` is
-# banned, so this is the remaining option — rustix rather than raw libc
-# because the crate is `#![forbid(unsafe_code)]` and rustix's `killpg` wrapper
-# is safe, so the ban stays intact instead of being carved out.
-rustix = { version = "0.38", features = ["process"] }
+# The bounded-subprocess primitive: a deadline, a file capture instead of a
+# deadlocking pipe, and a process-GROUP kill. Extracted from this crate into
+# the fleet daemon-lifecycle library once the consumer count reached six.
+tsunagu = "0.1.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -18,6 +18,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tsunagu::exec::{BoundedRun, OnTimeout};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -215,7 +216,10 @@ impl RealEnv {
                 OnTimeout::KillGroup,
             ),
         };
-        run_captured(cmd, &self.rebuild_capture_path(verb), timeout, on_timeout)
+        BoundedRun::new(&self.rebuild_capture_path(verb))
+            .timeout(timeout)
+            .on_timeout(on_timeout)
+            .run(cmd)
             .map_err(|e| Self::rebuild_err(verb, e.to_string()))
     }
 
@@ -238,153 +242,19 @@ impl RealEnv {
 
 }
 
-/// Run `cmd` to completion with its stdout+stderr captured to `cap_path`,
-/// returning an [`std::process::Output`] whose `stderr` holds the (bounded)
-/// tail of that capture.
-///
-/// Free function, not a method, so the deadlock it exists to prevent is
-/// testable without a `RealEnv`, a config, or a real `darwin-rebuild` — see
-/// `a_leaked_grandchild_cannot_hang_the_rebuild`.
-/// What a bounded run does to a child that outlived its deadline.
-///
-/// ── ★ THE ASYMMETRY IS REAL, SO IT IS A TYPE ─────────────────────────────
-/// A timed-out BUILD has changed nothing, so killing it is free and leaves a
-/// clean slate. A timed-out SWITCH may be mid-activation, and killing it
-/// there is how you get a half-switched machine — the exact damage
-/// `process_group(0)` exists to avoid. Abandoning the wait instead is
-/// already the documented bargain on the detach path ("we lose only the
-/// receipt for that tick"): the activation finishes detached, and the next
-/// tick re-probes and reconciles against whatever actually landed.
-///
-/// An enum rather than a `bool` so neither call site can read as the other
-/// at a glance, and so a third policy has to be named rather than guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnTimeout {
-    /// Kill the child's whole process group. Safe only when nothing has been
-    /// mutated yet.
-    KillGroup,
-    /// Stop waiting; leave the child running. The next tick reconciles.
-    Abandon,
-}
-
-/// Marker in the returned error when a run exceeded its deadline, so a
-/// reader (and the receipt chain) can tell a hang from a real failure.
-const TIMEOUT_MARKER: &str = "timed out after";
-
-fn run_captured(
-    mut cmd: Command,
-    cap_path: &Path,
-    timeout: std::time::Duration,
-    on_timeout: OnTimeout,
-) -> std::io::Result<std::process::Output> {
-    let f = File::create(cap_path)?;
-    let g = f.try_clone()?;
-    cmd.stdout(std::process::Stdio::from(f));
-    cmd.stderr(std::process::Stdio::from(g));
-    // Never inherit the daemon's stdin: a child that reads it would block on
-    // a descriptor nobody will ever write to.
-    cmd.stdin(std::process::Stdio::null());
-
-    let mut child = cmd.spawn()?;
-
-    // ── ★ EVERY TICK IS BOUNDED — A HANG MUST DEGRADE, NOT WEDGE ─────────
-    // The file capture above removed the ONE hang we had diagnosed (pipe
-    // EOF vs a detached grandchild). It did not bound the tick. Anything
-    // else that blocks — a stalled substituter fetch, a wedged nix daemon,
-    // an activation script waiting on something that never comes — lands in
-    // the identical permanent wedge from a different direction: no receipt,
-    // no cooldown, no retry, heartbeat frozen at `in_flight` forever.
-    //
-    // So the CLASS is closed here rather than the instance: past the
-    // deadline this becomes an ordinary error, which feeds the machinery
-    // that already exists — cooldown, the failure streak, and
-    // `land_last_good_after_failures`. A node whose builds hang now falls
-    // back to the newest rev it proved buildable instead of stopping
-    // forever.
-    //
-    // `try_wait` polling rather than a wait-with-timeout syscall: std has no
-    // portable one, and at a 1s granularity against a multi-minute build the
-    // cost is nil while the code stays free of unsafe and of a second
-    // thread whose own failure modes would need bounding too.
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(s) => break s,
-            None if std::time::Instant::now() >= deadline => {
-                if on_timeout == OnTimeout::KillGroup {
-                    kill_process_group(&child);
-                    // Reap, so the child does not linger as a zombie — the
-                    // very symptom that made the original hang confusing.
-                    let _ = child.wait();
-                }
-                let captured = std::fs::read(cap_path).unwrap_or_default();
-                let _ = std::fs::remove_file(cap_path);
-                let secs = timeout.as_secs();
-                let tail = String::from_utf8_lossy(&tail_bytes(captured)).into_owned();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    ["run ", TIMEOUT_MARKER, " ", &secs.to_string(), "s\n", &tail].concat(),
-                ));
-            }
-            None => std::thread::sleep(std::time::Duration::from_secs(1)),
-        }
-    };
-
-    let captured = std::fs::read(cap_path).unwrap_or_default();
-    let _ = std::fs::remove_file(cap_path);
-    Ok(std::process::Output {
-        status,
-        // Merged into `stderr`: callers only ever read that field for the
-        // failure message, and nix splits diagnostics across both streams, so
-        // keeping them apart would drop half the reason.
-        stdout: Vec::new(),
-        stderr: tail_bytes(captured),
-    })
-}
-
-/// Kill the child's whole process group.
-///
-/// The group, not the pid: `process_group(0)` made the child a group leader
-/// whose pgid equals its pid, and killing only the leader would orphan
-/// exactly the descendants that caused the original deadlock. `SIGKILL`
-/// rather than `SIGTERM` because this path is reached only after the child
-/// has already ignored its entire deadline.
-///
-/// rustix's safe wrapper rather than `libc::killpg` in an `unsafe` block:
-/// this crate is `#![forbid(unsafe_code)]`, and a deadline is not a good
-/// enough reason to put the first hole in that.
-///
-/// Best-effort. The only real failure is ESRCH — the group already exited
-/// between the deadline check and here — which needs no handling, and there
-/// is nothing useful to do about any other errno while abandoning a hung
-/// build anyway.
-fn kill_process_group(child: &std::process::Child) {
-    let Ok(raw) = i32::try_from(child.id()) else {
-        return;
-    };
-    if let Some(pid) = rustix::process::Pid::from_raw(raw) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
-    }
-}
-
-/// Keep the TAIL of a capture, bounded. A nix failure puts the reason at the
-/// END (the error, after however many thousand lines of build log), so
-/// truncating the head is what preserves the useful part. Bounded because
-/// this text reaches an `EnvError`, a receipt and a log line — an unbounded
-/// build log in the receipt chain would bloat every subsequent load of it.
-fn tail_bytes(mut v: Vec<u8>) -> Vec<u8> {
-    const MAX: usize = 16 * 1024;
-    if v.len() > MAX {
-        // Advance to a char boundary so the lossy decode downstream does not
-        // open with a replacement character.
-        let mut cut = v.len() - MAX;
-        while cut < v.len() && (v[cut] & 0xC0) == 0x80 {
-            cut += 1;
-        }
-        v = v.split_off(cut);
-    }
-    v
-}
+// ── ★ THE BOUNDED-SUBPROCESS PRIMITIVE NOW LIVES IN tsunagu ──────────
+// `OnTimeout`, `run_captured`, the process-GROUP kill and the tail bound
+// were authored here, but nothing about them is sentinela-specific: six
+// pleme-io components shell out to something slow with no bound (forge,
+// kindling, fleet, gen, sui, and this). They are now
+// `tsunagu::exec::BoundedRun`, and this file is consumer #1 rather than
+// the owner — so a fix reaches the fleet instead of one daemon.
+//
+// tsunagu was already the daemon-lifecycle library and already
+// feature-gates axum so CLI consumers can take it, which is why the
+// primitive went there rather than into a new repo.
+//
+// Doctrine: theory/RECONCILER-LIVENESS.md (P1).
 
 impl GitopsEnv for RealEnv {
     fn probe_head(&self) -> Result<Option<Rev>, EnvError> {
@@ -664,192 +534,11 @@ fn current_generation() -> Option<Generation> {
 mod tests {
     use super::*;
 
-    /// Serializes the tests that FORK against the tests that assert an
-    /// flock is released.
-    ///
-    /// ── ★ A FORK TRANSIENTLY HOLDS EVERY OPEN DESCRIPTOR ─────────────────
-    /// `fork()` duplicates the whole descriptor table, so between fork and
-    /// exec the child owns a copy of any flock this process holds — CLOEXEC
-    /// closes it at EXEC, not at fork. A lock test running concurrently can
-    /// therefore observe a lock as still-held microseconds after its guard
-    /// dropped, and fail truthfully about a condition that is not a bug.
-    ///
-    /// MEASURED here 2026-08-04: adding the forking test took this binary
-    /// from 0/8 to 1/8 failing runs, always on the release assertion. The
-    /// flake is the TEST's, not the lock's, so it is fixed in the tests
-    /// rather than by weakening the assertion.
-    static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn a_leaked_grandchild_cannot_hang_the_rebuild() {
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // THE 2026-08-04 CID DEADLOCK, in miniature. `/bin/sh` exits at once
-        // but leaves a `sleep` holding the inherited stdout — precisely what
-        // darwin-rebuild does when its detached activation outlives it.
-        //
-        // Under the old `Command::output()` this blocks for the FULL sleep:
-        // output() reads to EOF, and EOF only arrives when the last holder
-        // of the write end closes it, not when our direct child exits. On
-        // cid the holder was a real activation and the wait was unbounded —
-        // the tick simply never ended.
-        //
-        // MEASURED 2026-08-04, same command both ways:
-        //     pipe capture (what output() does): 10.02s
-        //     file capture (what we do now):      0.01s
-        // Note you CANNOT verify that by swapping `run_captured` for
-        // `.output()` here: output() forces its own pipes, overriding the
-        // File stdio, so the capture comes back empty and this test fails on
-        // the content assertion long before it could hang. The timing above
-        // was taken against a standalone reproduction of the same POSIX
-        // mechanic, which is the honest way to state it.
-        //
-        // `process_group(0)` is set because it is what production does, and
-        // it is half the cause: detaching is exactly what lets grandchildren
-        // outlive the child.
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("sleep 10 & echo started");
-        cmd.process_group(0);
 
-        let cap = std::env::temp_dir().join(format!(
-            "sentinela-capture-test-{}.out",
-            std::process::id()
-        ));
-        let t0 = std::time::Instant::now();
-        let out = run_captured(
-            cmd,
-            &cap,
-            std::time::Duration::from_secs(60),
-            OnTimeout::KillGroup,
-        )
-        .expect("capture run must not error");
-        let elapsed = t0.elapsed();
 
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "a leaked grandchild must not hold the rebuild open — took {elapsed:?}"
-        );
-        assert!(out.status.success(), "the direct child exited cleanly");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("started"),
-            "output must still be captured, not merely un-blocked"
-        );
-        assert!(
-            !cap.exists(),
-            "the capture file is consumed and cleaned up"
-        );
-    }
 
-    #[test]
-    fn a_hung_run_hits_its_deadline_and_the_group_dies() {
-        // THE CLASS, not the instance. The file capture closed the one hang
-        // we diagnosed; this closes "the tick hangs" generally — a stalled
-        // fetch, a wedged nix daemon, an activation blocked on something
-        // that never comes. Past the deadline it must become an ordinary
-        // error so the cooldown + last-good-fallback machinery takes over.
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
 
-        let marker = std::env::temp_dir().join(format!(
-            "sentinela-grandchild-alive-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&marker);
-
-        let mut cmd = Command::new("/bin/sh");
-        // A GRANDCHILD that outlives a naive kill of just the leader, and
-        // that announces its survival. Killing only the direct child would
-        // leave it to touch the marker — which is precisely the orphaning
-        // that caused the 0.1.9 deadlock, so the test has to be able to see
-        // the difference rather than just timing the return.
-        cmd.arg("-c")
-            .arg(["(sleep 4; touch '", &marker.display().to_string(), "') & sleep 300"].concat());
-        cmd.process_group(0);
-        let cap = std::env::temp_dir().join(format!(
-            "sentinela-timeout-test-{}.out",
-            std::process::id()
-        ));
-
-        let t0 = std::time::Instant::now();
-        let err = run_captured(
-            cmd,
-            &cap,
-            std::time::Duration::from_secs(2),
-            OnTimeout::KillGroup,
-        )
-        .expect_err("a run past its deadline must be an error, never a hang");
-        let elapsed = t0.elapsed();
-
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-        assert!(
-            err.to_string().contains(TIMEOUT_MARKER),
-            "the error must say it TIMED OUT, so a hang is distinguishable \
-             from a genuine build failure in the receipt chain: {err}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(20),
-            "must return at its deadline, not the child's lifetime — took {elapsed:?}"
-        );
-        assert!(!cap.exists(), "the capture file is cleaned up on timeout too");
-
-        // Outlive the grandchild's own timer, then confirm it never ran: the
-        // whole GROUP died, not just the leader.
-        std::thread::sleep(std::time::Duration::from_secs(6));
-        let survived = marker.exists();
-        let _ = std::fs::remove_file(&marker);
-        assert!(
-            !survived,
-            "KillGroup must kill the process GROUP — a surviving grandchild \
-             is the orphaning that caused the 0.1.9 deadlock"
-        );
-    }
-
-    #[test]
-    fn a_zero_deadline_run_still_completes_normally() {
-        // A fast command must not be killed just because the deadline is
-        // tight — the loop checks `try_wait` BEFORE the clock, so a process
-        // that already finished is reaped, never reported as timed out.
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("echo quick");
-        let cap = std::env::temp_dir().join(format!(
-            "sentinela-quick-test-{}.out",
-            std::process::id()
-        ));
-        let out = run_captured(
-            cmd,
-            &cap,
-            std::time::Duration::from_secs(30),
-            OnTimeout::KillGroup,
-        )
-        .expect("a fast command must succeed");
-        assert!(out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("quick"));
-    }
-
-    #[test]
-    fn a_capture_is_bounded_to_its_tail_on_a_char_boundary() {
-        // The reason lives at the END of a nix log, so the tail is what we
-        // keep — and the cut must land on a char boundary or the lossy
-        // decode opens with U+FFFD.
-        let big = "é".repeat(40 * 1024).into_bytes();
-        let kept = tail_bytes(big.clone());
-        assert!(kept.len() <= 16 * 1024, "must be bounded");
-        assert!(
-            big.ends_with(&kept),
-            "must keep the TAIL, never the head"
-        );
-        let s = String::from_utf8_lossy(&kept);
-        assert!(
-            !s.starts_with('\u{FFFD}'),
-            "must cut on a char boundary, got a replacement char"
-        );
-    }
-
-    #[test]
-    fn a_capture_smaller_than_the_bound_is_untouched() {
-        let small = b"error: flake.lock parse error".to_vec();
-        assert_eq!(tail_bytes(small.clone()), small);
-    }
 
     #[test]
     fn inject_token_builds_basic_auth_url() {
@@ -955,7 +644,6 @@ mod tests {
 
     #[test]
     fn a_held_lock_reports_its_holder() {
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         let _first = acquire_switch_lock(&path).expect("first acquisition");
@@ -970,7 +658,6 @@ mod tests {
 
     #[test]
     fn an_uncontended_lock_is_acquired_and_released_on_drop() {
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         {
@@ -985,7 +672,6 @@ mod tests {
 
     #[test]
     fn the_lock_file_is_group_and_other_writable() {
-        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Cross-user flock needs a 0666 file: the daemon (root) and the
         // operator both create it, and whoever comes second must still be
         // able to open it for WRITE to take the exclusive flock.
