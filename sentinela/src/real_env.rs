@@ -58,7 +58,34 @@ impl RealEnv {
         Self { cfg }
     }
 
+    /// Where the receipt chain lives. **YAML**, and now named so.
+    ///
+    /// ── ★ THE FILENAME USED TO LIE, AND IT MISLED A CAREFUL READER ────────
+    /// This returned `receipts.json` while [`Self::persist_chain`] serialises
+    /// with `serde_yaml` — the heartbeat beside it is genuine JSON, so two
+    /// files in one directory disagreed about what `.json` means. Verified on
+    /// cid 2026-08-05: the live file begins `- seq: 0` / `  rev: …`, i.e. YAML.
+    ///
+    /// Not cosmetic. During a 2026-08-05 audit an agent reasoned from the
+    /// extension that `fleet`'s chain reader must be broken (a bare
+    /// `kind:`/`rev:` prefix scan cannot match JSON), reported it as a likely
+    /// silent failure — and was wrong. The parser was right; the NAME was
+    /// wrong. Anyone pointing a JSON parser at it gets a hard failure on a file
+    /// that has been YAML since inception.
     fn receipts_path(&self) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join("receipts.yaml")
+    }
+
+    /// The pre-2026-08-05 path — `receipts.json`, containing YAML.
+    ///
+    /// Read-only, and never deleted by this daemon. The chain is hash-linked
+    /// (`prev_hash`), so it is the only durable record that this node's deploys
+    /// are what they claim to be; silently unlinking it would destroy an audit
+    /// trail to tidy a filename. [`Self::load_chain`] falls back to it and
+    /// [`Self::persist_chain`] writes only the canonical path, so the first
+    /// save after an upgrade migrates the content forward and leaves the
+    /// original for an operator to remove deliberately.
+    fn legacy_receipts_path(&self) -> PathBuf {
         Path::new(&self.cfg.state_dir).join("receipts.json")
     }
 
@@ -414,20 +441,32 @@ impl GitopsEnv for RealEnv {
     }
 
     fn load_chain(&self) -> Result<ReceiptChain, EnvError> {
-        let path = self.receipts_path();
-        match std::fs::read_to_string(&path) {
-            Ok(s) => serde_yaml::from_str(&s).map_err(|e| EnvError::ReceiptIo(e.to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReceiptChain::new()),
-            Err(e) => Err(EnvError::ReceiptIo(e.to_string())),
+        // Canonical path first, then the legacy one. A node upgrading across
+        // this change MUST keep its chain: an empty chain reads as "never
+        // deployed" — the startup banner reports a freshly-enrolled node, and
+        // the failure/deferral streaks the starvation escapes count on reset to
+        // zero. Losing it would not merely lose history, it would change what
+        // the daemon does next.
+        for path in [self.receipts_path(), self.legacy_receipts_path()] {
+            match std::fs::read_to_string(&path) {
+                Ok(s) => {
+                    return serde_yaml::from_str(&s)
+                        .map_err(|e| EnvError::ReceiptIo(e.to_string()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(EnvError::ReceiptIo(e.to_string())),
+            }
         }
+        Ok(ReceiptChain::new())
     }
 
     fn persist_chain(&self, chain: &ReceiptChain) -> Result<(), EnvError> {
         let path = self.receipts_path();
         let body = serde_yaml::to_string(chain).map_err(|e| EnvError::ReceiptIo(e.to_string()))?;
         // Atomic: write a temp sibling then rename, so a crash never
-        // leaves a half-written chain.
-        let tmp = path.with_extension("json.tmp");
+        // leaves a half-written chain. (The heartbeat's own tmp below keeps
+        // `.json.tmp` — that file genuinely IS JSON.)
+        let tmp = path.with_extension("yaml.tmp");
         std::fs::write(&tmp, body.as_bytes()).map_err(|e| EnvError::ReceiptIo(e.to_string()))?;
         std::fs::rename(&tmp, &path).map_err(|e| EnvError::ReceiptIo(e.to_string()))?;
         Ok(())
@@ -926,5 +965,79 @@ mod tests {
         }
         .to_string();
         assert!(msg.contains("git"), "message must name the tool: {msg}");
+    }
+
+    // ── receipts.yaml migration: the edge is "an existing chain still loads"
+    //
+    // The chain is hash-linked and drives behaviour (streaks feed the
+    // starvation escapes), so a rename that orphans it is worse than the
+    // misleading filename it fixes.
+
+    fn env_with_state(dir: &std::path::Path) -> RealEnv {
+        RealEnv::new(SentinelaConfig {
+            state_dir: dir.to_string_lossy().into_owned(),
+            ..SentinelaConfig::default()
+        })
+    }
+
+    #[test]
+    fn the_canonical_receipt_path_is_yaml_because_the_bytes_are_yaml() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        assert!(
+            env.receipts_path().ends_with("receipts.yaml"),
+            "persist_chain serialises with serde_yaml; the name must say so"
+        );
+    }
+
+    #[test]
+    fn a_legacy_receipts_json_chain_still_loads() {
+        // THE regression: a node upgrading across the rename keeps its chain.
+        // The fixture is the real on-disk shape measured on cid 2026-08-05.
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        std::fs::write(
+            env.legacy_receipts_path(),
+            "- seq: 0\n  rev: cd136f04e14ea67bae9b53491099c63b88a1d3f6\n  \
+             outcome:\n    kind: deferred\n    newer: \
+             a891200b72fdef64117de281a232bca0105789c3\n  at_unix_ms: \
+             1785645747419\n  prev_hash: null\n",
+        )
+        .unwrap();
+        let chain = env.load_chain().expect("legacy chain must parse");
+        assert!(
+            !chain.is_empty(),
+            "an orphaned chain reads as `never deployed`, which resets the \
+             failure/deferral streaks the escapes count on — behaviour, not \
+             just history"
+        );
+    }
+
+    #[test]
+    fn the_canonical_path_wins_when_both_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        std::fs::write(env.legacy_receipts_path(), "[]\n").unwrap();
+        std::fs::write(
+            env.receipts_path(),
+            "- seq: 7\n  rev: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  \
+             outcome:\n    kind: deferred\n    newer: \
+             bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  at_unix_ms: 1\n  \
+             prev_hash: null\n",
+        )
+        .unwrap();
+        let chain = env.load_chain().expect("parses");
+        assert!(
+            !chain.is_empty(),
+            "the migrated file is authoritative once written; the legacy copy \
+             is left on disk for the operator, never re-read over the new one"
+        );
+    }
+
+    #[test]
+    fn no_chain_at_either_path_is_an_empty_chain_not_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        assert!(env.load_chain().expect("absent is not an error").is_empty());
     }
 }
