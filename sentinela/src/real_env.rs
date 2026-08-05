@@ -202,7 +202,20 @@ impl RealEnv {
         // descriptor, and a grandchild appending afterwards is harmless. The
         // capture also keeps the failure text, which plain inheritance
         // (writing straight to the daemon log) would have cost us.
-        run_captured(cmd, &self.rebuild_capture_path(verb))
+        // A build has mutated nothing, so a hung one is killed outright. A
+        // switch may be mid-activation, where killing is the damage — see
+        // `OnTimeout`.
+        let (timeout, on_timeout) = match verb {
+            "switch" => (
+                std::time::Duration::from_secs(self.cfg.switch_timeout_seconds),
+                OnTimeout::Abandon,
+            ),
+            _ => (
+                std::time::Duration::from_secs(self.cfg.build_timeout_seconds),
+                OnTimeout::KillGroup,
+            ),
+        };
+        run_captured(cmd, &self.rebuild_capture_path(verb), timeout, on_timeout)
             .map_err(|e| Self::rebuild_err(verb, e.to_string()))
     }
 
@@ -232,7 +245,38 @@ impl RealEnv {
 /// Free function, not a method, so the deadlock it exists to prevent is
 /// testable without a `RealEnv`, a config, or a real `darwin-rebuild` — see
 /// `a_leaked_grandchild_cannot_hang_the_rebuild`.
-fn run_captured(mut cmd: Command, cap_path: &Path) -> std::io::Result<std::process::Output> {
+/// What a bounded run does to a child that outlived its deadline.
+///
+/// ── ★ THE ASYMMETRY IS REAL, SO IT IS A TYPE ─────────────────────────────
+/// A timed-out BUILD has changed nothing, so killing it is free and leaves a
+/// clean slate. A timed-out SWITCH may be mid-activation, and killing it
+/// there is how you get a half-switched machine — the exact damage
+/// `process_group(0)` exists to avoid. Abandoning the wait instead is
+/// already the documented bargain on the detach path ("we lose only the
+/// receipt for that tick"): the activation finishes detached, and the next
+/// tick re-probes and reconciles against whatever actually landed.
+///
+/// An enum rather than a `bool` so neither call site can read as the other
+/// at a glance, and so a third policy has to be named rather than guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnTimeout {
+    /// Kill the child's whole process group. Safe only when nothing has been
+    /// mutated yet.
+    KillGroup,
+    /// Stop waiting; leave the child running. The next tick reconciles.
+    Abandon,
+}
+
+/// Marker in the returned error when a run exceeded its deadline, so a
+/// reader (and the receipt chain) can tell a hang from a real failure.
+const TIMEOUT_MARKER: &str = "timed out after";
+
+fn run_captured(
+    mut cmd: Command,
+    cap_path: &Path,
+    timeout: std::time::Duration,
+    on_timeout: OnTimeout,
+) -> std::io::Result<std::process::Output> {
     let f = File::create(cap_path)?;
     let g = f.try_clone()?;
     cmd.stdout(std::process::Stdio::from(f));
@@ -241,7 +285,50 @@ fn run_captured(mut cmd: Command, cap_path: &Path) -> std::io::Result<std::proce
     // a descriptor nobody will ever write to.
     cmd.stdin(std::process::Stdio::null());
 
-    let status = cmd.spawn()?.wait()?;
+    let mut child = cmd.spawn()?;
+
+    // ── ★ EVERY TICK IS BOUNDED — A HANG MUST DEGRADE, NOT WEDGE ─────────
+    // The file capture above removed the ONE hang we had diagnosed (pipe
+    // EOF vs a detached grandchild). It did not bound the tick. Anything
+    // else that blocks — a stalled substituter fetch, a wedged nix daemon,
+    // an activation script waiting on something that never comes — lands in
+    // the identical permanent wedge from a different direction: no receipt,
+    // no cooldown, no retry, heartbeat frozen at `in_flight` forever.
+    //
+    // So the CLASS is closed here rather than the instance: past the
+    // deadline this becomes an ordinary error, which feeds the machinery
+    // that already exists — cooldown, the failure streak, and
+    // `land_last_good_after_failures`. A node whose builds hang now falls
+    // back to the newest rev it proved buildable instead of stopping
+    // forever.
+    //
+    // `try_wait` polling rather than a wait-with-timeout syscall: std has no
+    // portable one, and at a 1s granularity against a multi-minute build the
+    // cost is nil while the code stays free of unsafe and of a second
+    // thread whose own failure modes would need bounding too.
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None if std::time::Instant::now() >= deadline => {
+                if on_timeout == OnTimeout::KillGroup {
+                    kill_process_group(&child);
+                    // Reap, so the child does not linger as a zombie — the
+                    // very symptom that made the original hang confusing.
+                    let _ = child.wait();
+                }
+                let captured = std::fs::read(cap_path).unwrap_or_default();
+                let _ = std::fs::remove_file(cap_path);
+                let secs = timeout.as_secs();
+                let tail = String::from_utf8_lossy(&tail_bytes(captured)).into_owned();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    ["run ", TIMEOUT_MARKER, " ", &secs.to_string(), "s\n", &tail].concat(),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_secs(1)),
+        }
+    };
 
     let captured = std::fs::read(cap_path).unwrap_or_default();
     let _ = std::fs::remove_file(cap_path);
@@ -253,6 +340,31 @@ fn run_captured(mut cmd: Command, cap_path: &Path) -> std::io::Result<std::proce
         stdout: Vec::new(),
         stderr: tail_bytes(captured),
     })
+}
+
+/// Kill the child's whole process group.
+///
+/// The group, not the pid: `process_group(0)` made the child a group leader
+/// whose pgid equals its pid, and killing only the leader would orphan
+/// exactly the descendants that caused the original deadlock. `SIGKILL`
+/// rather than `SIGTERM` because this path is reached only after the child
+/// has already ignored its entire deadline.
+///
+/// rustix's safe wrapper rather than `libc::killpg` in an `unsafe` block:
+/// this crate is `#![forbid(unsafe_code)]`, and a deadline is not a good
+/// enough reason to put the first hole in that.
+///
+/// Best-effort. The only real failure is ESRCH — the group already exited
+/// between the deadline check and here — which needs no handling, and there
+/// is nothing useful to do about any other errno while abandoning a hung
+/// build anyway.
+fn kill_process_group(child: &std::process::Child) {
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return;
+    };
+    if let Some(pid) = rustix::process::Pid::from_raw(raw) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+    }
 }
 
 /// Keep the TAIL of a capture, bounded. A nix failure puts the reason at the
@@ -603,7 +715,13 @@ mod tests {
             std::process::id()
         ));
         let t0 = std::time::Instant::now();
-        let out = run_captured(cmd, &cap).expect("capture run must not error");
+        let out = run_captured(
+            cmd,
+            &cap,
+            std::time::Duration::from_secs(60),
+            OnTimeout::KillGroup,
+        )
+        .expect("capture run must not error");
         let elapsed = t0.elapsed();
 
         assert!(
@@ -619,6 +737,93 @@ mod tests {
             !cap.exists(),
             "the capture file is consumed and cleaned up"
         );
+    }
+
+    #[test]
+    fn a_hung_run_hits_its_deadline_and_the_group_dies() {
+        // THE CLASS, not the instance. The file capture closed the one hang
+        // we diagnosed; this closes "the tick hangs" generally — a stalled
+        // fetch, a wedged nix daemon, an activation blocked on something
+        // that never comes. Past the deadline it must become an ordinary
+        // error so the cooldown + last-good-fallback machinery takes over.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let marker = std::env::temp_dir().join(format!(
+            "sentinela-grandchild-alive-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut cmd = Command::new("/bin/sh");
+        // A GRANDCHILD that outlives a naive kill of just the leader, and
+        // that announces its survival. Killing only the direct child would
+        // leave it to touch the marker — which is precisely the orphaning
+        // that caused the 0.1.9 deadlock, so the test has to be able to see
+        // the difference rather than just timing the return.
+        cmd.arg("-c")
+            .arg(["(sleep 4; touch '", &marker.display().to_string(), "') & sleep 300"].concat());
+        cmd.process_group(0);
+        let cap = std::env::temp_dir().join(format!(
+            "sentinela-timeout-test-{}.out",
+            std::process::id()
+        ));
+
+        let t0 = std::time::Instant::now();
+        let err = run_captured(
+            cmd,
+            &cap,
+            std::time::Duration::from_secs(2),
+            OnTimeout::KillGroup,
+        )
+        .expect_err("a run past its deadline must be an error, never a hang");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string().contains(TIMEOUT_MARKER),
+            "the error must say it TIMED OUT, so a hang is distinguishable \
+             from a genuine build failure in the receipt chain: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "must return at its deadline, not the child's lifetime — took {elapsed:?}"
+        );
+        assert!(!cap.exists(), "the capture file is cleaned up on timeout too");
+
+        // Outlive the grandchild's own timer, then confirm it never ran: the
+        // whole GROUP died, not just the leader.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !survived,
+            "KillGroup must kill the process GROUP — a surviving grandchild \
+             is the orphaning that caused the 0.1.9 deadlock"
+        );
+    }
+
+    #[test]
+    fn a_zero_deadline_run_still_completes_normally() {
+        // A fast command must not be killed just because the deadline is
+        // tight — the loop checks `try_wait` BEFORE the clock, so a process
+        // that already finished is reaped, never reported as timed out.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo quick");
+        let cap = std::env::temp_dir().join(format!(
+            "sentinela-quick-test-{}.out",
+            std::process::id()
+        ));
+        let out = run_captured(
+            cmd,
+            &cap,
+            std::time::Duration::from_secs(30),
+            OnTimeout::KillGroup,
+        )
+        .expect("a fast command must succeed");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("quick"));
     }
 
     #[test]

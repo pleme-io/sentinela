@@ -90,6 +90,28 @@ pub struct SentinelaConfig {
     /// verified rev unactivated for as long as main stays red. See
     /// `sentinela_core::LoopConfig::land_last_good_after_failures`.
     pub land_last_good_after_failures: usize,
+    /// Seconds a `darwin-rebuild build` may run before the daemon gives up
+    /// and KILLS its process group. A build has mutated nothing, so killing
+    /// is free.
+    ///
+    /// This bounds the TICK, which nothing else does. The file-capture fix in
+    /// 0.1.9 removed the one hang we had diagnosed; it did not stop a
+    /// different one (a stalled fetch, a wedged nix daemon) from producing
+    /// the same permanent wedge. Past this deadline a hang becomes an
+    /// ordinary failure and feeds the cooldown + `land_last_good_after_failures`
+    /// machinery, so the node keeps converging instead of stopping forever.
+    ///
+    /// Generous on purpose: a cold darwin rebuild measured 7-23 minutes on
+    /// cid, and a deadline that kills a legitimate build would trade a rare
+    /// hang for a routine regression. `0` disables the bound entirely and
+    /// restores the pre-0.1.10 "wait forever" behaviour.
+    pub build_timeout_seconds: u64,
+    /// Seconds a `darwin-rebuild switch` may run before the daemon stops
+    /// waiting. The child is deliberately NOT killed — it may be
+    /// mid-activation, and killing it there is how a machine ends up half
+    /// switched. The activation finishes detached and the next tick
+    /// reconciles against whatever actually landed. `0` disables the bound.
+    pub switch_timeout_seconds: u64,
 }
 
 /// Default poll cadence, seconds.
@@ -102,6 +124,13 @@ pub const DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS: usize = 2;
 /// built. Higher than the deferral threshold on purpose — a failure may be
 /// transient where a deferral is not.
 pub const DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES: usize = 3;
+/// Default build deadline, seconds (90 min). Well above the 7-23 min a cold
+/// cid rebuild measured, because killing a real build is a regression while
+/// the bound only has to catch a hang.
+pub const DEFAULT_BUILD_TIMEOUT_SECONDS: u64 = 90 * 60;
+/// Default switch deadline, seconds (30 min). Activation is minutes, not
+/// tens of minutes, so this can be tighter than the build bound.
+pub const DEFAULT_SWITCH_TIMEOUT_SECONDS: u64 = 30 * 60;
 
 impl Default for SentinelaConfig {
     fn default() -> Self {
@@ -138,6 +167,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             cooldown_after_failure_ms: 0,
             land_ancestor_after_deferrals: 0,
             land_last_good_after_failures: 0,
+            build_timeout_seconds: 0,
+            switch_timeout_seconds: 0,
         }
     }
 
@@ -152,6 +183,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             cooldown_after_failure_ms: DEFAULT_COOLDOWN_MS,
             land_ancestor_after_deferrals: DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS,
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
+            build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
+            switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
         }
     }
 }
@@ -218,6 +251,8 @@ mod tests {
             cooldown_after_failure_ms: 300_000,
             land_ancestor_after_deferrals: 2,
             land_last_good_after_failures: 3,
+            build_timeout_seconds: 5400,
+            switch_timeout_seconds: 1800,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();

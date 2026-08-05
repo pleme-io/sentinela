@@ -886,10 +886,11 @@ dependencies = [
 
 [[package]]
 name = "sentinela"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "clap",
  "fs4",
+ "rustix 0.38.44",
  "sentinela-config",
  "sentinela-core",
  "serde",
@@ -904,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-config"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "sentinela-core",
  "serde",
@@ -915,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "blake3",
  "serde",
