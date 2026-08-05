@@ -12,7 +12,7 @@ members = ["sentinela-core", "sentinela-config", "sentinela"]
 # is invisible from inside the repo. Members now inherit
 # (`version.workspace = true`), so the workspace version is the single
 # source and cannot drift member-to-member.
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 rust-version = "1.91.0"
 license = "MIT"
