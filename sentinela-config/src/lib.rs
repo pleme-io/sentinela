@@ -57,6 +57,43 @@ impl RevProbeConfig {
     }
 }
 
+/// WHICH rebuild tool the daemon drives — a closed sum, not a path.
+///
+/// sentinela was Darwin-only until 2026-08-05, and the binary was a `const`
+/// in `real_env.rs`. That const is why the fleet's ONLY reconciler carrying
+/// the dual starvation escape could not run on a NixOS node: rio ran upstream
+/// `comin` instead, which has neither escape, and on 2026-08-04 it discarded
+/// 13 generations in 6 hours without landing one.
+///
+/// A closed sum rather than a configurable path: the two tools are the only
+/// two that exist, their argv shape is identical (`<verb> --flake <ref>`), and
+/// a free-form path would let a config name a binary that cannot take those
+/// arguments — an unrepresentable state made representable for no gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RebuildTool {
+    /// nix-darwin. The historical behaviour, so it stays the default: an
+    /// existing Mac config that never mentions `rebuild_tool` keeps working
+    /// byte-for-byte.
+    #[default]
+    DarwinRebuild,
+    /// NixOS.
+    NixosRebuild,
+}
+
+impl RebuildTool {
+    /// Absolute path, taken from the running system rather than `$PATH` — a
+    /// daemon started by launchd/systemd has no useful `$PATH`, and running
+    /// as root means no sudo is needed either way.
+    #[must_use]
+    pub fn binary(self) -> &'static str {
+        match self {
+            Self::DarwinRebuild => "/run/current-system/sw/bin/darwin-rebuild",
+            Self::NixosRebuild => "/run/current-system/sw/bin/nixos-rebuild",
+        }
+    }
+}
+
 /// The full daemon config surface (mirrors `pleme.gitops`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -112,6 +149,9 @@ pub struct SentinelaConfig {
     /// switched. The activation finishes detached and the next tick
     /// reconciles against whatever actually landed. `0` disables the bound.
     pub switch_timeout_seconds: u64,
+    /// Which rebuild tool to drive. Defaults to `darwin-rebuild` so every
+    /// existing config is unchanged; a NixOS node sets `nixos-rebuild`.
+    pub rebuild_tool: RebuildTool,
 }
 
 /// Default poll cadence, seconds.
@@ -169,6 +209,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: 0,
             build_timeout_seconds: 0,
             switch_timeout_seconds: 0,
+            rebuild_tool: RebuildTool::DarwinRebuild,
         }
     }
 
@@ -185,6 +226,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
             switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
+            rebuild_tool: RebuildTool::DarwinRebuild,
         }
     }
 }
@@ -253,11 +295,60 @@ mod tests {
             land_last_good_after_failures: 3,
             build_timeout_seconds: 5400,
             switch_timeout_seconds: 1800,
+            rebuild_tool: RebuildTool::NixosRebuild,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
         // deny_unknown_fields guards against a stale/typo'd render.
         assert!(serde_yaml::from_str::<SentinelaConfig>("bogus_key: 1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod rebuild_tool_tests {
+    use super::*;
+
+    /// The whole point of the sum: each variant maps to the tool that can
+    /// actually build that platform's system closure.
+    #[test]
+    fn each_variant_names_its_tool() {
+        assert_eq!(
+            RebuildTool::DarwinRebuild.binary(),
+            "/run/current-system/sw/bin/darwin-rebuild"
+        );
+        assert_eq!(
+            RebuildTool::NixosRebuild.binary(),
+            "/run/current-system/sw/bin/nixos-rebuild"
+        );
+    }
+
+    /// BACKWARD COMPATIBILITY, asserted rather than assumed. `SentinelaConfig`
+    /// carries `deny_unknown_fields`, so binary and config cross a generation
+    /// boundary together — a config rendered by an older module must still
+    /// parse, and must still mean darwin-rebuild.
+    #[test]
+    fn absent_field_defaults_to_darwin() {
+        let yaml = "flake_url: github:pleme-io/nix\nhostname: ryn\n";
+        let cfg: SentinelaConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.rebuild_tool, RebuildTool::DarwinRebuild);
+    }
+
+    /// The wire spelling is kebab-case, matching every other field's rendering
+    /// from the Nix side.
+    #[test]
+    fn wire_spelling_is_kebab_case() {
+        let yaml = "flake_url: f\nhostname: h\nrebuild_tool: nixos-rebuild\n";
+        let cfg: SentinelaConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.rebuild_tool, RebuildTool::NixosRebuild);
+        assert!(serde_yaml::to_string(&cfg).unwrap().contains("nixos-rebuild"));
+    }
+
+    /// An unspelled tool has no representation — the reason this is a sum and
+    /// not a path.
+    #[test]
+    fn unknown_tool_is_rejected() {
+        let yaml = "flake_url: f\nhostname: h\nrebuild_tool: home-manager\n";
+        assert!(serde_yaml::from_str::<SentinelaConfig>(yaml).is_err());
     }
 }

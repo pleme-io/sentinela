@@ -26,7 +26,6 @@ use url::Url;
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 /// `darwin-rebuild` from the running system (root, no sudo needed under
 /// the launchd daemon).
-const DARWIN_REBUILD: &str = "/run/current-system/sw/bin/darwin-rebuild";
 
 /// The one machine-wide rebuild lock — THE SAME absolute path `fleet
 /// rebuild` uses (`pleme-io/fleet/src/commands/rebuild.rs`), so an
@@ -113,15 +112,15 @@ impl RealEnv {
         }
     }
 
-    /// Where `darwin-rebuild` is run from. See [`Self::run_darwin_rebuild`]
+    /// Where the rebuild tool is run from. See [`Self::run_rebuild`]
     /// — this is load-bearing, not incidental.
     fn rebuild_cwd(&self) -> &Path {
         Path::new(&self.cfg.state_dir)
     }
 
-    fn run_darwin_rebuild(&self, verb: &str, rev: &Rev) -> Result<std::process::Output, EnvError> {
+    fn run_rebuild(&self, verb: &str, rev: &Rev) -> Result<std::process::Output, EnvError> {
         let flake_ref = self.flake_ref(rev);
-        let mut cmd = Command::new(DARWIN_REBUILD);
+        let mut cmd = Command::new(self.cfg.rebuild_tool.binary());
         cmd.arg(verb).arg("--flake").arg(&flake_ref);
         // ── ★ THE REBUILD MUST RUN FROM A WRITABLE DIRECTORY ──────────────
         // `darwin-rebuild` appends `--no-link` for every action EXCEPT
@@ -191,7 +190,7 @@ impl RealEnv {
         //
         // DIAGNOSED on cid 2026-08-04 from a live `sample(1)` of the wedged
         // daemon:
-        //     Sentinela::tick → run_darwin_rebuild → Command::output
+        //     Sentinela::tick → run_rebuild → Command::output
         //       → read_output → poll
         // with the direct child a zombie and zero nix build activity. It
         // reads exactly like a slow build from the outside, which is why it
@@ -353,7 +352,7 @@ impl GitopsEnv for RealEnv {
     }
 
     fn build(&self, rev: &Rev) -> Result<(), EnvError> {
-        let out = self.run_darwin_rebuild("build", rev)?;
+        let out = self.run_rebuild("build", rev)?;
         if out.status.success() {
             Ok(())
         } else {
@@ -374,14 +373,14 @@ impl GitopsEnv for RealEnv {
         //
         // HONEST RESIDUAL: the flock dies with us. If the launchd job is
         // killed mid-switch (its own plist changing, the one path where
-        // `run_darwin_rebuild` detaches the child), the lock drops while the
+        // `run_rebuild` detaches the child), the lock drops while the
         // detached activation is still running — a window an operator switch
         // could race. Rare (only on plist-changing generations), and the
         // next tick re-converges; documented rather than engineered around,
         // because fixing it would require holding the lock in a child we
         // deliberately orphan.
         let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
-        let out = self.run_darwin_rebuild("switch", rev)?;
+        let out = self.run_rebuild("switch", rev)?;
         if !out.status.success() {
             return Err(EnvError::SwitchFailed(
                 String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -611,7 +610,7 @@ mod tests {
         // know is writable — the state dir we already own.
         //
         // HONEST SCOPE: this pins the helper, not the `Command` wiring.
-        // Deleting the `cmd.current_dir(...)` call in `run_darwin_rebuild`
+        // Deleting the `cmd.current_dir(...)` call in `run_rebuild`
         // would still pass, because a `Command`'s cwd is not observable
         // without spawning `darwin-rebuild` for real. Tier: only-mitigated.
         let cfg = SentinelaConfig {
