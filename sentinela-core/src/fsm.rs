@@ -383,7 +383,12 @@ impl Sentinela {
             };
             // Best-effort attest (the system is unchanged, so a persist
             // failure here corrupts nothing).
-            let _ = self.record(&mut chain, env, head.clone(), Outcome::failed(e.to_string()));
+            let _ = self.record(
+                &mut chain,
+                env,
+                head.clone(),
+                Outcome::failed(e.to_string()),
+            );
 
             // ── ★ THE SECOND ESCAPE: A RED HEAD MUST NOT STARVE THE NODE ──
             // Retrying is the right first answer — most build failures are
@@ -573,12 +578,7 @@ impl Sentinela {
                 // we hold it by reference. Taking it is sound precisely
                 // because this arm RETURNS the tick: the caller's `chain` is
                 // never read again on this path.
-                Some(self.activate(
-                    std::mem::take(chain),
-                    env,
-                    candidate,
-                    Some(head.clone()),
-                ))
+                Some(self.activate(std::mem::take(chain), env, candidate, Some(head.clone())))
             }
             (a, b) => {
                 if let Some(e) = a.as_ref().err().or_else(|| b.as_ref().err()) {
@@ -880,7 +880,9 @@ mod tests {
             Ok(Some(rev(2))),
         ]);
         env.set_ancestry_result(Ok(true));
-        env.set_build_result(Err(EnvError::BuildFailed("broken from the start".to_owned())));
+        env.set_build_result(Err(EnvError::BuildFailed(
+            "broken from the start".to_owned(),
+        )));
         let mut s = Sentinela::new(cfg_last_good_after(3));
         for n in 1u32..=4 {
             env.set_now_ms(u64::from(n) * 10_000);

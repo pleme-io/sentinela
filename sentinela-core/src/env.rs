@@ -18,6 +18,42 @@ pub enum EnvError {
     /// `git ls-remote` failed (network, auth, bad url).
     #[error("probe failed: {0}")]
     ProbeFailed(String),
+    /// An external binary this daemon shells out to is NOT ON PATH.
+    ///
+    /// ── ★ STRUCTURAL, NOT TRANSIENT — AND THAT DISTINCTION IS THE POINT ──
+    /// Every other variant here describes a condition that may resolve on its
+    /// own: a network comes back, a lock is released, a branch stops moving.
+    /// This one cannot. Retrying an absent binary on any cadence, forever,
+    /// produces exactly one outcome — and the loop stays fail-closed while
+    /// doing it, so it looks alive and correct the entire time.
+    ///
+    /// MEASURED, rio 2026-08-05 (the first NixOS node flipped to sentinela):
+    /// the systemd unit declared no `path`, and a NixOS unit inherits
+    /// systemd's default PATH — coreutils, findutils, gnugrep, gnused,
+    /// systemd. No `git`. So `probe_head`'s `Command::new("git")` returned
+    /// ENOENT on every tick for over an hour:
+    ///
+    /// ```text
+    /// heartbeat.json: {"outcome":"probeError","head_rev":null,…}
+    /// probe error (fail-closed) error=probe failed:
+    ///   No such file or directory (os error 2)
+    /// ```
+    ///
+    /// The unit was `active (running)`, `NRestarts=0`, the heartbeat was
+    /// rewritten every 60s and `systemctl --failed` was empty. Every liveness
+    /// surface read healthy while the node had not reconciled once.
+    ///
+    /// It cost a live diagnosis because it was typed as
+    /// `ProbeFailed(e.to_string())` — a missing binary and an unreachable
+    /// remote produced the same variant carrying the same opaque
+    /// `io::Error` string. Naming it separately is what lets the preflight
+    /// (see `sentinela::preflight`) refuse to start at all, instead of the
+    /// daemon discovering it once per minute and telling nobody.
+    #[error("required tool not found on PATH: {tool}")]
+    ToolMissing {
+        /// The binary that could not be executed, as invoked.
+        tool: String,
+    },
     /// `darwin-rebuild build` failed for the rev.
     #[error("build failed: {0}")]
     BuildFailed(String),

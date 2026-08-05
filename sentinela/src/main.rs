@@ -106,8 +106,71 @@ fn load_config(path: &PathBuf) -> Result<SentinelaConfig, String> {
     serde_yaml::from_str(&raw).map_err(|e| e.to_string())
 }
 
+/// Every external binary this daemon cannot do its job without, checked
+/// before the loop starts. Returns the missing ones, in invocation order.
+///
+/// ── ★ REFUSE TO START, DO NOT DISCOVER IT ONCE A MINUTE FOREVER ────────
+/// A reconciler whose preconditions are structurally unsatisfiable must not
+/// present as healthy. Without this the daemon starts, ticks, fails closed
+/// on every tick, rewrites a fresh heartbeat each time, and reports
+/// `active (running)` with `NRestarts=0` — so `systemctl status`,
+/// `systemctl --failed` and the fleet MCP's heartbeat reader all show a
+/// working loop while `head_rev` is `null` forever.
+///
+/// MEASURED on rio 2026-08-05: exactly that, for over an hour, because the
+/// systemd unit shipped no `path` and a NixOS unit inherits systemd's
+/// default PATH (coreutils, findutils, gnugrep, gnused, systemd — no
+/// `git`). The Nix-side fix landed in `nix@36c1e3de`, but a fix in one
+/// module protects one module: this protects every consumer, on both
+/// platforms, including a hand-run `sentinela run`.
+///
+/// `git` is probed by EXECUTING it rather than by scanning `$PATH`, because
+/// the failure being modelled is `Command::output()` returning ENOENT — the
+/// only faithful test is the same syscall, which also catches a present but
+/// non-executable file. The rebuild tool is an absolute path
+/// (`/run/current-system/sw/bin/…`), so for it existence is the question.
+fn missing_tools(cfg: &SentinelaConfig) -> Vec<String> {
+    let mut missing = Vec::new();
+
+    match std::process::Command::new("git").arg("--version").output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push("git".to_owned()),
+        // Any other error (a git that exists but errors) is NOT a missing
+        // tool — fail-closed at tick time carries those, with context.
+        Err(_) | Ok(_) => {}
+    }
+
+    let rebuild = cfg.rebuild_tool.binary();
+    if !std::path::Path::new(rebuild).exists() {
+        missing.push(rebuild.to_owned());
+    }
+
+    missing
+}
+
 /// The daemon loop: one cycle, then sleep `poll_seconds`, forever.
 fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
+    // ── ★ PREFLIGHT BEFORE THE LOOP, AND EXIT IF IT FAILS ────────────────
+    // See `missing_tools`. Exiting non-zero is what makes the fault reach an
+    // operator: the unit lands in `activating (auto-restart)` and then, once
+    // the start limit trips, `failed` — where `systemctl --failed` finally
+    // shows it. That start limit is NOT optional and NOT systemd's default:
+    // with `RestartSec=30` the default 5-starts-per-10s can never be
+    // reached, so an un-tuned unit restarts forever and stays invisible.
+    // The nix module pairs this with an explicit
+    // StartLimitIntervalSec/StartLimitBurst for exactly that reason.
+    let missing = missing_tools(&cfg);
+    if !missing.is_empty() {
+        tracing::error!(
+            missing = %missing.join(", "),
+            rebuild_tool = cfg.rebuild_tool.binary(),
+            "sentinela: PREFLIGHT FAILED — required tools are absent, refusing to start. \
+             A daemon that cannot probe or rebuild must not report itself healthy; \
+             every tick would fail closed while every liveness surface read green. \
+             On NixOS add them to the unit's `path` (systemd does not inherit a login PATH)."
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
     // ── ★ NO `poll` LOCAL ON PURPOSE ─────────────────────────────────────
     // There used to be a `Duration` here and `sleep(poll)` below, which
     // overruled the FSM's per-outcome cadence on every tick. Deleting it is

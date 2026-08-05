@@ -341,7 +341,11 @@ mod rebuild_tool_tests {
         let yaml = "flake_url: f\nhostname: h\nrebuild_tool: nixos-rebuild\n";
         let cfg: SentinelaConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.rebuild_tool, RebuildTool::NixosRebuild);
-        assert!(serde_yaml::to_string(&cfg).unwrap().contains("nixos-rebuild"));
+        assert!(
+            serde_yaml::to_string(&cfg)
+                .unwrap()
+                .contains("nixos-rebuild")
+        );
     }
 
     /// An unspelled tool has no representation — the reason this is a sum and

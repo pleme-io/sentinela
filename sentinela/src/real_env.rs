@@ -18,8 +18,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tsunagu::exec::{BoundedRun, OnTimeout};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tsunagu::exec::{BoundedRun, OnTimeout};
 use url::Url;
 
 /// The nix system profile whose generation number a switch advances.
@@ -238,7 +238,6 @@ impl RealEnv {
             _ => EnvError::BuildFailed(msg),
         }
     }
-
 }
 
 // ── ★ THE BOUNDED-SUBPROCESS PRIMITIVE NOW LIVES IN tsunagu ──────────
@@ -264,7 +263,7 @@ impl GitopsEnv for RealEnv {
             .arg(&url)
             .arg(&refspec)
             .output()
-            .map_err(|e| EnvError::ProbeFailed(e.to_string()))?;
+            .map_err(|e| exec_err("git", &e, EnvError::ProbeFailed))?;
         if !out.status.success() {
             return Err(EnvError::ProbeFailed(
                 String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -299,7 +298,7 @@ impl GitopsEnv for RealEnv {
                 .arg(&url)
                 .arg(&mirror)
                 .output()
-                .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+                .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
             if !out.status.success() {
                 return Err(EnvError::AncestryFailed(
                     String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -323,7 +322,7 @@ impl GitopsEnv for RealEnv {
                 self.cfg.rev_probe.branch
             ))
             .output()
-            .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+            .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
         if !fetch.status.success() {
             return Err(EnvError::AncestryFailed(
                 String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
@@ -341,7 +340,7 @@ impl GitopsEnv for RealEnv {
             .arg(ancestor.as_str())
             .arg(descendant.as_str())
             .output()
-            .map_err(|e| EnvError::AncestryFailed(e.to_string()))?;
+            .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -453,6 +452,30 @@ impl GitopsEnv for RealEnv {
 /// The `build` verb deliberately does NOT take this lock: it is pure nix
 /// store work (already serialized by the store's own locking), and holding
 /// it across a half-hour build would block the operator for no safety gain.
+/// Classify a failure to *launch* a subprocess.
+///
+/// ── ★ ONE CLASSIFIER, NOT A CONDITIONAL AT EVERY EXEC SITE ─────────────
+/// `ErrorKind::NotFound` from `Command::output()` means the BINARY does not
+/// exist — a structural fault that no retry can clear — while every other
+/// `io::Error` is an ordinary runtime failure belonging to whichever variant
+/// the caller already uses. Four call sites need that split (the head probe
+/// and the three git invocations behind the ancestry check), so it is a
+/// function rather than four copies of the same `if`.
+///
+/// The `fallback` is passed as the caller's own constructor so each site
+/// keeps its existing semantics unchanged — only the ENOENT case is lifted
+/// out. See [`EnvError::ToolMissing`] for the rio measurement that motivated
+/// separating them at all.
+fn exec_err(tool: &str, e: &std::io::Error, fallback: impl FnOnce(String) -> EnvError) -> EnvError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        EnvError::ToolMissing {
+            tool: tool.to_owned(),
+        }
+    } else {
+        fallback(e.to_string())
+    }
+}
+
 fn acquire_switch_lock(lock_path: &Path) -> Result<File, EnvError> {
     use fs4::fs_std::FileExt;
     let mut file = File::options()
@@ -532,12 +555,6 @@ fn current_generation() -> Option<Generation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
-
-
-
-
 
     #[test]
     fn inject_token_builds_basic_auth_url() {
@@ -682,5 +699,69 @@ mod tests {
             mode, 0o666,
             "a default 0644 would hand the creator a monopoly"
         );
+    }
+
+    // ── exec_err: the structural/transient split ────────────────────────
+    //
+    // These are the regression tests for the rio 2026-08-05 measurement: a
+    // missing binary and an unreachable remote were the SAME variant, so
+    // the daemon retried an unsatisfiable condition forever while every
+    // liveness surface read healthy.
+
+    #[test]
+    fn exec_err_maps_enoent_to_tool_missing() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let got = exec_err("git", &e, EnvError::ProbeFailed);
+        assert_eq!(
+            got,
+            EnvError::ToolMissing {
+                tool: "git".to_owned()
+            },
+            "ENOENT on exec means the BINARY is absent — a structural fault \
+             no retry can clear. Collapsing it into ProbeFailed is what cost \
+             a live diagnosis on rio."
+        );
+    }
+
+    #[test]
+    fn exec_err_keeps_the_callers_variant_for_every_other_io_error() {
+        // A refused connection is transient and belongs to the caller's own
+        // variant — the split must be narrow, or it would relabel ordinary
+        // network failures as a broken installation.
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        match exec_err("git", &e, EnvError::ProbeFailed) {
+            EnvError::ProbeFailed(msg) => assert!(!msg.is_empty()),
+            other => panic!("transient io error must stay ProbeFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_err_preserves_the_ancestry_variant_too() {
+        // Same classifier, different caller: the fallback is the caller's,
+        // so the ancestry sites keep failing closed as AncestryFailed.
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        match exec_err("git", &e, EnvError::AncestryFailed) {
+            EnvError::AncestryFailed(_) => {}
+            other => panic!("expected AncestryFailed, got {other:?}"),
+        }
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            exec_err("git", &enoent, EnvError::AncestryFailed),
+            EnvError::ToolMissing {
+                tool: "git".to_owned()
+            },
+            "ENOENT outranks the caller's variant at EVERY site"
+        );
+    }
+
+    #[test]
+    fn tool_missing_names_the_binary_in_its_message() {
+        // The whole point is legibility in a log; an opaque message would
+        // reproduce the original defect with a new variant name.
+        let msg = EnvError::ToolMissing {
+            tool: "git".to_owned(),
+        }
+        .to_string();
+        assert!(msg.contains("git"), "message must name the tool: {msg}");
     }
 }
