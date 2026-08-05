@@ -106,8 +106,43 @@ fn load_config(path: &PathBuf) -> Result<SentinelaConfig, String> {
     serde_yaml::from_str(&raw).map_err(|e| e.to_string())
 }
 
-/// Every external binary this daemon cannot do its job without, checked
-/// before the loop starts. Returns the missing ones, in invocation order.
+/// One reason this daemon must not start.
+///
+/// A typed sum rather than a `Vec<String>` of prose: the two refusals have
+/// genuinely different fixes — one is "install/expose a binary", the other is
+/// "this pair of config fields cannot work together" — and an operator reading
+/// a log at 3am should not have to infer which from the wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreflightFailure {
+    /// A binary the daemon invokes is absent. Mirrors
+    /// [`sentinela_core::EnvError::ToolMissing`], which is the same condition
+    /// discovered at tick time instead of at startup.
+    ToolMissing { tool: String },
+    /// The selected rebuild tool structurally cannot resolve the configured
+    /// `flake_url`. See `sentinela_config::FlakeRefSyntax`.
+    FlakeRefUnsupported {
+        tool: &'static str,
+        flake_url: String,
+    },
+}
+
+impl std::fmt::Display for PreflightFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToolMissing { tool } => write!(f, "required tool not found: {tool}"),
+            Self::FlakeRefUnsupported { tool, flake_url } => write!(
+                f,
+                "{tool} cannot resolve the flake ref `{flake_url}` — it accepts \
+                 an absolute filesystem path only, and this daemon builds a \
+                 rev-pinned ref off `flake_url`. Every tick would fail closed \
+                 while the loop reported healthy."
+            ),
+        }
+    }
+}
+
+/// Every precondition this daemon cannot do its job without, checked before
+/// the loop starts. Returns the failures, in the order they would bite.
 ///
 /// ── ★ REFUSE TO START, DO NOT DISCOVER IT ONCE A MINUTE FOREVER ────────
 /// A reconciler whose preconditions are structurally unsatisfiable must not
@@ -129,11 +164,22 @@ fn load_config(path: &PathBuf) -> Result<SentinelaConfig, String> {
 /// only faithful test is the same syscall, which also catches a present but
 /// non-executable file. The rebuild tool is an absolute path
 /// (`/run/current-system/sw/bin/…`), so for it existence is the question.
-fn missing_tools(cfg: &SentinelaConfig) -> Vec<String> {
-    let mut missing = Vec::new();
+///
+/// ── ★ A PRESENT BINARY IS NOT A USABLE ONE ─────────────────────────────
+/// The flake-ref check is the same failure SHAPE with a different cause: the
+/// tool is installed and runs, and still cannot do the job, because the ref
+/// this daemon constructs is not one it can parse. Adding
+/// `RebuildTool::Sui` made that reachable by configuration for the first
+/// time, so the refusal lands here rather than in a comment.
+fn preflight(cfg: &SentinelaConfig) -> Vec<PreflightFailure> {
+    let mut failures = Vec::new();
 
     match std::process::Command::new("git").arg("--version").output() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push("git".to_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            failures.push(PreflightFailure::ToolMissing {
+                tool: "git".to_owned(),
+            });
+        }
         // Any other error (a git that exists but errors) is NOT a missing
         // tool — fail-closed at tick time carries those, with context.
         Err(_) | Ok(_) => {}
@@ -141,10 +187,40 @@ fn missing_tools(cfg: &SentinelaConfig) -> Vec<String> {
 
     let rebuild = cfg.rebuild_tool.binary();
     if !std::path::Path::new(rebuild).exists() {
-        missing.push(rebuild.to_owned());
+        failures.push(PreflightFailure::ToolMissing {
+            tool: rebuild.to_owned(),
+        });
     }
 
-    missing
+    failures.extend(flake_ref_failure(cfg));
+
+    failures
+}
+
+/// The tool-vs-flake-ref half of [`preflight`], split out as a PURE function.
+///
+/// ── ★ SPLIT SO ITS TESTS DO NOT FORK ────────────────────────────────────
+/// Not cosmetic. [`preflight`] runs `git --version`, and a forked child
+/// inherits the parent's open descriptors — including the `flock`ed
+/// `/tmp/fleet-rebuild.lock` held by `real_env::acquire_switch_lock`. Calling
+/// `preflight` from three tests turned `an_uncontended_lock_is_acquired_and_released_on_drop`
+/// from green into **19 failures in 25 runs** (measured on cid 2026-08-05;
+/// `HEAD` was 0/25, single-threaded is 0/25), because the lock outlives the
+/// guard's `Drop` for as long as any forked child still references the
+/// description. The pure half is where the new behaviour lives, so it is the
+/// half that gets the tests.
+///
+/// The daemon has the same property deliberately and documents it as an honest
+/// residual (`real_env::GitopsEnv::switch`); this is the test-side consequence
+/// of it, recorded rather than papered over.
+fn flake_ref_failure(cfg: &SentinelaConfig) -> Option<PreflightFailure> {
+    if cfg.flake_ref_is_resolvable() {
+        return None;
+    }
+    Some(PreflightFailure::FlakeRefUnsupported {
+        tool: cfg.rebuild_tool.binary(),
+        flake_url: cfg.flake_url.clone(),
+    })
 }
 
 /// The daemon loop: one cycle, then sleep `poll_seconds`, forever.
@@ -158,15 +234,21 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     // reached, so an un-tuned unit restarts forever and stays invisible.
     // The nix module pairs this with an explicit
     // StartLimitIntervalSec/StartLimitBurst for exactly that reason.
-    let missing = missing_tools(&cfg);
-    if !missing.is_empty() {
+    let failures = preflight(&cfg);
+    if !failures.is_empty() {
+        let reasons = failures
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
         tracing::error!(
-            missing = %missing.join(", "),
+            reasons = %reasons,
             rebuild_tool = cfg.rebuild_tool.binary(),
-            "sentinela: PREFLIGHT FAILED — required tools are absent, refusing to start. \
+            "sentinela: PREFLIGHT FAILED — refusing to start. \
              A daemon that cannot probe or rebuild must not report itself healthy; \
              every tick would fail closed while every liveness surface read green. \
-             On NixOS add them to the unit's `path` (systemd does not inherit a login PATH)."
+             On NixOS add missing tools to the unit's `path` (systemd does not \
+             inherit a login PATH)."
         );
         return std::process::ExitCode::FAILURE;
     }
@@ -486,6 +568,80 @@ fn tick_once(cfg: &SentinelaConfig) -> std::process::ExitCode {
         tracing::info!("entered cooldown after a failure");
     }
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::{PreflightFailure, flake_ref_failure};
+    use sentinela_config::{RebuildTool, SentinelaConfig};
+
+    fn cfg_with(tool: RebuildTool, flake_url: &str) -> SentinelaConfig {
+        SentinelaConfig {
+            flake_url: flake_url.to_owned(),
+            hostname: "rio".to_owned(),
+            rebuild_tool: tool,
+            ..SentinelaConfig::default()
+        }
+    }
+
+    /// ── ★ THE REFUSAL THAT MAKES `RebuildTool::Sui` SAFE TO SHIP ─────────
+    /// sui cannot parse a `github:` flake ref (`sui-compat/src/flake_ref.rs`
+    /// treats the left half of `<ref>#<attr>` as a filesystem path; measured
+    /// live on cid 2026-08-05 against sui 0.1.154). Without this refusal, a
+    /// node that selected sui would start, tick, fail closed on every build
+    /// with `getFlake: … No such file or directory`, and report `active
+    /// (running)` with a fresh heartbeat forever — the exact rio 2026-08-05
+    /// shape, reintroduced by a config knob.
+    #[test]
+    fn sui_against_a_remote_flake_url_is_refused_before_the_loop_starts() {
+        assert_eq!(
+            flake_ref_failure(&cfg_with(RebuildTool::Sui, "github:pleme-io/nix")),
+            Some(PreflightFailure::FlakeRefUnsupported {
+                tool: RebuildTool::Sui.binary(),
+                flake_url: "github:pleme-io/nix".to_owned(),
+            }),
+            "selecting sui against a remote repo must refuse at startup"
+        );
+    }
+
+    /// The refusal must be SCOPED to the tool that cannot do it — otherwise
+    /// it would ground the two tools that run the fleet today.
+    #[test]
+    fn the_nix_tools_are_never_refused_for_a_remote_flake_url() {
+        for tool in [RebuildTool::DarwinRebuild, RebuildTool::NixosRebuild] {
+            assert_eq!(
+                flake_ref_failure(&cfg_with(tool, "github:pleme-io/nix")),
+                None,
+                "{tool:?} resolves remote refs natively"
+            );
+        }
+    }
+
+    /// And sui IS reachable — the variant is gated, not dead. An absolute
+    /// path is the one shape it can resolve, so that pairing passes the
+    /// flake-ref check (the binary may still be absent on a given host, which
+    /// is a separate, correctly-typed failure).
+    #[test]
+    fn sui_against_an_absolute_path_passes_the_flake_ref_check() {
+        assert_eq!(
+            flake_ref_failure(&cfg_with(RebuildTool::Sui, "/srv/nix-checkouts")),
+            None,
+            "an absolute path is exactly what sui's parser accepts"
+        );
+    }
+
+    /// The message has to name both halves — a refusal an operator cannot act
+    /// on reproduces the opacity this whole vocabulary exists to remove.
+    #[test]
+    fn the_refusal_names_the_tool_and_the_url() {
+        let msg = PreflightFailure::FlakeRefUnsupported {
+            tool: "/run/current-system/sw/bin/sui",
+            flake_url: "github:pleme-io/nix".to_owned(),
+        }
+        .to_string();
+        assert!(msg.contains("sui"), "{msg}");
+        assert!(msg.contains("github:pleme-io/nix"), "{msg}");
+    }
 }
 
 #[cfg(test)]

@@ -121,7 +121,14 @@ impl RealEnv {
     fn run_rebuild(&self, verb: &str, rev: &Rev) -> Result<std::process::Output, EnvError> {
         let flake_ref = self.flake_ref(rev);
         let mut cmd = Command::new(self.cfg.rebuild_tool.binary());
-        cmd.arg(verb).arg("--flake").arg(&flake_ref);
+        for word in rebuild_argv(
+            self.cfg.rebuild_tool,
+            verb,
+            &flake_ref,
+            &self.cfg.extra_rebuild_args,
+        ) {
+            cmd.arg(word);
+        }
         // ── ★ THE REBUILD MUST RUN FROM A WRITABLE DIRECTORY ──────────────
         // `darwin-rebuild` appends `--no-link` for every action EXCEPT
         // `build`, so `build` alone drops a `./result` symlink into the
@@ -171,9 +178,6 @@ impl RealEnv {
         // time without a plist change, so it survives and attests. One
         // extra cycle, self-healing, instead of a wedged loop.
         cmd.process_group(0);
-        for a in &self.cfg.extra_rebuild_args {
-            cmd.arg(a);
-        }
 
         // ── ★ CAPTURE TO A FILE, NEVER A PIPE — `output()` DEADLOCKS HERE ─
         // `Command::output()` reads stdout/stderr to EOF and only then
@@ -215,11 +219,30 @@ impl RealEnv {
                 OnTimeout::KillGroup,
             ),
         };
+        // ── ★ AN ABSENT REBUILD BINARY IS `ToolMissing`, NOT `BuildFailed` ──
+        // `BoundedRun::run` ends in `cmd.spawn()?`
+        // (`tsunagu-0.1.4/src/exec.rs:178`), so a rebuild tool that is not on
+        // disk arrives here as an ordinary `io::Error` with
+        // `ErrorKind::NotFound`. Collapsing that into `BuildFailed` is exactly
+        // the defect `exec_err` was written for on 2026-08-05 — it was applied
+        // to the four `git` sites and NOT to this one, which is the site the
+        // daemon exists to drive. A structural fault would have been retried
+        // on the cooldown cadence forever, indistinguishable in the receipt
+        // chain from a red HEAD.
+        //
+        // The split must stay narrow: `OnTimeout` returns `ErrorKind::TimedOut`
+        // through this same `Result`, and a hang IS a build failure — it must
+        // keep feeding the cooldown + `land_last_good_after_failures` machinery
+        // rather than being relabelled a broken installation.
         BoundedRun::new(&self.rebuild_capture_path(verb))
             .timeout(timeout)
             .on_timeout(on_timeout)
             .run(cmd)
-            .map_err(|e| Self::rebuild_err(verb, e.to_string()))
+            .map_err(|e| {
+                exec_err(self.cfg.rebuild_tool.binary(), &e, |msg| {
+                    Self::rebuild_err(verb, msg)
+                })
+            })
     }
 
     /// Where one rebuild's merged output is captured. Per-verb rather than
@@ -431,6 +454,33 @@ impl GitopsEnv for RealEnv {
 }
 
 // ── pure decision helpers (unit-tested; the impure methods wrap these) ──
+
+/// The full argv (everything after the binary) for one rebuild invocation.
+///
+/// ── ★ THE TOOL OWNS ITS SHAPE; THIS FUNCTION ONLY COMPOSES IT ───────────
+/// `run_rebuild` used to hardcode `cmd.arg(verb)` as the first word, which
+/// silently assumed every rebuild tool IS the rebuild command. That is true of
+/// `darwin-rebuild` and `nixos-rebuild` and false of `sui`, whose verb lives at
+/// `sui system rebuild <verb>`. Lifting the prefix onto
+/// [`RebuildTool::argv_prefix`] means a tool with a different shape is
+/// *expressible* rather than merely unimplemented — and pulling the whole argv
+/// out as a pure function means it is observable, which a `Command`'s argv is
+/// not (the same reason `rebuild_cwd`'s test is honest about its scope).
+///
+/// `extra_rebuild_args` stay LAST, exactly where the old code put them.
+fn rebuild_argv(
+    tool: sentinela_config::RebuildTool,
+    verb: &str,
+    flake_ref: &str,
+    extra: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = tool.argv_prefix().iter().map(|w| (*w).to_owned()).collect();
+    argv.push(verb.to_owned());
+    argv.push("--flake".to_owned());
+    argv.push(flake_ref.to_owned());
+    argv.extend(extra.iter().cloned());
+    argv
+}
 
 /// Acquire the machine-wide rebuild lock, fail-fast.
 ///
@@ -752,6 +802,119 @@ mod tests {
             },
             "ENOENT outranks the caller's variant at EVERY site"
         );
+    }
+
+    // ── the rebuild argv: the tool owns its own shape ───────────────────
+
+    #[test]
+    fn rebuild_argv_puts_the_verb_first_for_the_nix_tools() {
+        use sentinela_config::RebuildTool;
+        let argv = rebuild_argv(
+            RebuildTool::DarwinRebuild,
+            "switch",
+            "github:o/r/abc#h",
+            &[],
+        );
+        assert_eq!(argv, ["switch", "--flake", "github:o/r/abc#h"]);
+        let argv = rebuild_argv(RebuildTool::NixosRebuild, "build", "github:o/r/abc#h", &[]);
+        assert_eq!(argv, ["build", "--flake", "github:o/r/abc#h"]);
+    }
+
+    #[test]
+    fn rebuild_argv_prefixes_suis_subcommand_path_before_the_verb() {
+        // `sui` is a multi-command CLI: the verb is at `sui system rebuild
+        // <verb>`, not argv[1]. If the prefix is dropped, sui parses `switch`
+        // as a top-level subcommand and exits on an unknown command — which
+        // this daemon would have recorded as a switch FAILURE, forever.
+        use sentinela_config::RebuildTool;
+        let argv = rebuild_argv(RebuildTool::Sui, "switch", "/srv/nix/abc#h", &[]);
+        assert_eq!(
+            argv,
+            ["system", "rebuild", "switch", "--flake", "/srv/nix/abc#h"]
+        );
+    }
+
+    #[test]
+    fn rebuild_argv_keeps_extra_args_last_for_every_tool() {
+        // Position is load-bearing: `extra_rebuild_args` are pass-through
+        // flags for the underlying tool and must not land between the
+        // subcommand path and the verb.
+        use sentinela_config::RebuildTool;
+        let extra = vec!["--option".to_owned(), "foo".to_owned()];
+        assert_eq!(
+            rebuild_argv(RebuildTool::DarwinRebuild, "build", "r#h", &extra),
+            ["build", "--flake", "r#h", "--option", "foo"]
+        );
+        assert_eq!(
+            rebuild_argv(RebuildTool::Sui, "build", "r#h", &extra),
+            [
+                "system", "rebuild", "build", "--flake", "r#h", "--option", "foo"
+            ]
+        );
+    }
+
+    // ── the rebuild site's structural/transient split ───────────────────
+
+    // NOTE: the companion test proving tsunagu really surfaces a failed spawn
+    // as `ErrorKind::NotFound` lives in `tests/bounded_run_enoent.rs`, NOT
+    // here. It has to actually attempt a spawn, and a fork inside this test
+    // binary transiently leaks the `flock` held by the lock tests above into
+    // the child — measured 2026-08-05: 19 failures in 25 runs of
+    // `an_uncontended_lock_is_acquired_and_released_on_drop`. Cargo runs test
+    // binaries serially, so a separate integration binary removes the
+    // interference without weakening either assertion.
+
+    #[test]
+    fn a_missing_rebuild_tool_is_tool_missing_not_a_build_failure() {
+        // The regression test for the hole `exec_err` left open: it was
+        // applied to the four `git` sites and not to the rebuild site, so an
+        // absent `nixos-rebuild` was retried on the cooldown cadence forever
+        // and read, in the receipt chain, exactly like a red HEAD.
+        //
+        // HONEST SCOPE (same tier as `rebuild_cwd_is_the_state_dir_…`): this
+        // pins the CLASSIFIER, not the wiring. Deleting the `exec_err` call in
+        // `run_rebuild` would still pass, because reaching it needs a real
+        // spawn of an absent rebuild binary, and every `RebuildTool::binary()`
+        // is an absolute path that either does not exist on this platform
+        // (unstable to assert) or is a tool that must never be executed from a
+        // test. Tier: only-mitigated.
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        for verb in ["build", "switch"] {
+            assert_eq!(
+                exec_err("/run/current-system/sw/bin/nixos-rebuild", &enoent, |m| {
+                    RealEnv::rebuild_err(verb, m)
+                }),
+                EnvError::ToolMissing {
+                    tool: "/run/current-system/sw/bin/nixos-rebuild".to_owned()
+                },
+                "an absent rebuild tool is structural at EVERY verb"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebuild_that_blew_its_deadline_stays_a_build_or_switch_failure() {
+        // The split must be NARROW. `OnTimeout` returns `ErrorKind::TimedOut`
+        // through the same `Result`, and a hang must keep feeding the cooldown
+        // + `land_last_good_after_failures` machinery — relabelling it a broken
+        // installation would disable both starvation escapes.
+        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        match exec_err(
+            "/run/current-system/sw/bin/darwin-rebuild",
+            &timed_out,
+            |m| RealEnv::rebuild_err("build", m),
+        ) {
+            EnvError::BuildFailed(_) => {}
+            other => panic!("a timeout must stay BuildFailed, got {other:?}"),
+        }
+        match exec_err(
+            "/run/current-system/sw/bin/darwin-rebuild",
+            &timed_out,
+            |m| RealEnv::rebuild_err("switch", m),
+        ) {
+            EnvError::SwitchFailed(_) => {}
+            other => panic!("a timeout must stay SwitchFailed, got {other:?}"),
+        }
     }
 
     #[test]

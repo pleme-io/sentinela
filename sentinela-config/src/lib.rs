@@ -57,6 +57,62 @@ impl RevProbeConfig {
     }
 }
 
+/// WHICH FORM of flake reference a rebuild tool can resolve.
+///
+/// ── ★ NOT A STYLE DIFFERENCE — THE ONE THING BLOCKING P5 ────────────────
+/// sentinela's entire safety model is a **rev-pinned remote** flake ref: it
+/// resolves branch HEAD over the git protocol and then builds
+/// `<flake_url>/<rev>#<hostname>` (`sentinela::real_env::RealEnv::flake_ref`).
+/// `darwin-rebuild`/`nixos-rebuild` hand that string to nix, which fetches the
+/// rev. sui **cannot**: `sui_compat::flake_ref::FlakeRef::parse`
+/// (`sui/sui-compat/src/flake_ref.rs:37-58`) splits on `#` and treats the left
+/// half as a *filesystem path* — there is no fetcher on that path at all — and
+/// `sui_eval::builtins::evaluate_flake`
+/// (`sui/sui-eval/src/builtins/flake_eval.rs:43`) takes a `&Path`.
+///
+/// MEASURED, cid 2026-08-05, sui 0.1.154:
+/// ```text
+/// $ sui system rebuild dry-activate \
+///     --flake 'github:pleme-io/nix/0123…4567#ryn'
+/// Error: rebuild failed: eval: I/O error: getFlake:
+///   github:pleme-io/nix/0123…4567/flake.nix: No such file or directory
+/// ```
+///
+/// So this is a TYPED PROPERTY OF THE TOOL, checked before the loop starts.
+/// Without it, selecting sui would produce a daemon that fails every tick
+/// forever while every liveness surface reads green — the exact class
+/// [`crate::RebuildTool`]'s sibling [`sentinela_core::EnvError::ToolMissing`]
+/// was introduced to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlakeRefSyntax {
+    /// Anything nix itself accepts, including `github:owner/repo/<rev>` — the
+    /// rev-pinned remote form this daemon is built around.
+    Remote,
+    /// A filesystem path only. No fetcher: the ref's left half is opened as a
+    /// directory and `flake.nix` read out of it.
+    LocalPathOnly,
+}
+
+impl FlakeRefSyntax {
+    /// Can a tool with this syntax resolve `flake_url` at all?
+    ///
+    /// Deliberately strict for [`Self::LocalPathOnly`]: only an absolute path
+    /// (bare or `path:`-prefixed, both of which sui's parser accepts —
+    /// `flake_ref.rs:48`). A relative path would resolve against the daemon's
+    /// cwd, which is the state dir, which is not a checkout — a config that
+    /// *looks* plausible and cannot work.
+    #[must_use]
+    pub fn accepts(self, flake_url: &str) -> bool {
+        match self {
+            Self::Remote => true,
+            Self::LocalPathOnly => {
+                let bare = flake_url.strip_prefix("path:").unwrap_or(flake_url);
+                bare.starts_with('/')
+            }
+        }
+    }
+}
+
 /// WHICH rebuild tool the daemon drives — a closed sum, not a path.
 ///
 /// sentinela was Darwin-only until 2026-08-05, and the binary was a `const`
@@ -65,10 +121,12 @@ impl RevProbeConfig {
 /// `comin` instead, which has neither escape, and on 2026-08-04 it discarded
 /// 13 generations in 6 hours without landing one.
 ///
-/// A closed sum rather than a configurable path: the two tools are the only
-/// two that exist, their argv shape is identical (`<verb> --flake <ref>`), and
-/// a free-form path would let a config name a binary that cannot take those
-/// arguments — an unrepresentable state made representable for no gain.
+/// A closed sum rather than a configurable path: a free-form path would let a
+/// config name a binary that cannot take these arguments — an unrepresentable
+/// state made representable for no gain. Each variant therefore carries its
+/// own [`argv_prefix`](Self::argv_prefix) and its own
+/// [`flake_ref_syntax`](Self::flake_ref_syntax) rather than the sum assuming
+/// one shape for all of them, which is what it used to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RebuildTool {
@@ -79,6 +137,39 @@ pub enum RebuildTool {
     DarwinRebuild,
     /// NixOS.
     NixosRebuild,
+    /// sui — the fleet's own pure-Rust nix. **The P5 destination, and NOT
+    /// USABLE BY THIS DAEMON YET.**
+    ///
+    /// ── ★ WHY IT IS HERE ANYWAY (MODULARIZE, DON'T DELETE) ───────────────
+    /// `sui-orchestrate` states its own purpose as *"Replaces darwin-rebuild,
+    /// nixos-rebuild, deploy-rs, and colmena"*
+    /// (`sui/sui-orchestrate/src/lib.rs:3`), so the subprocess this daemon
+    /// spawns is a reimplementation boundary against a primitive the fleet
+    /// already owns — doctrine P5 / `theory/RECONCILER-LIVENESS.md` §IV.3.
+    /// The pipeline behind `sui system rebuild` is real and wired: 10 of 11
+    /// surfaces on the marquee path are REAL
+    /// (`sui/docs/SUI-SUPREMACY-ROADMAP.md:105-121`), M2.6 closed
+    /// (`sui/docs/SUI-EQUIVALENCE.md:110`).
+    ///
+    /// ── ★ WHY IT CANNOT BE SELECTED TODAY ────────────────────────────────
+    /// Its [`flake_ref_syntax`](Self::flake_ref_syntax) is
+    /// [`FlakeRefSyntax::LocalPathOnly`], and every real sentinela config
+    /// names a remote repo — so `sentinela::preflight` REFUSES the pairing and
+    /// the daemon exits rather than failing every tick forever. See
+    /// [`FlakeRefSyntax`] for the measured evidence.
+    ///
+    /// Two things must land before this variant is reachable, and neither is
+    /// in this repo:
+    /// 1. sui gains a fetcher for `github:owner/repo/<rev>` in `FlakeRef` —
+    ///    then this becomes [`FlakeRefSyntax::Remote`] and nothing else moves;
+    ///    **or** sentinela materializes each rev into `<flake_url>/<rev>/` and
+    ///    the config names an absolute path, which needs a materializer this
+    ///    daemon does not have.
+    /// 2. sui's byte-identical toplevel is proven, not just built — the loop
+    ///    inherits that gate (`sui/docs/CONVERGENCE.md` R5). A node reconciler
+    ///    that activates a *different* system than `nix run .#rebuild` is
+    ///    worse than one that shells out.
+    Sui,
 }
 
 impl RebuildTool {
@@ -90,6 +181,33 @@ impl RebuildTool {
         match self {
             Self::DarwinRebuild => "/run/current-system/sw/bin/darwin-rebuild",
             Self::NixosRebuild => "/run/current-system/sw/bin/nixos-rebuild",
+            Self::Sui => "/run/current-system/sw/bin/sui",
+        }
+    }
+
+    /// Argv words that precede the verb.
+    ///
+    /// `darwin-rebuild`/`nixos-rebuild` ARE the rebuild command, so the verb
+    /// is argv[1]. sui is a multi-command CLI where the same verb lives at
+    /// `sui system rebuild <verb>`. This used to be an assumption baked into
+    /// `run_rebuild` (`cmd.arg(verb)` first, unconditionally) and stated in
+    /// this sum's own doc comment as *"their argv shape is identical"* — true
+    /// of two tools, false of the family, and the thing that made a third
+    /// tool inexpressible rather than merely unimplemented.
+    #[must_use]
+    pub fn argv_prefix(self) -> &'static [&'static str] {
+        match self {
+            Self::DarwinRebuild | Self::NixosRebuild => &[],
+            Self::Sui => &["system", "rebuild"],
+        }
+    }
+
+    /// Which flake-ref forms this tool can resolve. See [`FlakeRefSyntax`].
+    #[must_use]
+    pub fn flake_ref_syntax(self) -> FlakeRefSyntax {
+        match self {
+            Self::DarwinRebuild | Self::NixosRebuild => FlakeRefSyntax::Remote,
+            Self::Sui => FlakeRefSyntax::LocalPathOnly,
         }
     }
 }
@@ -192,6 +310,27 @@ impl SentinelaConfig {
             land_ancestor_after_deferrals: self.land_ancestor_after_deferrals,
             land_last_good_after_failures: self.land_last_good_after_failures,
         }
+    }
+
+    /// `false` when the selected tool structurally cannot resolve the
+    /// configured `flake_url` — a config that would fail-closed on every tick
+    /// forever while presenting as a healthy loop.
+    ///
+    /// Pure, so the refusal is provable without a daemon, a binary, or a
+    /// network; `sentinela::preflight` is the one caller and turns a `false`
+    /// here into a refusal to start.
+    ///
+    /// An EMPTY `flake_url` is deliberately NOT judged here: both config tiers
+    /// ship it empty on purpose (the nix module fills it), so judging it would
+    /// make `prescribed_default()` itself unusable. A mis-rendered empty url
+    /// is already a visible failure at probe time.
+    #[must_use]
+    pub fn flake_ref_is_resolvable(&self) -> bool {
+        self.flake_url.is_empty()
+            || self
+                .rebuild_tool
+                .flake_ref_syntax()
+                .accepts(&self.flake_url)
     }
 }
 
@@ -321,6 +460,101 @@ mod rebuild_tool_tests {
             RebuildTool::NixosRebuild.binary(),
             "/run/current-system/sw/bin/nixos-rebuild"
         );
+        assert_eq!(RebuildTool::Sui.binary(), "/run/current-system/sw/bin/sui");
+    }
+
+    /// The verb is NOT always argv[1]. `sui` is a multi-command CLI and the
+    /// rebuild verb lives at `sui system rebuild <verb>`; the two nix-* tools
+    /// ARE the rebuild command and take the verb directly.
+    #[test]
+    fn each_variant_carries_its_own_argv_prefix() {
+        assert_eq!(RebuildTool::DarwinRebuild.argv_prefix(), &[] as &[&str]);
+        assert_eq!(RebuildTool::NixosRebuild.argv_prefix(), &[] as &[&str]);
+        assert_eq!(RebuildTool::Sui.argv_prefix(), &["system", "rebuild"]);
+    }
+
+    /// ── ★ THE MEASURED BLOCKER, AS A TEST ────────────────────────────────
+    /// sui parses the left half of `<ref>#<attr>` as a filesystem path
+    /// (`sui/sui-compat/src/flake_ref.rs:37-58`), so a `github:` ref becomes a
+    /// directory that does not exist. Proven live on cid 2026-08-05 against
+    /// sui 0.1.154:
+    ///   `getFlake: github:pleme-io/nix/<rev>/flake.nix: No such file or directory`
+    #[test]
+    fn sui_cannot_resolve_a_remote_flake_ref_and_the_nix_tools_can() {
+        assert_eq!(
+            RebuildTool::Sui.flake_ref_syntax(),
+            FlakeRefSyntax::LocalPathOnly
+        );
+        assert_eq!(
+            RebuildTool::DarwinRebuild.flake_ref_syntax(),
+            FlakeRefSyntax::Remote
+        );
+        assert_eq!(
+            RebuildTool::NixosRebuild.flake_ref_syntax(),
+            FlakeRefSyntax::Remote
+        );
+
+        let remote = "github:pleme-io/nix";
+        assert!(FlakeRefSyntax::Remote.accepts(remote));
+        assert!(
+            !FlakeRefSyntax::LocalPathOnly.accepts(remote),
+            "a github: ref has no fetcher on sui's path — it is opened as a directory"
+        );
+    }
+
+    /// The accepted local forms are exactly the two sui's parser handles
+    /// (`flake_ref.rs:48` strips `path:`), and a RELATIVE path is refused on
+    /// purpose: it would resolve against the daemon's cwd, which is the state
+    /// dir, not a checkout.
+    #[test]
+    fn local_path_only_accepts_absolute_paths_bare_or_path_prefixed() {
+        assert!(FlakeRefSyntax::LocalPathOnly.accepts("/var/lib/sentinela/checkout"));
+        assert!(FlakeRefSyntax::LocalPathOnly.accepts("path:/var/lib/sentinela/checkout"));
+        assert!(!FlakeRefSyntax::LocalPathOnly.accepts("relative/checkout"));
+        assert!(!FlakeRefSyntax::LocalPathOnly.accepts("."));
+        assert!(!FlakeRefSyntax::LocalPathOnly.accepts("git+https://example.invalid/r"));
+    }
+
+    /// The pairing check the preflight refuses on. A remote-capable tool never
+    /// trips it; sui trips it for every realistic sentinela config.
+    #[test]
+    fn a_remote_flake_url_is_unresolvable_under_sui_and_fine_under_the_nix_tools() {
+        let with = |tool| SentinelaConfig {
+            flake_url: "github:pleme-io/nix".to_owned(),
+            hostname: "rio".to_owned(),
+            rebuild_tool: tool,
+            ..SentinelaConfig::default()
+        };
+        assert!(with(RebuildTool::DarwinRebuild).flake_ref_is_resolvable());
+        assert!(with(RebuildTool::NixosRebuild).flake_ref_is_resolvable());
+        assert!(
+            !with(RebuildTool::Sui).flake_ref_is_resolvable(),
+            "selecting sui against a remote repo must be refused BEFORE the loop \
+             starts — otherwise every tick fails closed forever while the unit \
+             reads active(running) and the heartbeat stays fresh"
+        );
+    }
+
+    /// The empty url both tiers ship must not be judged, or `bare()` and
+    /// `prescribed_default()` would be self-refusing configs.
+    #[test]
+    fn an_empty_flake_url_is_not_judged_by_the_pairing_check() {
+        use shikumi::TieredConfig as _;
+        assert!(SentinelaConfig::bare().flake_ref_is_resolvable());
+        assert!(SentinelaConfig::prescribed_default().flake_ref_is_resolvable());
+        let mut cfg = SentinelaConfig::prescribed_default();
+        cfg.rebuild_tool = RebuildTool::Sui;
+        assert!(cfg.flake_ref_is_resolvable());
+    }
+
+    /// A node selects sui by config, same as every other tool — the variant is
+    /// retired-by-configuration, not absent (★★ MODULARIZE, DON'T DELETE).
+    #[test]
+    fn sui_has_a_wire_spelling() {
+        let yaml = "flake_url: /srv/nix\nhostname: h\nrebuild_tool: sui\n";
+        let cfg: SentinelaConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.rebuild_tool, RebuildTool::Sui);
+        assert!(serde_yaml::to_string(&cfg).unwrap().contains("sui"));
     }
 
     /// BACKWARD COMPATIBILITY, asserted rather than assumed. `SentinelaConfig`
