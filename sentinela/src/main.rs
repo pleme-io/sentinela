@@ -275,59 +275,141 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     // thousand failed. MEASURED on ryn 2026-08-02: 4136 consecutive
     // failures across 27.9 days, and 15 `daemon started` lines in that same
     // log — every restart had the number available and printed none of it.
-    match env.load_chain() {
-        Ok(chain) => {
-            let streak = chain.consecutive_failures();
-            let last_ok = chain
-                .last_activated_rev()
-                .map_or_else(|| "never".to_owned(), |r| r.short().to_owned());
-            // An empty chain has a zero streak, so a naive `streak == 0`
-            // reports a loop that has NEVER deployed as converged. Absence
-            // of failure is not evidence of convergence; only an activation
-            // is. Seen for real on cid 2026-08-02, freshly migrated onto
-            // this engine: receipts=0, streak=0, last_activated=never.
-            // ── ★ THREE STATES, NOT TWO ──────────────────────────────────
-            // "not converged" is not one condition. A loop whose builds FAIL
-            // needs a human; a loop that keeps DEFERRING because the branch
-            // moves faster than it can build needs nothing — it converges the
-            // moment pushing stops. Reporting both as DEGRADED is what trains
-            // an operator to ignore the word. Broken outranks starved: if
-            // anything is genuinely failing, say that first.
-            let deferrals = chain.consecutive_deferrals();
-            if chain.is_empty() {
-                tracing::warn!(
-                    "gitops: no deploy recorded yet — expected on a freshly-enrolled node"
-                );
-            } else if streak > 0 {
-                tracing::error!(
-                    consecutive_failures = streak,
-                    last_activated = %last_ok,
-                    "gitops: DEGRADED — this node is not tracking the branch"
-                );
-            } else if deferrals > 0 {
-                tracing::warn!(
-                    consecutive_deferrals = deferrals,
-                    last_activated = %last_ok,
-                    "gitops: STARVED — each build finishes against a moved HEAD; \
-                     nothing is broken, the branch is moving faster than one build"
-                );
-            } else {
-                tracing::info!(last_activated = %last_ok, "gitops: converged");
-            }
-        }
-        // Unreadable chain is itself worth saying out loud: it means the
-        // audit trail — the only durable record of whether we converge —
-        // cannot be consulted.
-        Err(e) => tracing::error!(error = %e, "gitops: receipt chain unreadable"),
-    }
+    let mut prev = health(&env);
+    log_health(&prev);
+
+    // ── ★ AND RE-ASK IT EVERY TICK ────────────────────────────────────────
+    // The announcement above answers "is this loop working?" exactly once,
+    // at startup, because it sits before `loop`. That was the whole defect
+    // in the next outage: MEASURED on ryn 2026-08-06, the daemon started at
+    // 00:28, printed DEGRADED once at 07:28, and then said nothing for the
+    // 19.5 hours it spent failing, deferring and standing aside on an
+    // operator-held machine lock. It was alive the entire time, so KeepAlive
+    // was satisfied; it was ticking, so nothing looked hung; and the one
+    // surface that knew the number had already spoken and would not speak
+    // again for the life of the process.
+    //
+    // A startup-only verdict answers the question at the one moment it is
+    // least likely to be interesting — a fresh process has nothing to report
+    // yet. Re-ask it after every tick.
+    //
+    // Quiet while converged, loud otherwise. Emitting unconditionally would
+    // print an info line every poll interval on a healthy node, which is the
+    // fastest way to train an operator to filter the word out — the exact
+    // failure the DEGRADED/STARVED split above exists to avoid. So a healthy
+    // loop stays silent after its startup line, a broken one says so on
+    // every tick, and the transition back to healthy is announced once.
     loop {
         let outcome = sentinela.tick(&env);
         log_outcome(&outcome);
+
+        let now = health(&env);
+        if should_report(&prev, &now) {
+            log_health(&now);
+        }
+        prev = now;
+
         std::thread::sleep(outcome.next_delay(&loop_cfg));
     }
 }
 
 /// Emit one tick's outcome as a typed structured log line.
+/// What the receipt chain says about this loop, as a VALUE rather than a log
+/// line — so the caller can decide whether saying it again is worth saying.
+///
+/// Separating the verdict from its emission is the whole point. While this
+/// lived inline before `loop`, "is this loop working?" could only ever be
+/// answered once per process, and a 19.5-hour outage passed in silence
+/// because the answer had already been given at a moment when it was still
+/// uninteresting.
+///
+/// ── ★ THREE STATES, NOT TWO ──
+/// "not converged" is not one condition. A loop whose builds FAIL needs a
+/// human; a loop that keeps DEFERRING because the branch moves faster than
+/// it can build needs nothing — it converges the moment pushing stops.
+/// Reporting both as DEGRADED is what trains an operator to ignore the word.
+/// Broken outranks starved: if anything is genuinely failing, say that first.
+enum Health {
+    /// Chain readable, nothing deployed yet. An empty chain has a ZERO
+    /// streak, so a naive `streak == 0` reports a loop that has NEVER
+    /// deployed as converged. Absence of failure is not evidence of
+    /// convergence; only an activation is. Seen for real on cid 2026-08-02,
+    /// freshly migrated onto this engine: receipts=0, streak=0,
+    /// last_activated=never.
+    NeverDeployed,
+    Degraded { streak: usize, last_ok: String },
+    Starved { deferrals: usize, last_ok: String },
+    Converged { last_ok: String },
+    /// An unreadable chain is itself worth saying out loud: it means the
+    /// audit trail — the only durable record of whether we converge —
+    /// cannot be consulted.
+    Unreadable { error: String },
+}
+
+fn health(env: &RealEnv) -> Health {
+    let chain = match env.load_chain() {
+        Ok(c) => c,
+        Err(e) => {
+            return Health::Unreadable {
+                error: e.to_string(),
+            }
+        }
+    };
+    if chain.is_empty() {
+        return Health::NeverDeployed;
+    }
+    let last_ok = chain
+        .last_activated_rev()
+        .map_or_else(|| "never".to_owned(), |r| r.short().to_owned());
+    let streak = chain.consecutive_failures();
+    if streak > 0 {
+        return Health::Degraded { streak, last_ok };
+    }
+    let deferrals = chain.consecutive_deferrals();
+    if deferrals > 0 {
+        return Health::Starved { deferrals, last_ok };
+    }
+    Health::Converged { last_ok }
+}
+
+/// Say something whenever anything is wrong, and once more on the transition
+/// back to healthy. Stay silent while converged.
+///
+/// The silence is deliberate and is the only judgement call here. Emitting
+/// unconditionally would print an info line every poll interval on a healthy
+/// node — which is the fastest way to train an operator to filter the word
+/// out, and filtering is exactly the failure the DEGRADED/STARVED split
+/// exists to prevent. A broken loop therefore says so on EVERY tick, and
+/// recovery is announced once so the log shows when it stopped.
+fn should_report(prev: &Health, now: &Health) -> bool {
+    !matches!(now, Health::Converged { .. }) || !matches!(prev, Health::Converged { .. })
+}
+
+fn log_health(h: &Health) {
+    match h {
+        Health::NeverDeployed => {
+            tracing::warn!("gitops: no deploy recorded yet — expected on a freshly-enrolled node")
+        }
+        Health::Degraded { streak, last_ok } => tracing::error!(
+            consecutive_failures = streak,
+            last_activated = %last_ok,
+            "gitops: DEGRADED — this node is not tracking the branch"
+        ),
+        Health::Starved { deferrals, last_ok } => tracing::warn!(
+            consecutive_deferrals = deferrals,
+            last_activated = %last_ok,
+            "gitops: STARVED — each build finishes against a moved HEAD; \
+             nothing is broken, the branch is moving faster than one build"
+        ),
+        Health::Converged { last_ok } => {
+            tracing::info!(last_activated = %last_ok, "gitops: converged")
+        }
+        Health::Unreadable { error } => {
+            tracing::error!(error = %error, "gitops: receipt chain unreadable")
+        }
+    }
+}
+
 fn log_outcome(outcome: &TickOutcome) {
     match outcome {
         TickOutcome::Deployed { rev, generation } => {
@@ -641,6 +723,84 @@ mod preflight_tests {
         .to_string();
         assert!(msg.contains("sui"), "{msg}");
         assert!(msg.contains("github:pleme-io/nix"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod health_report_tests {
+    use super::{should_report, Health};
+
+    fn converged() -> Health {
+        Health::Converged {
+            last_ok: "28638ed".to_owned(),
+        }
+    }
+
+    /// The ryn 2026-08-06 outage, pinned at the level it actually broke.
+    ///
+    /// The daemon printed DEGRADED once at 07:28 and then said nothing for
+    /// the 19.5 hours it spent failing. It was alive, so KeepAlive was
+    /// satisfied; it was ticking, so nothing looked hung. A degraded loop
+    /// must speak on every tick, not once per process.
+    #[test]
+    fn degraded_reports_on_every_tick() {
+        let d = Health::Degraded {
+            streak: 9,
+            last_ok: "28638ed".to_owned(),
+        };
+        assert!(should_report(&d, &d), "a persistently degraded loop stays loud");
+    }
+
+    /// Starved is not broken, but it is still not converged — it means the
+    /// branch is outrunning the builder, which an operator may want to know.
+    #[test]
+    fn starved_reports_on_every_tick() {
+        let s = Health::Starved {
+            deferrals: 2,
+            last_ok: "28638ed".to_owned(),
+        };
+        assert!(should_report(&s, &s));
+    }
+
+    /// The silence that makes the noise credible. Without it a healthy node
+    /// prints an info line every poll interval, and an operator learns to
+    /// filter the word — which is the failure the DEGRADED/STARVED split
+    /// exists to prevent.
+    #[test]
+    fn converged_stays_quiet() {
+        assert!(!should_report(&converged(), &converged()));
+    }
+
+    /// Recovery is announced once, so the log shows when it stopped.
+    #[test]
+    fn recovery_is_announced_once() {
+        let broken = Health::Degraded {
+            streak: 9,
+            last_ok: "28638ed".to_owned(),
+        };
+        assert!(should_report(&broken, &converged()), "the recovery tick speaks");
+        assert!(
+            !should_report(&converged(), &converged()),
+            "the tick after recovery is silent again"
+        );
+    }
+
+    /// An empty chain has a zero failure streak, so a naive `streak == 0`
+    /// would call a loop that has NEVER deployed converged. Absence of
+    /// failure is not evidence of convergence.
+    #[test]
+    fn never_deployed_is_not_converged() {
+        assert!(should_report(&Health::NeverDeployed, &Health::NeverDeployed));
+    }
+
+    /// If the chain cannot be read, the one durable record of whether we
+    /// converge is unavailable — that is a finding, not a quiet state.
+    #[test]
+    fn unreadable_chain_reports() {
+        let u = Health::Unreadable {
+            error: "permission denied".to_owned(),
+        };
+        assert!(should_report(&u, &u));
     }
 }
 
