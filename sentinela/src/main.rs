@@ -38,13 +38,18 @@ struct Cli {
 enum Cmd {
     /// Run the daemon loop (the launchd entry point).
     Run,
-    /// Print the current deploy state (chain head + verification) as JSON.
+    /// Print the current deploy state — verdict first, then the evidence.
     Status {
         /// Exit non-zero unless the node is POSITIVELY converged: a fresh
         /// heartbeat, a verified chain, no failure streak. Absent evidence
         /// exits non-zero too — "cannot tell" is not "fine".
         #[arg(long)]
         gate: bool,
+        /// Emit the machine surface (the same JSON document this command
+        /// printed unconditionally before 0.1.18) instead of the operator
+        /// view. Every field is unchanged, so a consumer adds one flag.
+        #[arg(long)]
+        json: bool,
     },
     /// Verify the receipt chain; exit non-zero if broken.
     Verify,
@@ -74,7 +79,7 @@ fn main() -> std::process::ExitCode {
 
     match cli.command {
         Cmd::Run => run(cfg),
-        Cmd::Status { gate } => status(&cfg, gate),
+        Cmd::Status { gate, json } => status(&cfg, gate, json),
         Cmd::Verify => verify(&cfg),
         Cmd::Probe => probe(&cfg),
         Cmd::TickOnce => tick_once(&cfg),
@@ -467,7 +472,7 @@ fn log_outcome(outcome: &TickOutcome) {
 }
 
 /// Print the current state as JSON (for the observability surface).
-fn status(cfg: &SentinelaConfig, gate: bool) -> std::process::ExitCode {
+fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCode {
     let env = RealEnv::new(cfg.clone());
     let chain = match env.load_chain() {
         Ok(c) => c,
@@ -541,10 +546,14 @@ fn status(cfg: &SentinelaConfig, gate: bool) -> std::process::ExitCode {
             .and_then(|b| b.head_rev.as_ref())
             .map(|r| r.as_str().to_owned()),
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&status).unwrap_or_default()
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
+        );
+    } else {
+        print!("{}", StatusView(&status));
+    }
 
     if !gate {
         return std::process::ExitCode::SUCCESS;
@@ -962,5 +971,143 @@ mod gate_tests {
         let err = convergence_gate(&beat_at(NOW_MS - 1000), NOW_MS, POLL, 0, false)
             .expect_err("tamper-evidence outranks liveness");
         assert!(err.contains("verification"), "{err}");
+    }
+}
+
+// ── The operator-facing face of `status` ────────────────────────────────
+//
+// ── ★ WHY THIS EXISTS: A DOCUMENT IS NOT A VERDICT ──────────────────────
+// `status` printed one pretty-printed JSON object and nothing else. Every
+// field it needed was in there and it was still not *readable*: the answer
+// ("is this node converging?") sat in a nested `converged.ok` two thirds of
+// the way down, next to an epoch-milliseconds timestamp and two 40-char
+// hex revs that the reader has to compare character by character.
+//
+// Measured cost, 2026-08-07: over one session an operator-agent piped this
+// command through a hand-written Python parser THREE separate times purely
+// to answer "is it healthy and how old is the last tick" — converting
+// `last_tick_at_unix_ms` by hand each time. A surface that every reader
+// rewrites a parser for is not a surface, it is a data dump.
+//
+// So the view answers, in order of how urgently a human needs it:
+//   1. the VERDICT, first line, one word, coloured, with a glyph — legible
+//      before the eye reaches the second line;
+//   2. WHY, immediately under it, only when the answer is not "fine";
+//   3. deployed and head ADJACENT, with an explicit marker when they
+//      differ, so "behind" is seen rather than computed;
+//   4. durations in human units — `42s`, `36m`, `2h03m` — never epochs;
+//   5. what to run next, when there is a next thing to run.
+//
+// The JSON is not gone and not reshaped: `--json` prints the identical
+// document. A machine consumer adds one flag; a human stops needing one.
+//
+// TYPED EMISSION: this is a `Display` impl driven by `write!`, which is the
+// sanctioned emission surface — not `format!` of a rendered blob.
+//
+// TIER: only-mitigated. Nothing stops a future field from being added to
+// the JSON and never surfacing here; the two are hand-kept in step.
+// DESTINATION: `kazari` (飾り), the fleet's typed line-output primitive, so
+// the block is DERIVED from the typed status rather than written twice.
+// Not adopted here because it is a new dependency, and this crate's
+// `Cargo.lock` is mid-`gen`-regeneration for the tsunagu bump.
+// `pending-despacho: status-view-through-kazari`
+struct StatusView<'a>(&'a serde_json::Value);
+
+/// ANSI, applied only when the stream is a terminal and `NO_COLOR` is unset.
+fn paint(s: &str, code: &str) -> String {
+    use std::io::IsTerminal as _;
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        ["\x1b[", code, "m", s, "\x1b[0m"].concat()
+    } else {
+        s.to_owned()
+    }
+}
+
+/// Epoch-milliseconds → the age a human reads at a glance.
+///
+/// The whole point of the view: `1786134280041` tells a reader nothing
+/// without arithmetic, and the arithmetic is where the mistakes live —
+/// this session mis-read one such number as a ratio against the poll
+/// interval and published a false claim off it.
+fn human_age(then_ms: u64, now_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(then_ms) / 1000;
+    match secs {
+        0..=59 => [&secs.to_string(), "s"].concat(),
+        60..=3599 => [&(secs / 60).to_string(), "m", &(secs % 60).to_string(), "s"].concat(),
+        3600..=86399 => [&(secs / 3600).to_string(), "h", &((secs % 3600) / 60).to_string(), "m"].concat(),
+        _ => [&(secs / 86400).to_string(), "d", &((secs % 86400) / 3600).to_string(), "h"].concat(),
+    }
+}
+
+/// First 8 chars of a rev — enough to compare two by eye, which is the job.
+fn short(rev: &str) -> &str {
+    rev.get(..8).unwrap_or(rev)
+}
+
+impl std::fmt::Display for StatusView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = self.0;
+        let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("—").to_owned();
+        let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+
+        let ok = v.pointer("/converged/ok").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let why = v.pointer("/converged/why").and_then(serde_json::Value::as_str);
+
+        let (glyph, word, colour) = if ok {
+            ("●", "CONVERGED", "32;1")
+        } else {
+            ("✗", "NOT CONVERGED", "31;1")
+        };
+        writeln!(f)?;
+        writeln!(f, "  {} {:<44}{}", paint(glyph, colour), paint(word, colour), paint(&s("hostname"), "1"))?;
+        if let Some(w) = why {
+            writeln!(f, "    {:<11} {}", "why", paint(w, "31"))?;
+        }
+        writeln!(f)?;
+
+        writeln!(f, "    {:<11} {} · {}", "tracking", s("flake_url"), s("branch"))?;
+
+        // Deployed and head ADJACENT — the comparison is the diagnosis.
+        let deployed = v.get("last_activated_rev").and_then(serde_json::Value::as_str);
+        let head = v.get("head_rev").and_then(serde_json::Value::as_str);
+        writeln!(f, "    {:<11} {}", "deployed", deployed.map_or("— never activated".to_owned(), |r| short(r).to_owned()))?;
+        match (deployed, head) {
+            (Some(d), Some(h)) if d == h => writeln!(f, "    {:<11} {}  {}", "head", short(h), paint("(in sync)", "32"))?,
+            (_, Some(h)) => writeln!(f, "    {:<11} {}  {}", "head", short(h), paint("← BEHIND", "33;1"))?,
+            (_, None) => writeln!(f, "    {:<11} {}", "head", paint("— the last tick resolved no branch head", "33"))?,
+        }
+
+        // Liveness, in units a human owns.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let tick = match n("last_tick_at_unix_ms") {
+            Some(t) => [
+                &human_age(t, now_ms), " ago · ", &s("last_tick_outcome"), " · ", &s("phase"),
+            ].concat(),
+            None => paint("no heartbeat has ever been published", "31").to_string(),
+        };
+        writeln!(f, "    {:<11} {}   {}", "last tick", tick,
+                 paint(&["(poll ", &n("poll_seconds").unwrap_or(0).to_string(), "s)"].concat(), "2"))?;
+
+        let verified = v.get("chain_verified").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        writeln!(f, "    {:<11} {} · chain {}", "receipts", n("receipts").unwrap_or(0),
+                 if verified { paint("verified", "32") } else { paint("UNVERIFIED", "31;1") })?;
+
+        let fails = n("consecutive_failures").unwrap_or(0);
+        let defers = n("consecutive_deferrals").unwrap_or(0);
+        // 0/0 healthy · n/0 broken · 0/n starved — the doc's own reading.
+        let streaks = [
+            &if fails == 0 { paint("0 failures", "32") } else { paint(&[&fails.to_string(), " failures"].concat(), "31;1") },
+            " · ",
+            &if defers == 0 { paint("0 deferrals", "32") } else { paint(&[&defers.to_string(), " deferrals"].concat(), "33;1") },
+        ].concat();
+        writeln!(f, "    {:<11} {}", "streaks", streaks)?;
+
+        if !ok {
+            writeln!(f)?;
+            writeln!(f, "    {:<11} {}", "next", paint("journalctl -u pleme-gitops -n 50 --no-pager", "36"))?;
+        }
+        writeln!(f)
     }
 }
