@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
-shikumi = { git = "https://github.com/pleme-io/shikumi" }
+shikumi = "0.1.496"
 sentinela-core = { path = "../sentinela-core" }
 
 [dev-dependencies]

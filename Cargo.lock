@@ -347,6 +347,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,8 +381,9 @@ dependencies = [
 
 [[package]]
 name = "gen-macros"
-version = "0.1.17"
-source = "git+https://github.com/pleme-io/gen#26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e87d6e8b417dad4ba0d2ed96c58c2cd7af538f592dcf698db0cd8480b08225ed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -382,8 +392,9 @@ dependencies = [
 
 [[package]]
 name = "gen-platform"
-version = "0.1.17"
-source = "git+https://github.com/pleme-io/gen#26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "340242b11b413b24644f55a9dd7ffd05e371910a738ab52981a03a6ffedf6783"
 dependencies = [
  "gen-macros",
  "gen-types",
@@ -395,8 +406,9 @@ dependencies = [
 
 [[package]]
 name = "gen-types"
-version = "0.1.17"
-source = "git+https://github.com/pleme-io/gen#26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1efa39b439fd999e2f7454c08cb7a4d1f9e6e49ffa805557647f7f998caf7414"
 dependencies = [
  "blake3",
  "chrono",
@@ -737,6 +749,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
 dependencies = [
  "bitflags",
+ "fsevent-sys",
  "inotify",
  "kqueue",
  "libc",
@@ -1065,8 +1078,9 @@ dependencies = [
 
 [[package]]
 name = "shikumi"
-version = "0.1.151"
-source = "git+https://github.com/pleme-io/shikumi#4927e26f092f9d5ab69729f4d8021d07cd74b147"
+version = "0.1.496"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de145934a9ccb306460220a3cd6068240dea61c139a34846b030bdb3d7b6af41"
 dependencies = [
  "arc-swap",
  "async-trait",
