@@ -34,7 +34,7 @@ fs4 = "0.9"
 # The bounded-subprocess primitive: a deadline, a file capture instead of a
 # deadlocking pipe, and a process-GROUP kill. Extracted from this crate into
 # the fleet daemon-lifecycle library once the consumer count reached six.
-tsunagu = "0.1.4"
+tsunagu = "0.1.5"
 
 [dev-dependencies]
 tempfile = "3"

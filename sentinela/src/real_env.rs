@@ -17,7 +17,7 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsunagu::exec::{BoundedRun, OnTimeout};
 use url::Url;
@@ -276,6 +276,55 @@ impl RealEnv {
     /// per-run: the file is consumed and deleted at the end of the call, and
     /// a stable name means a crash leaves exactly one inspectable artifact
     /// instead of accumulating them in the state dir forever.
+    /// Where one git invocation's output is captured — one file, reused,
+    /// because these are short and only the last failure is interesting.
+    fn git_capture_path(&self) -> PathBuf {
+        Path::new(&self.cfg.state_dir).join("git.out")
+    }
+
+    /// Run a git command under the SAME bound the rebuild already uses.
+    ///
+    /// ── ★ THE TICK WAS BOUNDED EVERYWHERE EXCEPT ITS NETWORK CALLS ──
+    /// `run_rebuild` has driven `BoundedRun` since 0.1.10, and the receipt
+    /// above this impl block says the primitive was lifted into
+    /// `tsunagu::exec` precisely so "a fix reaches the fleet instead of one
+    /// daemon". These four git call sites — `ls-remote` in `probe_head`,
+    /// and the `fetch` + two `merge-base`/`rev-parse` calls in the ancestry
+    /// check — were left on a bare `Command::output()`, which has no
+    /// deadline anywhere in it.
+    ///
+    /// `ls-remote` and `fetch` talk to the NETWORK. A stalled transfer
+    /// there wedges the tick with no receipt, no cooldown and no retry —
+    /// the same permanent wedge `build_timeout_seconds` was added to
+    /// prevent, arriving by the one path in the tick that had no bound.
+    /// git's own `http.lowSpeedLimit` is unset by default, so nothing
+    /// underneath was catching it either.
+    ///
+    /// `OnTimeout::KillGroup`: git mutates nothing we depend on here
+    /// (`ls-remote` is a read; `fetch` writes only the throwaway mirror),
+    /// so a hung one is killed outright — the opposite of a mid-activation
+    /// switch, which is why that one is `Abandon`.
+    ///
+    /// Doctrine: theory/RECONCILER-LIVENESS.md (P1) · theory/BALIZA.md 0b.
+    fn run_git(&self, cmd: Command, err: fn(String) -> EnvError) -> Result<Output, EnvError> {
+        let capture = self.git_capture_path();
+        // `separate_streams` is load-bearing, not a preference: tsunagu's
+        // DEFAULT capture is merged, and it delivers the merged tail in
+        // `Output::stderr` with `stdout` left EMPTY. `probe_head` parses
+        // `out.stdout` for the ls-remote line, so the merged mode would have
+        // silently broken head probing while every call still "succeeded" —
+        // the reason tsunagu 0.1.5 added the mode at all ("the merged-only
+        // contract excluded most of the fleet"). Hence the 0.1.4 -> 0.1.5
+        // bump that ships with this change.
+        let mut run = BoundedRun::new(&capture).separate_streams();
+        if self.cfg.git_timeout_seconds > 0 {
+            run = run
+                .timeout(std::time::Duration::from_secs(self.cfg.git_timeout_seconds))
+                .on_timeout(OnTimeout::KillGroup);
+        }
+        run.run(cmd).map_err(|e| exec_err("git", &e, err))
+    }
+
     fn rebuild_capture_path(&self, verb: &str) -> PathBuf {
         Path::new(&self.cfg.state_dir).join(format!("rebuild-{verb}.out"))
     }
@@ -308,12 +357,10 @@ impl GitopsEnv for RealEnv {
     fn probe_head(&self) -> Result<Option<Rev>, EnvError> {
         let url = self.probe_url()?;
         let refspec = ["refs/heads/", self.cfg.rev_probe.branch.as_str()].concat();
-        let out = Command::new("git")
-            .arg("ls-remote")
+        let out = self.run_git({ let mut c = Command::new("git");
+            c.arg("ls-remote")
             .arg(&url)
-            .arg(&refspec)
-            .output()
-            .map_err(|e| exec_err("git", &e, EnvError::ProbeFailed))?;
+            .arg(&refspec);c }, EnvError::ProbeFailed)?;
         if !out.status.success() {
             return Err(EnvError::ProbeFailed(
                 String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -341,14 +388,12 @@ impl GitopsEnv for RealEnv {
         let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
 
         if !mirror.exists() {
-            let out = Command::new("git")
-                .arg("clone")
+            let out = self.run_git({ let mut c = Command::new("git");
+                c.arg("clone")
                 .arg("--bare")
                 .arg("--filter=blob:none")
                 .arg(&url)
-                .arg(&mirror)
-                .output()
-                .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
+                .arg(&mirror);c }, EnvError::AncestryFailed)?;
             if !out.status.success() {
                 return Err(EnvError::AncestryFailed(
                     String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -361,18 +406,24 @@ impl GitopsEnv for RealEnv {
         // may be unreachable from any ref at all — which is exactly the case
         // that must answer "not an ancestor" rather than error out into a
         // retry loop.
-        let fetch = Command::new("git")
-            .arg("--git-dir")
-            .arg(&mirror)
-            .arg("fetch")
-            .arg("--quiet")
-            .arg(&url)
-            .arg(format!(
-                "+refs/heads/{}:refs/heads/probe",
-                self.cfg.rev_probe.branch
-            ))
-            .output()
-            .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
+        // The most network-exposed call in the whole tick: an actual object
+        // transfer from a remote we do not control. Bounded like the rest.
+        let fetch = self.run_git(
+            {
+                let mut c = Command::new("git");
+                c.arg("--git-dir")
+                    .arg(&mirror)
+                    .arg("fetch")
+                    .arg("--quiet")
+                    .arg(&url)
+                    .arg(format!(
+                        "+refs/heads/{}:refs/heads/probe",
+                        self.cfg.rev_probe.branch
+                    ));
+                c
+            },
+            EnvError::AncestryFailed,
+        )?;
         if !fetch.status.success() {
             return Err(EnvError::AncestryFailed(
                 String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
@@ -382,15 +433,13 @@ impl GitopsEnv for RealEnv {
         // `--is-ancestor` is exit-code-only: 0 = yes, 1 = no, anything else
         // (including a rev this mirror has never heard of) is an ERROR and
         // must not be read as either answer.
-        let out = Command::new("git")
-            .arg("--git-dir")
+        let out = self.run_git({ let mut c = Command::new("git");
+            c.arg("--git-dir")
             .arg(&mirror)
             .arg("merge-base")
             .arg("--is-ancestor")
             .arg(ancestor.as_str())
-            .arg(descendant.as_str())
-            .output()
-            .map_err(|e| exec_err("git", &e, EnvError::AncestryFailed))?;
+            .arg(descendant.as_str());c }, EnvError::AncestryFailed)?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -978,6 +1027,74 @@ mod tests {
             state_dir: dir.to_string_lossy().into_owned(),
             ..SentinelaConfig::default()
         })
+    }
+
+    /// The regression this bounding pass nearly SHIPPED.
+    ///
+    /// `run_git` routes every git call through `BoundedRun`, whose DEFAULT
+    /// capture is merged — it returns the merged tail in `Output::stderr`
+    /// and leaves `stdout` **empty**. `probe_head` parses `out.stdout` for
+    /// the `ls-remote` line, so the default mode would have made every
+    /// probe return "no head" while every call still reported success: a
+    /// silent, total loss of convergence with a green build.
+    ///
+    /// So `separate_streams()` is load-bearing, and this test pins it by
+    /// running a real command with known stdout.
+    ///
+    /// RED-RUN RECEIPT (2026-08-07): dropping `.separate_streams()` from
+    /// `run_git` turns this red with an empty stdout, which is exactly the
+    /// silent breakage described above, made loud.
+    #[test]
+    fn run_git_keeps_stdout_separate_or_probe_head_reads_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+
+        // `git --version` is the cheapest git invocation that writes a
+        // known, non-empty line to stdout and nothing to stderr.
+        let out = env
+            .run_git(
+                {
+                    let mut c = std::process::Command::new("git");
+                    c.arg("--version");
+                    c
+                },
+                EnvError::ProbeFailed,
+            )
+            .expect("git --version must run");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("git version"),
+            "stdout must survive the bound — probe_head parses it. got stdout={stdout:?}, \
+             stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// `0` disables the git bound, matching `build_timeout_seconds` /
+    /// `switch_timeout_seconds`, so an operator can restore the
+    /// pre-bound behaviour without editing code (★★ MODULARIZE, DON'T
+    /// DELETE). Proven by running with the bound off rather than by
+    /// reading the branch.
+    #[test]
+    fn git_timeout_zero_disables_the_bound() {
+        let d = tempfile::tempdir().unwrap();
+        let env = RealEnv::new(SentinelaConfig {
+            state_dir: d.path().to_string_lossy().into_owned(),
+            git_timeout_seconds: 0,
+            ..SentinelaConfig::default()
+        });
+        let out = env
+            .run_git(
+                {
+                    let mut c = std::process::Command::new("git");
+                    c.arg("--version");
+                    c
+                },
+                EnvError::ProbeFailed,
+            )
+            .expect("the unbounded path must still run the command");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("git version"));
     }
 
     #[test]

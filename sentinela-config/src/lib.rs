@@ -267,6 +267,27 @@ pub struct SentinelaConfig {
     /// switched. The activation finishes detached and the next tick
     /// reconciles against whatever actually landed. `0` disables the bound.
     pub switch_timeout_seconds: u64,
+    /// Seconds a single **git** invocation may run before the daemon stops
+    /// waiting — `ls-remote` when probing the branch head, and the `fetch`
+    /// + ancestry pair.
+    ///
+    /// ── ★ THESE ARE NETWORK CALLS INSIDE AN OTHERWISE-BOUNDED TICK ──
+    /// `build_timeout_seconds` and `switch_timeout_seconds` bound the
+    /// rebuild and nothing else, so before this field existed a `git
+    /// ls-remote` against a stalled TLS connection blocked the tick
+    /// FOREVER — no receipt, no cooldown, no retry, and a heartbeat frozen
+    /// mid-tick. That is the exact wedge P1 exists to forbid, arriving by
+    /// the one path in the tick that had no deadline.
+    ///
+    /// Not hypothetical: on rio 2026-08-07 a nix build sat at zero CPU
+    /// holding two `CLOSE-WAIT` HTTPS sockets with unread bytes. A git
+    /// transfer can reach the same state, and git's own
+    /// `http.lowSpeedLimit` is unset by default.
+    ///
+    /// Short on purpose, unlike the rebuild bounds: `ls-remote` against a
+    /// healthy remote is sub-second, so 120s is ~100x headroom and still
+    /// two polls. `0` disables the bound.
+    pub git_timeout_seconds: u64,
     /// Which rebuild tool to drive. Defaults to `darwin-rebuild` so every
     /// existing config is unchanged; a NixOS node sets `nixos-rebuild`.
     pub rebuild_tool: RebuildTool,
@@ -286,6 +307,10 @@ pub const DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES: usize = 3;
 /// cid rebuild measured, because killing a real build is a regression while
 /// the bound only has to catch a hang.
 pub const DEFAULT_BUILD_TIMEOUT_SECONDS: u64 = 90 * 60;
+/// Default git deadline, seconds (2 min). A healthy `ls-remote` is
+/// sub-second; this is ~100x headroom and still only two polls, because a
+/// hung network read has nothing in common with a long build.
+pub const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 120;
 /// Default switch deadline, seconds (30 min). Activation is minutes, not
 /// tens of minutes, so this can be tighter than the build bound.
 pub const DEFAULT_SWITCH_TIMEOUT_SECONDS: u64 = 30 * 60;
@@ -348,6 +373,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: 0,
             build_timeout_seconds: 0,
             switch_timeout_seconds: 0,
+            git_timeout_seconds: 0,
             rebuild_tool: RebuildTool::DarwinRebuild,
         }
     }
@@ -365,6 +391,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
             switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
+            git_timeout_seconds: DEFAULT_GIT_TIMEOUT_SECONDS,
             rebuild_tool: RebuildTool::DarwinRebuild,
         }
     }
@@ -434,6 +461,7 @@ mod tests {
             land_last_good_after_failures: 3,
             build_timeout_seconds: 5400,
             switch_timeout_seconds: 1800,
+            git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();

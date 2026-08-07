@@ -1347,9 +1347,9 @@ dependencies = [
 
 [[package]]
 name = "tsunagu"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9555f43a18ebf2dcca64a97c5832e76425b4576e8a4109a46ed2cabcbff8d47e"
+checksum = "7ddf9592003d5781e33291e096dcfd47f470c1b46025b64882256de94b514762"
 dependencies = [
  "dirs",
  "rustix 0.38.44",
