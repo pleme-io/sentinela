@@ -3,3 +3,4 @@ result
 
 # per-member target dirs (workspace uses root target/)
 **/target
+Cargo.build-spec.json
