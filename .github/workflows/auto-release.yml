@@ -1,9 +1,5 @@
-# AUTO-RELEASE — bumps the workspace on merge to main. Uses the per-language
-# Rust *workspace* reusable DIRECTLY (not the polymorphic auto-release.yml@main
-# shim, which startup_failures per the org CLAUDE.md 2026-06-26 known issue).
-# sentinela is consumed by the nix repo as a flake input (built by gen for the
-# darwin system), not from crates.io — the release is the version bump + tag.
 name: auto-release
+
 on:
   push:
     branches: [main]
@@ -11,5 +7,5 @@ on:
 
 jobs:
   release:
-    uses: pleme-io/substrate/.github/workflows/rust-auto-release.yml@main
+    uses: pleme-io/substrate/.github/workflows/cargo-auto-release.yml@main
     secrets: inherit
