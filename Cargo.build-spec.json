@@ -570,16 +570,6 @@
           "optional": false,
           "target": null,
           "tree": "target"
-        },
-        {
-          "name": "cpufeatures",
-          "package_key": "cpufeatures-0.3.0",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": "cfg(any(target_arch = \"x86\", target_arch = \"x86_64\"))",
-          "tree": "target"
         }
       ],
       "build_dependencies": [
@@ -1817,15 +1807,53 @@
         "preBuild": "export CARGO_CRATE_NAME=fs4;"
       }
     },
-    "gen-macros-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+    "fsevent-sys-4.1.0": {
+      "name": "fsevent-sys",
+      "version": "4.1.0",
+      "edition": "2018",
+      "source": {
+        "kind": "registry",
+        "url": "https://static.crates.io/crates/fsevent-sys/fsevent-sys-4.1.0.crate",
+        "sha256": "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2",
+        "name_with_ext": "fsevent-sys-4.1.0.tar.gz"
+      },
+      "features": [],
+      "proc_macro": false,
+      "build_script": null,
+      "links": null,
+      "binaries": [],
+      "lib_target": null,
+      "runtime_dependencies": [
+        {
+          "name": "libc",
+          "package_key": "libc-0.2.186",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": null,
+          "tree": "target"
+        }
+      ],
+      "build_dependencies": [],
+      "crate_renames": {},
+      "build_rust_crate_args": {
+        "crateName": "fsevent-sys",
+        "version": "4.1.0",
+        "edition": "2018",
+        "release": true,
+        "preBuild": "export CARGO_CRATE_NAME=fsevent_sys;"
+      }
+    },
+    "gen-macros-0.1.34": {
       "name": "gen-macros",
-      "version": "0.1.17",
+      "version": "0.1.34",
       "edition": "2024",
       "source": {
-        "kind": "git",
-        "url": "https://github.com/pleme-io/gen",
-        "rev": "26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
-        "sha256": "sha256-khDWAqmgqr/pPPq73hZbZojnEw3gVc6RYFPLuNCoR/A="
+        "kind": "registry",
+        "url": "https://static.crates.io/crates/gen-macros/gen-macros-0.1.34.crate",
+        "sha256": "e87d6e8b417dad4ba0d2ed96c58c2cd7af538f592dcf698db0cd8480b08225ed",
+        "name_with_ext": "gen-macros-0.1.34.tar.gz"
       },
       "features": [],
       "proc_macro": true,
@@ -1879,7 +1907,7 @@
       },
       "build_rust_crate_args": {
         "crateName": "gen-macros",
-        "version": "0.1.17",
+        "version": "0.1.34",
         "edition": "2024",
         "crateRenames": {
           "proc-macro2": [
@@ -1894,15 +1922,15 @@
         "preBuild": "export CARGO_CRATE_NAME=gen_macros;"
       }
     },
-    "gen-platform-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+    "gen-platform-0.1.34": {
       "name": "gen-platform",
-      "version": "0.1.17",
+      "version": "0.1.34",
       "edition": "2024",
       "source": {
-        "kind": "git",
-        "url": "https://github.com/pleme-io/gen",
-        "rev": "26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
-        "sha256": "sha256-khDWAqmgqr/pPPq73hZbZojnEw3gVc6RYFPLuNCoR/A="
+        "kind": "registry",
+        "url": "https://static.crates.io/crates/gen-platform/gen-platform-0.1.34.crate",
+        "sha256": "340242b11b413b24644f55a9dd7ffd05e371910a738ab52981a03a6ffedf6783",
+        "name_with_ext": "gen-platform-0.1.34.tar.gz"
       },
       "features": [],
       "proc_macro": false,
@@ -1913,7 +1941,7 @@
       "runtime_dependencies": [
         {
           "name": "gen_macros",
-          "package_key": "gen-macros-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+          "package_key": "gen-macros-0.1.34",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -1923,7 +1951,7 @@
         },
         {
           "name": "gen_types",
-          "package_key": "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+          "package_key": "gen-types-0.1.34",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -1978,31 +2006,31 @@
       "crate_renames": {
         "gen-macros": [
           {
-            "version": "0.1.17",
+            "version": "0.1.34",
             "rename": "gen_macros"
           }
         ],
         "gen-types": [
           {
-            "version": "0.1.17",
+            "version": "0.1.34",
             "rename": "gen_types"
           }
         ]
       },
       "build_rust_crate_args": {
         "crateName": "gen-platform",
-        "version": "0.1.17",
+        "version": "0.1.34",
         "edition": "2024",
         "crateRenames": {
           "gen-macros": [
             {
-              "version": "0.1.17",
+              "version": "0.1.34",
               "rename": "gen_macros"
             }
           ],
           "gen-types": [
             {
-              "version": "0.1.17",
+              "version": "0.1.34",
               "rename": "gen_types"
             }
           ]
@@ -2011,15 +2039,15 @@
         "preBuild": "export CARGO_CRATE_NAME=gen_platform;"
       }
     },
-    "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+    "gen-types-0.1.34": {
       "name": "gen-types",
-      "version": "0.1.17",
+      "version": "0.1.34",
       "edition": "2024",
       "source": {
-        "kind": "git",
-        "url": "https://github.com/pleme-io/gen",
-        "rev": "26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
-        "sha256": "sha256-khDWAqmgqr/pPPq73hZbZojnEw3gVc6RYFPLuNCoR/A="
+        "kind": "registry",
+        "url": "https://static.crates.io/crates/gen-types/gen-types-0.1.34.crate",
+        "sha256": "1efa39b439fd999e2f7454c08cb7a4d1f9e6e49ffa805557647f7f998caf7414",
+        "name_with_ext": "gen-types-0.1.34.tar.gz"
       },
       "features": [],
       "proc_macro": false,
@@ -2109,7 +2137,7 @@
       "crate_renames": {},
       "build_rust_crate_args": {
         "crateName": "gen-types",
-        "version": "0.1.17",
+        "version": "0.1.34",
         "edition": "2024",
         "release": true,
         "preBuild": "export CARGO_CRATE_NAME=gen_types;"
@@ -2321,7 +2349,18 @@
       "links": null,
       "binaries": [],
       "lib_target": null,
-      "runtime_dependencies": [],
+      "runtime_dependencies": [
+        {
+          "name": "core_foundation_sys",
+          "package_key": "core-foundation-sys-0.8.7",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": false,
+          "target": "cfg(target_vendor = \"apple\")",
+          "tree": "target"
+        }
+      ],
       "build_dependencies": [],
       "crate_renames": {
         "core-foundation-sys": [
@@ -3293,117 +3332,6 @@
         "preBuild": "export CARGO_CRATE_NAME=itoa;"
       }
     },
-    "kqueue-1.2.0": {
-      "name": "kqueue",
-      "version": "1.2.0",
-      "edition": "2021",
-      "source": {
-        "kind": "registry",
-        "url": "https://static.crates.io/crates/kqueue/kqueue-1.2.0.crate",
-        "sha256": "273c0752728918e0ac4976f2b275b6fefb9ecd400585dec929419f3844cd87b5",
-        "name_with_ext": "kqueue-1.2.0.tar.gz"
-      },
-      "features": [],
-      "proc_macro": false,
-      "build_script": null,
-      "links": null,
-      "binaries": [],
-      "lib_target": null,
-      "runtime_dependencies": [
-        {
-          "name": "kqueue_sys",
-          "package_key": "kqueue-sys-1.1.2",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": null,
-          "tree": "target"
-        },
-        {
-          "name": "libc",
-          "package_key": "libc-0.2.186",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": null,
-          "tree": "target"
-        }
-      ],
-      "build_dependencies": [],
-      "crate_renames": {
-        "kqueue-sys": [
-          {
-            "version": "1.1.2",
-            "rename": "kqueue_sys"
-          }
-        ]
-      },
-      "build_rust_crate_args": {
-        "crateName": "kqueue",
-        "version": "1.2.0",
-        "edition": "2021",
-        "crateRenames": {
-          "kqueue-sys": [
-            {
-              "version": "1.1.2",
-              "rename": "kqueue_sys"
-            }
-          ]
-        },
-        "release": true,
-        "preBuild": "export CARGO_CRATE_NAME=kqueue;"
-      }
-    },
-    "kqueue-sys-1.1.2": {
-      "name": "kqueue-sys",
-      "version": "1.1.2",
-      "edition": "2021",
-      "source": {
-        "kind": "registry",
-        "url": "https://static.crates.io/crates/kqueue-sys/kqueue-sys-1.1.2.crate",
-        "sha256": "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087",
-        "name_with_ext": "kqueue-sys-1.1.2.tar.gz"
-      },
-      "features": [],
-      "proc_macro": false,
-      "build_script": null,
-      "links": null,
-      "binaries": [],
-      "lib_target": null,
-      "runtime_dependencies": [
-        {
-          "name": "bitflags",
-          "package_key": "bitflags-2.13.0",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": false,
-          "optional": false,
-          "target": null,
-          "tree": "target"
-        },
-        {
-          "name": "libc",
-          "package_key": "libc-0.2.186",
-          "kind": "normal",
-          "features": [],
-          "uses_default_features": true,
-          "optional": false,
-          "target": null,
-          "tree": "target"
-        }
-      ],
-      "build_dependencies": [],
-      "crate_renames": {},
-      "build_rust_crate_args": {
-        "crateName": "kqueue-sys",
-        "version": "1.1.2",
-        "edition": "2021",
-        "release": true,
-        "preBuild": "export CARGO_CRATE_NAME=kqueue_sys;"
-      }
-    },
     "lazy_static-1.5.0": {
       "name": "lazy_static",
       "version": "1.5.0",
@@ -3774,9 +3702,8 @@
         "name_with_ext": "notify-8.2.0.tar.gz"
       },
       "features": [
-        "kqueue",
-        "macos_kqueue",
-        "mio"
+        "fsevent-sys",
+        "macos_fsevent"
       ],
       "proc_macro": false,
       "build_script": null,
@@ -3785,13 +3712,23 @@
       "lib_target": null,
       "runtime_dependencies": [
         {
-          "name": "inotify",
-          "package_key": "inotify-0.11.2",
+          "name": "bitflags",
+          "package_key": "bitflags-2.13.0",
           "kind": "normal",
           "features": [],
-          "uses_default_features": false,
+          "uses_default_features": true,
           "optional": false,
-          "target": "cfg(any(target_os = \"linux\", target_os = \"android\"))",
+          "target": "cfg(target_os = \"macos\")",
+          "tree": "target"
+        },
+        {
+          "name": "fsevent_sys",
+          "package_key": "fsevent-sys-4.1.0",
+          "kind": "normal",
+          "features": [],
+          "uses_default_features": true,
+          "optional": true,
+          "target": "cfg(target_os = \"macos\")",
           "tree": "target"
         },
         {
@@ -3812,42 +3749,6 @@
           "uses_default_features": true,
           "optional": false,
           "target": null,
-          "tree": "target"
-        },
-        {
-          "name": "mio",
-          "package_key": "mio-1.2.1",
-          "kind": "normal",
-          "features": [
-            "os-ext"
-          ],
-          "uses_default_features": true,
-          "optional": false,
-          "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-          "tree": "target"
-        },
-        {
-          "name": "mio",
-          "package_key": "mio-1.2.1",
-          "kind": "normal",
-          "features": [
-            "os-ext"
-          ],
-          "uses_default_features": true,
-          "optional": false,
-          "target": "cfg(any(target_os = \"linux\", target_os = \"android\"))",
-          "tree": "target"
-        },
-        {
-          "name": "mio",
-          "package_key": "mio-1.2.1",
-          "kind": "normal",
-          "features": [
-            "os-ext"
-          ],
-          "uses_default_features": true,
-          "optional": true,
-          "target": "cfg(target_os = \"macos\")",
           "tree": "target"
         },
         {
@@ -3873,6 +3774,12 @@
       ],
       "build_dependencies": [],
       "crate_renames": {
+        "fsevent-sys": [
+          {
+            "version": "4.1.0",
+            "rename": "fsevent_sys"
+          }
+        ],
         "notify-types": [
           {
             "version": "2.1.0",
@@ -3885,11 +3792,16 @@
         "version": "8.2.0",
         "edition": "2021",
         "features": [
-          "kqueue",
-          "macos_kqueue",
-          "mio"
+          "fsevent-sys",
+          "macos_fsevent"
         ],
         "crateRenames": {
+          "fsevent-sys": [
+            {
+              "version": "4.1.0",
+              "rename": "fsevent_sys"
+            }
+          ],
           "notify-types": [
             {
               "version": "2.1.0",
@@ -4758,36 +4670,6 @@
           "optional": false,
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", target_arch = \"s390x\"), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "tree": "target"
-        },
-        {
-          "name": "linux_raw_sys",
-          "package_key": "linux-raw-sys-0.4.15",
-          "kind": "normal",
-          "features": [
-            "general",
-            "ioctl",
-            "no_std"
-          ],
-          "uses_default_features": false,
-          "optional": false,
-          "target": "cfg(all(any(target_os = \"android\", target_os = \"linux\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", target_arch = \"s390x\"), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
-          "tree": "target"
-        },
-        {
-          "name": "linux_raw_sys",
-          "package_key": "linux-raw-sys-0.4.15",
-          "kind": "normal",
-          "features": [
-            "elf",
-            "errno",
-            "general",
-            "ioctl",
-            "no_std"
-          ],
-          "uses_default_features": false,
-          "optional": false,
-          "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", target_arch = \"s390x\"), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
-          "tree": "target"
         }
       ],
       "build_dependencies": [],
@@ -4807,10 +4689,6 @@
           }
         ],
         "linux-raw-sys": [
-          {
-            "version": "0.4.15",
-            "rename": "linux_raw_sys"
-          },
           {
             "version": "0.4.15",
             "rename": "linux_raw_sys"
@@ -4846,10 +4724,6 @@
             }
           ],
           "linux-raw-sys": [
-            {
-              "version": "0.4.15",
-              "rename": "linux_raw_sys"
-            },
             {
               "version": "0.4.15",
               "rename": "linux_raw_sys"
@@ -4942,37 +4816,6 @@
           "optional": false,
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "tree": "target"
-        },
-        {
-          "name": "linux_raw_sys",
-          "package_key": "linux-raw-sys-0.12.1",
-          "kind": "normal",
-          "features": [
-            "general",
-            "ioctl",
-            "no_std"
-          ],
-          "uses_default_features": false,
-          "optional": false,
-          "target": "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
-          "tree": "target"
-        },
-        {
-          "name": "linux_raw_sys",
-          "package_key": "linux-raw-sys-0.12.1",
-          "kind": "normal",
-          "features": [
-            "auxvec",
-            "elf",
-            "errno",
-            "general",
-            "ioctl",
-            "no_std"
-          ],
-          "uses_default_features": false,
-          "optional": false,
-          "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
-          "tree": "target"
         }
       ],
       "build_dependencies": [],
@@ -4992,10 +4835,6 @@
           }
         ],
         "linux-raw-sys": [
-          {
-            "version": "0.12.1",
-            "rename": "linux_raw_sys"
-          },
           {
             "version": "0.12.1",
             "rename": "linux_raw_sys"
@@ -5028,10 +4867,6 @@
             }
           ],
           "linux-raw-sys": [
-            {
-              "version": "0.12.1",
-              "rename": "linux_raw_sys"
-            },
             {
               "version": "0.12.1",
               "rename": "linux_raw_sys"
@@ -5365,7 +5200,7 @@
         },
         {
           "name": "shikumi",
-          "package_key": "shikumi-0.1.151-4927e26f092f9d5ab69729f4d8021d07cd74b147",
+          "package_key": "shikumi-0.1.496",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -5925,15 +5760,15 @@
         "preBuild": "export CARGO_CRATE_NAME=sharded_slab;"
       }
     },
-    "shikumi-0.1.151-4927e26f092f9d5ab69729f4d8021d07cd74b147": {
+    "shikumi-0.1.496": {
       "name": "shikumi",
-      "version": "0.1.151",
+      "version": "0.1.496",
       "edition": "2024",
       "source": {
-        "kind": "git",
-        "url": "https://github.com/pleme-io/shikumi",
-        "rev": "4927e26f092f9d5ab69729f4d8021d07cd74b147",
-        "sha256": "sha256-IAh1GgeK2a17xhTATWrQsXsj13U4nRJrXPhzX9iMzAQ="
+        "kind": "registry",
+        "url": "https://static.crates.io/crates/shikumi/shikumi-0.1.496.crate",
+        "sha256": "de145934a9ccb306460220a3cd6068240dea61c139a34846b030bdb3d7b6af41",
+        "name_with_ext": "shikumi-0.1.496.tar.gz"
       },
       "features": [
         "default"
@@ -5980,7 +5815,7 @@
         },
         {
           "name": "gen_platform",
-          "package_key": "gen-platform-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+          "package_key": "gen-platform-0.1.34",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -5990,7 +5825,7 @@
         },
         {
           "name": "gen_types",
-          "package_key": "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+          "package_key": "gen-types-0.1.34",
           "kind": "normal",
           "features": [],
           "uses_default_features": true,
@@ -6013,7 +5848,7 @@
           "package_key": "notify-8.2.0",
           "kind": "normal",
           "features": [
-            "macos_kqueue"
+            "macos_fsevent"
           ],
           "uses_default_features": false,
           "optional": false,
@@ -6089,20 +5924,20 @@
         ],
         "gen-platform": [
           {
-            "version": "0.1.17",
+            "version": "0.1.34",
             "rename": "gen_platform"
           }
         ],
         "gen-types": [
           {
-            "version": "0.1.17",
+            "version": "0.1.34",
             "rename": "gen_types"
           }
         ]
       },
       "build_rust_crate_args": {
         "crateName": "shikumi",
-        "version": "0.1.151",
+        "version": "0.1.496",
         "edition": "2024",
         "features": [
           "default"
@@ -6122,13 +5957,13 @@
           ],
           "gen-platform": [
             {
-              "version": "0.1.17",
+              "version": "0.1.34",
               "rename": "gen_platform"
             }
           ],
           "gen-types": [
             {
-              "version": "0.1.17",
+              "version": "0.1.34",
               "rename": "gen_types"
             }
           ]
@@ -9878,7 +9713,7 @@
           "sync"
         ]
       },
-      "gen-macros-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+      "gen-macros-0.1.34": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -9917,11 +9752,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-platform-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+      "gen-platform-0.1.34": {
         "runtime_dependencies": [
           {
             "name": "gen_macros",
-            "package_key": "gen-macros-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+            "package_key": "gen-macros-0.1.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9931,7 +9766,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+            "package_key": "gen-types-0.1.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -9985,7 +9820,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0": {
+      "gen-types-0.1.34": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -11231,7 +11066,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.151-4927e26f092f9d5ab69729f4d8021d07cd74b147",
+            "package_key": "shikumi-0.1.496",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -11531,7 +11366,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "shikumi-0.1.151-4927e26f092f9d5ab69729f4d8021d07cd74b147": {
+      "shikumi-0.1.496": {
         "runtime_dependencies": [
           {
             "name": "arc_swap",
@@ -11569,7 +11404,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+            "package_key": "gen-platform-0.1.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -11579,7 +11414,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.17-26e5bdf9fe257a16e55d46b4b3e454e3f3f108d0",
+            "package_key": "gen-types-0.1.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -11602,7 +11437,7 @@
             "package_key": "notify-8.2.0",
             "kind": "normal",
             "features": [
-              "macos_kqueue"
+              "macos_fsevent"
             ],
             "uses_default_features": false,
             "optional": false,
@@ -13188,6 +13023,22 @@
               "link"
             ]
           },
+          "fsevent-sys-4.1.0": {
+            "runtime_dependencies": [
+              {
+                "name": "libc",
+                "package_key": "libc-0.2.186",
+                "kind": "normal",
+                "features": [],
+                "uses_default_features": true,
+                "optional": false,
+                "target": null,
+                "tree": "target"
+              }
+            ],
+            "build_dependencies": [],
+            "features": []
+          },
           "iana-time-zone-0.1.65": {
             "runtime_dependencies": [
               {
@@ -13206,58 +13057,6 @@
               "fallback"
             ]
           },
-          "kqueue-1.2.0": {
-            "runtime_dependencies": [
-              {
-                "name": "kqueue_sys",
-                "package_key": "kqueue-sys-1.1.2",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
-          "kqueue-sys-1.1.2": {
-            "runtime_dependencies": [
-              {
-                "name": "bitflags",
-                "package_key": "bitflags-2.13.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": false,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
           "notify-8.2.0": {
             "runtime_dependencies": [
               {
@@ -13271,18 +13070,8 @@
                 "tree": "target"
               },
               {
-                "name": "kqueue",
-                "package_key": "kqueue-1.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-                "tree": "target"
-              },
-              {
-                "name": "kqueue",
-                "package_key": "kqueue-1.2.0",
+                "name": "fsevent_sys",
+                "package_key": "fsevent-sys-4.1.0",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -13311,42 +13100,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-                "tree": "target"
-              },
-              {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"linux\", target_os = \"android\"))",
-                "tree": "target"
-              },
-              {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -13369,9 +13122,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -13723,18 +13475,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -13757,9 +13497,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -14172,18 +13911,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -14206,9 +13933,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -14504,6 +14230,22 @@
             "build_dependencies": [],
             "features": []
           },
+          "fsevent-sys-4.1.0": {
+            "runtime_dependencies": [
+              {
+                "name": "libc",
+                "package_key": "libc-0.2.186",
+                "kind": "normal",
+                "features": [],
+                "uses_default_features": true,
+                "optional": false,
+                "target": null,
+                "tree": "target"
+              }
+            ],
+            "build_dependencies": [],
+            "features": []
+          },
           "iana-time-zone-0.1.65": {
             "runtime_dependencies": [
               {
@@ -14522,58 +14264,6 @@
               "fallback"
             ]
           },
-          "kqueue-1.2.0": {
-            "runtime_dependencies": [
-              {
-                "name": "kqueue_sys",
-                "package_key": "kqueue-sys-1.1.2",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
-          "kqueue-sys-1.1.2": {
-            "runtime_dependencies": [
-              {
-                "name": "bitflags",
-                "package_key": "bitflags-2.13.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": false,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              },
-              {
-                "name": "libc",
-                "package_key": "libc-0.2.186",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": null,
-                "tree": "target"
-              }
-            ],
-            "build_dependencies": [],
-            "features": []
-          },
           "notify-8.2.0": {
             "runtime_dependencies": [
               {
@@ -14587,18 +14277,8 @@
                 "tree": "target"
               },
               {
-                "name": "kqueue",
-                "package_key": "kqueue-1.2.0",
-                "kind": "normal",
-                "features": [],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-                "tree": "target"
-              },
-              {
-                "name": "kqueue",
-                "package_key": "kqueue-1.2.0",
+                "name": "fsevent_sys",
+                "package_key": "fsevent-sys-4.1.0",
                 "kind": "normal",
                 "features": [],
                 "uses_default_features": true,
@@ -14627,42 +14307,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\", target_os = \"dragonflybsd\", target_os = \"ios\"))",
-                "tree": "target"
-              },
-              {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": false,
-                "target": "cfg(any(target_os = \"linux\", target_os = \"android\"))",
-                "tree": "target"
-              },
-              {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -14685,9 +14329,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -15054,18 +14697,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -15088,9 +14719,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -15518,18 +15148,6 @@
                 "tree": "target"
               },
               {
-                "name": "mio",
-                "package_key": "mio-1.2.1",
-                "kind": "normal",
-                "features": [
-                  "os-ext"
-                ],
-                "uses_default_features": true,
-                "optional": true,
-                "target": "cfg(target_os = \"macos\")",
-                "tree": "target"
-              },
-              {
                 "name": "notify_types",
                 "package_key": "notify-types-2.1.0",
                 "kind": "normal",
@@ -15552,9 +15170,8 @@
             ],
             "build_dependencies": [],
             "features": [
-              "kqueue",
-              "macos_kqueue",
-              "mio"
+              "fsevent-sys",
+              "macos_fsevent"
             ]
           },
           "rustix-0.38.44": {
@@ -15767,10 +15384,10 @@
       }
     }
   },
-  "cargo_lock_sha256": "84cb6cfd1c63e12978aec2e8549be6066740e2cf2a3460d347987ab755b5e321",
+  "cargo_lock_sha256": "5fc91fb392e642b640440ab0161cea5fada352721f0616c22cbb7361c75a11d4",
   "manifest_sha256": {
     "Cargo.toml": "4ce6324e03a031b1e6e5741b543d96e782f7303c0d0448b0ad91e50d346efc10",
-    "sentinela-config/Cargo.toml": "0d1817a1ead3d5e3b3d4011d2085a803adf42a39e44c1683cc21af0416ad0618",
+    "sentinela-config/Cargo.toml": "40c611e94837822c6526b6364fe584a956b3a98bc82c47712ac02b7e37e7aff4",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
     "sentinela/Cargo.toml": "0ad236aec66e6f0a1117fa83f78a7749b49504fff38c1dec09f695b2a7855589"
   }
