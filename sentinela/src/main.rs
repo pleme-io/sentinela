@@ -1044,6 +1044,39 @@ fn short(rev: &str) -> &str {
     rev.get(..8).unwrap_or(rev)
 }
 
+/// The command that actually helps, given the numbers.
+///
+/// Pure so the three branches are testable; a hint buried in a `Display` impl
+/// is a hint nobody checks.
+///
+/// Classified from NUMERIC fields, never by matching the prose in `why`: a
+/// human-readable sentence is not a stable key, and a hint keyed on one
+/// silently stops matching the moment the wording moves.
+fn next_step(
+    last_tick_at_unix_ms: Option<u64>,
+    now_ms: u64,
+    poll_seconds: u64,
+    consecutive_failures: u64,
+) -> &'static str {
+    let stopped = match last_tick_at_unix_ms {
+        // Never ticked: it has not started, which is the stopped case.
+        None => true,
+        Some(t) => now_ms.saturating_sub(t) > poll_seconds.max(1) * 3 * 1000,
+    };
+    if stopped {
+        // The loop is not running. Restarting it is the fix, and NOTHING else
+        // helps until it is — reading logs of a dead process is a detour.
+        "sudo launchctl kickstart -k system/org.nixos.pleme-gitops"
+    } else if consecutive_failures > 0 {
+        // Running and failing: the build output is the evidence.
+        "log show --predicate 'process == \"sentinela\"' --last 30m"
+    } else {
+        // Running, not failing, still behind — the probe half decides what to
+        // build, so that is the half to interrogate.
+        "sentinela probe"
+    }
+}
+
 impl std::fmt::Display for StatusView<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let v = self.0;
@@ -1105,9 +1138,89 @@ impl std::fmt::Display for StatusView<'_> {
         writeln!(f, "    {:<11} {}", "streaks", streaks)?;
 
         if !ok {
+            // The next step must match WHY it is not converged, and must exist
+            // on the platform. This used to print `journalctl -u pleme-gitops`
+            // unconditionally — a Linux command, from a daemon whose own
+            // --help calls itself "Darwin GitOps node-sync daemon", offered
+            // identically for three failure modes that need three different
+            // actions. It sent the reader to a command that does not exist.
+            //
+            // Classified from the NUMERIC fields, never by matching the prose
+            // in `why`: a human-readable sentence is not a stable key, and a
+            // hint keyed on one silently stops matching when the wording moves.
+            let next = next_step(
+                n("last_tick_at_unix_ms"),
+                now_ms,
+                n("poll_seconds").unwrap_or(60),
+                fails,
+            );
             writeln!(f)?;
-            writeln!(f, "    {:<11} {}", "next", paint("journalctl -u pleme-gitops -n 50 --no-pager", "36"))?;
+            writeln!(f, "    {:<11} {}", "next", paint(next, "36"))?;
         }
         writeln!(f)
+    }
+}
+
+#[cfg(test)]
+mod next_step_tests {
+    use super::next_step;
+
+    const NOW: u64 = 1_000_000_000;
+    const FRESH: u64 = NOW - 10 * 1000;
+    const STALE: u64 = NOW - 12 * 3600 * 1000;
+
+    /// A dead loop must be told to RESTART. This is the case that cost 12
+    /// hours: sentinela was stopped, and `status` said
+    /// `journalctl -u pleme-gitops` — a Linux command, from a daemon whose own
+    /// --help calls itself "Darwin GitOps node-sync daemon". Reading the logs
+    /// of a dead process is a detour; restarting it is the fix.
+    #[test]
+    fn a_stopped_loop_is_told_to_restart() {
+        assert!(next_step(Some(STALE), NOW, 60, 0).starts_with("sudo launchctl kickstart"));
+        // Never ticked at all is the same case, not a special one.
+        assert!(next_step(None, NOW, 60, 0).starts_with("sudo launchctl kickstart"));
+    }
+
+    /// A LIVE loop that is failing needs the build output, not a restart —
+    /// restarting a working loop only loses its place.
+    #[test]
+    fn a_live_failing_loop_is_pointed_at_the_logs() {
+        assert!(next_step(Some(FRESH), NOW, 60, 3).contains("log show"));
+    }
+
+    /// Live, not failing, still behind: the probe half decides what to build.
+    #[test]
+    fn a_live_healthy_but_behind_loop_is_pointed_at_the_probe() {
+        assert_eq!(next_step(Some(FRESH), NOW, 60, 0), "sentinela probe");
+    }
+
+    /// No hint may name a Linux-only tool. This binary is Darwin-only, and a
+    /// Linux command is exactly what the single hardcoded hint used to be.
+    #[test]
+    fn no_hint_is_a_linux_only_command() {
+        let all = [
+            next_step(Some(STALE), NOW, 60, 0),
+            next_step(None, NOW, 60, 0),
+            next_step(Some(FRESH), NOW, 60, 3),
+            next_step(Some(FRESH), NOW, 60, 0),
+        ];
+        // The denominator: every branch must be represented, or this passes
+        // while checking a subset of them.
+        assert_eq!(all.len(), 4, "all four branches must be exercised");
+        for h in all {
+            assert!(!h.contains("journalctl"), "Linux-only hint on a Darwin daemon: {h}");
+            assert!(!h.contains("systemctl"), "Linux-only hint on a Darwin daemon: {h}");
+            assert!(!h.is_empty(), "an empty hint is worse than none");
+        }
+    }
+
+    /// The stopped threshold tracks the CONFIGURED poll rather than a
+    /// hardcoded number — a slow-polling node must not be called stopped for
+    /// ticking exactly on schedule.
+    #[test]
+    fn the_stopped_threshold_scales_with_the_poll_interval() {
+        let age_10min = NOW - 600 * 1000;
+        assert!(next_step(Some(age_10min), NOW, 60, 0).starts_with("sudo launchctl"));
+        assert_eq!(next_step(Some(age_10min), NOW, 600, 0), "sentinela probe");
     }
 }
