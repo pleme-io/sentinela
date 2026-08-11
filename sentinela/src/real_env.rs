@@ -12,7 +12,7 @@
 
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{
-    EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, RebuildDriver, Rev,
+    BuildProgress, EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, RebuildDriver, Rev,
 };
 use std::fs::File;
 use std::io::Write as _;
@@ -526,7 +526,28 @@ impl GitopsEnv for RealEnv {
         // Through the driver seam, not `run_rebuild` directly: this is the
         // one axis an in-process sui driver replaces, and everything else in
         // this impl (probe, chain, generation read) stays shared.
-        self.driver()?.build(&self.flake_ref(rev))
+        let driver = self.driver()?;
+        let flake_ref = self.flake_ref(rev);
+        if !driver.reports_progress() {
+            return driver.build(&flake_ref);
+        }
+        // M3: republish the in-flight pulse as each derivation lands, so
+        // "which drv is it on, and when did it last advance" is answerable
+        // without waiting for the tick to resolve. Progress reporting is
+        // best-effort by contract — a heartbeat write that fails costs a
+        // progress update, never the build.
+        let mut sink = |p: BuildProgress| {
+            let beat = Heartbeat {
+                at_unix_ms: p.at_unix_ms,
+                outcome: "building".to_owned(),
+                phase: sentinela_core::Phase::InFlight,
+                head_rev: Some(rev.clone()),
+                poll_seconds: self.cfg.poll_seconds,
+                in_flight: Some(p),
+            };
+            let _ = self.write_heartbeat(&beat);
+        };
+        driver.build_streaming(&flake_ref, &mut sink)
     }
 
     fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {

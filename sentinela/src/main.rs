@@ -865,6 +865,7 @@ mod gate_tests {
             phase: sentinela_core::Phase::Resolved,
             head_rev: None,
             poll_seconds: POLL,
+            in_flight: None,
         })
     }
 
@@ -876,6 +877,10 @@ mod gate_tests {
             phase: sentinela_core::Phase::InFlight,
             head_rev: None,
             poll_seconds: POLL,
+            // These fixtures predate per-drv progress and stay that way on
+            // purpose: the gate's staleness verdict must not depend on a
+            // driver being able to report steps.
+            in_flight: None,
         })
     }
 

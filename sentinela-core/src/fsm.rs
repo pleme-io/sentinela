@@ -288,6 +288,10 @@ impl Sentinela {
             phase: crate::env::Phase::Resolved,
             head_rev: outcome.observed_head().cloned(),
             poll_seconds: self.cfg.poll_seconds,
+            // A resolved tick has nothing in flight by definition. Clearing
+            // it rather than carrying the last step forward: a stale drv
+            // beside a finished outcome reads as a build still running.
+            in_flight: None,
         };
         if let Err(e) = env.write_heartbeat(&beat) {
             tracing::warn!(error = %e, "sentinela: could not write heartbeat (loop is fine)");
@@ -369,6 +373,11 @@ impl Sentinela {
             phase: crate::env::Phase::InFlight,
             head_rev: Some(head.clone()),
             poll_seconds: self.cfg.poll_seconds,
+            // Published BEFORE the build starts, so there is no step to
+            // report yet. A driver that streams progress overwrites this
+            // pulse as it goes; one that cannot leaves it None, which reads
+            // as "not measured" rather than "not moving".
+            in_flight: None,
         };
         if let Err(e) = env.write_heartbeat(&in_flight) {
             tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");

@@ -169,6 +169,41 @@ pub struct Heartbeat {
     /// or reports `unknown` while holding a perfectly good heartbeat.
     /// Measured on the first consumer, which did exactly the latter.
     pub poll_seconds: u64,
+    /// What the in-flight build is working on right now, when the driver can
+    /// say — M3 of the sui plan.
+    ///
+    /// ── ★ THE HEARTBEAT, NOT THE RECEIPT CHAIN ─────────────────────────────
+    /// The plan said "one receipt per realised drv". That is the wrong home,
+    /// and the reason is written two fields up plus in `RealEnv`: the chain is
+    /// append-only, hash-linked, and already reached 31 MB on ryn, while the
+    /// heartbeat is rewritten every tick precisely so a liveness reader need
+    /// not parse the chain. Per-drv receipts would put the fastest-moving data
+    /// in the slowest-growing file and make the audit trail expensive to read
+    /// to gain a progress display. Progress is liveness, so it lives here.
+    ///
+    /// `None` means the driver does not report progress, which is the honest
+    /// answer for `ShellDriver`: it can only see bytes the tool chose to
+    /// print. Absence is "not measured", never "nothing happening" — the same
+    /// discipline as `head_rev`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<BuildProgress>,
+}
+
+/// A driver's report of what a running build is doing.
+///
+/// This is what makes a wedge diagnosable rather than merely detectable. The
+/// guards added on 2026-08-11 can say "the build stopped moving"; they cannot
+/// say WHICH derivation it stopped on, because a subprocess driver only sees
+/// a byte stream. An in-process driver knows, and this is where it says so.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildProgress {
+    /// The store path being realised, as the driver names it.
+    pub drv: String,
+    /// How many derivations have been realised so far this build.
+    pub realised: u64,
+    /// When this step was reported, unix-millis — so a reader can age it
+    /// against `poll_seconds` exactly as it does the pulse itself.
+    pub at_unix_ms: u64,
 }
 
 /// FSM tunables (mirrors the operator-facing `pleme.gitops` surface that
@@ -644,4 +679,158 @@ pub trait RebuildDriver {
     /// Name for logs and receipts — which driver produced this outcome.
     /// Recorded so a chain spanning a driver swap stays readable.
     fn name(&self) -> &'static str;
+
+    /// Build, reporting each realised derivation to `sink` as it goes — M3.
+    ///
+    /// The default forwards to [`Self::build`] and reports nothing, which is
+    /// the truthful implementation for a subprocess driver: it sees a byte
+    /// stream, not derivations, and inferring steps by scraping a tool's
+    /// output would manufacture a progress display that lies whenever the
+    /// tool changes its formatting. A driver that genuinely knows overrides
+    /// this; one that does not inherits honest silence.
+    ///
+    /// Reporting is best-effort and MUST NOT affect the outcome: a sink that
+    /// panics or a heartbeat that fails to write is a lost progress update,
+    /// never a failed build.
+    ///
+    /// # Errors
+    /// Whatever [`Self::build`] returns.
+    fn build_streaming(
+        &self,
+        flake_ref: &str,
+        _sink: &mut dyn FnMut(BuildProgress),
+    ) -> Result<(), EnvError> {
+        self.build(flake_ref)
+    }
+
+    /// Whether this driver reports per-derivation progress at all.
+    ///
+    /// Lets a caller distinguish "no steps reported because nothing happened"
+    /// from "this driver cannot report steps" WITHOUT waiting to see whether
+    /// any arrive — the same not-measured-vs-measured-zero distinction the
+    /// heartbeat's `Option` fields keep.
+    fn reports_progress(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod rebuild_driver_tests {
+    use super::*;
+
+    /// A driver that cannot see derivations — the shape of `ShellDriver`.
+    struct Blind;
+    impl RebuildDriver for Blind {
+        fn build(&self, _flake_ref: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+        fn switch(&self, _flake_ref: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "blind"
+        }
+    }
+
+    /// A driver that knows what it is realising — the shape of `SuiDriver`.
+    struct Streaming;
+    impl RebuildDriver for Streaming {
+        fn build(&self, _flake_ref: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+        fn switch(&self, _flake_ref: &str) -> Result<(), EnvError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "streaming"
+        }
+        fn reports_progress(&self) -> bool {
+            true
+        }
+        fn build_streaming(
+            &self,
+            _flake_ref: &str,
+            sink: &mut dyn FnMut(BuildProgress),
+        ) -> Result<(), EnvError> {
+            for (i, drv) in ["/nix/store/a.drv", "/nix/store/b.drv"].iter().enumerate() {
+                sink(BuildProgress {
+                    drv: (*drv).to_owned(),
+                    realised: i as u64 + 1,
+                    at_unix_ms: 1_000 + i as u64,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_driver_that_cannot_see_derivations_reports_silence_not_zero() {
+        // The distinction the Option in the heartbeat exists to keep: a
+        // subprocess driver sees a byte stream, so "no steps" must read as
+        // NOT MEASURED. Scraping a tool's output to manufacture steps would
+        // produce a progress display that lies the moment the tool reformats.
+        let mut seen = Vec::new();
+        let mut sink = |p: BuildProgress| seen.push(p);
+
+        Blind
+            .build_streaming("github:o/r/rev#h", &mut sink)
+            .expect("the default must still perform the build");
+
+        assert!(seen.is_empty(), "a blind driver must report nothing");
+        assert!(
+            !Blind.reports_progress(),
+            "and must SAY it cannot, so a reader never infers idleness from silence"
+        );
+    }
+
+    #[test]
+    fn a_streaming_driver_reports_each_derivation_in_order() {
+        let mut seen = Vec::new();
+        let mut sink = |p: BuildProgress| seen.push(p);
+
+        Streaming
+            .build_streaming("github:o/r/rev#h", &mut sink)
+            .expect("build must succeed");
+
+        assert!(Streaming.reports_progress());
+        assert_eq!(seen.len(), 2, "one report per realised derivation");
+        assert_eq!(seen[0].drv, "/nix/store/a.drv");
+        assert_eq!(seen[1].realised, 2, "the count advances");
+        assert!(
+            seen[1].at_unix_ms > seen[0].at_unix_ms,
+            "each step is independently ageable against poll_seconds"
+        );
+    }
+
+    #[test]
+    fn progress_rides_the_heartbeat_and_a_resolved_pulse_carries_none() {
+        // Serialisation contract: `in_flight` is skipped when absent, so a
+        // pulse from a driver that cannot report is byte-identical to one
+        // written before this field existed — an old `fleet` reader keeps
+        // working.
+        let quiet = Heartbeat {
+            at_unix_ms: 1,
+            outcome: "deployed".to_owned(),
+            phase: Phase::Resolved,
+            head_rev: None,
+            poll_seconds: 60,
+            in_flight: None,
+        };
+        let json = serde_json::to_string(&quiet).unwrap();
+        assert!(
+            !json.contains("in_flight"),
+            "an absent field must not appear at all: {json}"
+        );
+
+        let busy = Heartbeat {
+            in_flight: Some(BuildProgress {
+                drv: "/nix/store/c.drv".to_owned(),
+                realised: 7,
+                at_unix_ms: 42,
+            }),
+            ..quiet
+        };
+        let round: Heartbeat = serde_json::from_str(&serde_json::to_string(&busy).unwrap()).unwrap();
+        assert_eq!(round.in_flight.unwrap().realised, 7);
+    }
 }
