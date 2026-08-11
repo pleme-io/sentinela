@@ -590,3 +590,58 @@ mod wire_contract {
         assert_eq!(hb.phase, Phase::default());
     }
 }
+
+/// HOW a rev is built and activated — the one axis where an in-memory
+/// implementation and a subprocess implementation genuinely differ.
+///
+/// ── ★ WHY THIS IS A SEPARATE SEAM FROM [`GitopsEnv`] ────────────────────
+/// `GitopsEnv` is already clean: it speaks `Rev` and `Generation`, never
+/// `std::process::Output`. But a second `GitopsEnv` impl written to drive sui
+/// would have to re-implement everything that is IDENTICAL between the two —
+/// the `ls-remote` probe, the hash-linked receipt chain, the heartbeat, the
+/// generation read from the system profile symlink. That duplication is where
+/// the two drivers would silently drift apart, and the drift would live in
+/// the audit trail rather than in the build.
+///
+/// So the driver is only the pair of verbs. `RealEnv` keeps the probe and the
+/// chain; swapping the driver swaps how a rev becomes a system and nothing
+/// else.
+///
+/// Two implementations are intended:
+///
+/// * **shell** — today's `darwin-rebuild` / `nixos-rebuild` subprocess,
+///   bounded by `tsunagu::exec::BoundedRun`. Carries an irreducible hazard:
+///   the tool builds its own `nix build --json … | jq -r` pipeline internally,
+///   one level below anything we can bound, which is exactly the wedge
+///   measured on cid 2026-08-11 (four ticks × 5400s, tree idle throughout).
+/// * **sui, in-process** — `sui-orchestrate` called as a library. No
+///   subprocess, so no pipe, no EOF contract, and no `jq`: the wedge class
+///   stops existing rather than being detected. "Did it error" becomes a
+///   `Result` instead of a scan of captured bytes.
+///
+/// ── ★ ACTIVATION STAYS ATOMIC UNDER BOTH ───────────────────────────────
+/// [`Self::switch`] returns once, having advanced the system profile once.
+/// A driver may stream progress internally — sui can realise derivation by
+/// derivation — but the profile flip is single and total, because that flip
+/// IS the rollback boundary. A half-switched machine is a strictly worse
+/// failure than a slow one, which is also why the shell driver refuses to
+/// kill a `switch` on timeout.
+pub trait RebuildDriver {
+    /// Build `flake_ref` without activating it. Mutates nothing, so a
+    /// failure here is always safe to retry.
+    ///
+    /// # Errors
+    /// [`EnvError::BuildFailed`] with the reason.
+    fn build(&self, flake_ref: &str) -> Result<(), EnvError>;
+
+    /// Build and activate `flake_ref`, advancing the system profile exactly
+    /// once.
+    ///
+    /// # Errors
+    /// [`EnvError::SwitchFailed`] with the reason.
+    fn switch(&self, flake_ref: &str) -> Result<(), EnvError>;
+
+    /// Name for logs and receipts — which driver produced this outcome.
+    /// Recorded so a chain spanning a driver swap stays readable.
+    fn name(&self) -> &'static str;
+}

@@ -11,7 +11,9 @@
 //! ban): argv pieces are `concat`'d or built with typed builders.
 
 use sentinela_config::SentinelaConfig;
-use sentinela_core::{EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, Rev};
+use sentinela_core::{
+    EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, RebuildDriver, Rev,
+};
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -139,19 +141,32 @@ impl RealEnv {
         }
     }
 
+    /// The driver for this node's configured rebuild tool.
+    ///
+    /// Constructed per call rather than stored: it borrows the config, and a
+    /// driver is a zero-cost dispatch wrapper, not a resource. Selection is
+    /// the existing typed `RebuildTool` sum — a config that names sui is
+    /// already refused by `preflight` when sui cannot resolve the node's
+    /// flake ref, so an unusable pairing never reaches here.
+    fn driver(&self) -> ShellDriver<'_> {
+        ShellDriver { env: self }
+    }
+
     /// Where the rebuild tool is run from. See [`Self::run_rebuild`]
     /// — this is load-bearing, not incidental.
     fn rebuild_cwd(&self) -> &Path {
         Path::new(&self.cfg.state_dir)
     }
 
-    fn run_rebuild(&self, verb: &str, rev: &Rev) -> Result<std::process::Output, EnvError> {
-        let flake_ref = self.flake_ref(rev);
+    /// Takes the flake ref as a STRING, not a `Rev`: the driver seam speaks
+    /// refs, and building one from a rev is `RealEnv`'s job (it owns the
+    /// flake_url and hostname), not the driver's.
+    fn run_rebuild_ref(&self, verb: &str, flake_ref: &str) -> Result<std::process::Output, EnvError> {
         let mut cmd = Command::new(self.cfg.rebuild_tool.binary());
         for word in rebuild_argv(
             self.cfg.rebuild_tool,
             verb,
-            &flake_ref,
+            flake_ref,
             &self.cfg.extra_rebuild_args,
         ) {
             cmd.arg(word);
@@ -483,14 +498,10 @@ impl GitopsEnv for RealEnv {
     }
 
     fn build(&self, rev: &Rev) -> Result<(), EnvError> {
-        let out = self.run_rebuild("build", rev)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(EnvError::BuildFailed(
-                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            ))
-        }
+        // Through the driver seam, not `run_rebuild` directly: this is the
+        // one axis an in-process sui driver replaces, and everything else in
+        // this impl (probe, chain, generation read) stays shared.
+        self.driver().build(&self.flake_ref(rev))
     }
 
     fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {
@@ -511,12 +522,7 @@ impl GitopsEnv for RealEnv {
         // because fixing it would require holding the lock in a child we
         // deliberately orphan.
         let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
-        let out = self.run_rebuild("switch", rev)?;
-        if !out.status.success() {
-            return Err(EnvError::SwitchFailed(
-                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            ));
-        }
+        self.driver().switch(&self.flake_ref(rev))?;
         // Read the new generation from the system profile symlink; a
         // parse miss is non-fatal (the switch succeeded) — record 0.
         Ok(current_generation().unwrap_or(Generation(0)))
@@ -1189,5 +1195,50 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let env = env_with_state(d.path());
         assert!(env.load_chain().expect("absent is not an error").is_empty());
+    }
+}
+
+
+/// The subprocess driver — `darwin-rebuild` / `nixos-rebuild` under
+/// [`tsunagu::exec::BoundedRun`]. Today's behaviour, unchanged, now behind
+/// [`RebuildDriver`] so an in-process sui driver can take its place without
+/// touching the probe or the receipt chain.
+///
+/// ── ★ ITS IRREDUCIBLE HAZARD, STATED WHERE IT LIVES ────────────────────
+/// The bounds this driver applies stop at the process it spawns. The rebuild
+/// tool then builds `nix build --json … | jq -r` internally, and a wedge in
+/// THAT pipeline is invisible to any deadline we set on the outer command —
+/// measured on cid 2026-08-11 as four ticks of 5400s each with the tree
+/// completely idle. `build_error_quiet_seconds` and `build_silence_seconds`
+/// detect it; only removing the subprocess removes it.
+pub struct ShellDriver<'a> {
+    env: &'a RealEnv,
+}
+
+impl RebuildDriver for ShellDriver<'_> {
+    fn build(&self, flake_ref: &str) -> Result<(), EnvError> {
+        let out = self.env.run_rebuild_ref("build", flake_ref)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(EnvError::BuildFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            ))
+        }
+    }
+
+    fn switch(&self, flake_ref: &str) -> Result<(), EnvError> {
+        let out = self.env.run_rebuild_ref("switch", flake_ref)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(EnvError::SwitchFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            ))
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "shell"
     }
 }
