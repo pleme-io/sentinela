@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "dbc29eccc67d67df97e3dc5de0e42224e42abbda195d52e6d05e7cc5c0b6d14e",
+  "cargo_lock_sha256": "1e258ba94f344ffefd9037770d3d6992cc89d086afee9a97a4752bbadaafe4b0",
   "manifest_sha256": {
     "Cargo.toml": "4ce6324e03a031b1e6e5741b543d96e782f7303c0d0448b0ad91e50d346efc10",
     "sentinela-config/Cargo.toml": "40c611e94837822c6526b6364fe584a956b3a98bc82c47712ac02b7e37e7aff4",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
-    "sentinela/Cargo.toml": "2448d44b3a54697094ff0ff29fd1f7fcc722d448b31f48af7758436317681ddb"
+    "sentinela/Cargo.toml": "9704ce7fe72c2cf0b6a99751a290a3f523c4b36fa902aa0d49c180de967dcd54"
   },
   "target_resolves": {
     "base": {
@@ -2002,7 +2002,7 @@
           },
           {
             "name": "tsunagu",
-            "package_key": "tsunagu-0.1.7-0ad39eb0fe2318f847c37d9871c150f163163ce0",
+            "package_key": "tsunagu-0.1.7",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3438,7 +3438,7 @@
           "tracing-log"
         ]
       },
-      "tsunagu-0.1.7-0ad39eb0fe2318f847c37d9871c150f163163ce0": {
+      "tsunagu-0.1.7": {
         "runtime_dependencies": [
           {
             "name": "dirs",
@@ -6789,7 +6789,7 @@
     "tracing-subscriber-0.3.23": {
       "edition": "2018"
     },
-    "tsunagu-0.1.7-0ad39eb0fe2318f847c37d9871c150f163163ce0": {
+    "tsunagu-0.1.7": {
       "edition": "2024"
     },
     "uncased-0.9.10": {
@@ -6865,8 +6865,6 @@
       "build_script": "build.rs"
     }
   },
-  "git_nar_sha256": {
-    "tsunagu-0.1.7-0ad39eb0fe2318f847c37d9871c150f163163ce0": "sha256-q+AbRrd/begF/ysw0E4ZgVVRnGjDj3XjdM9x54gBdXs="
-  },
+  "git_nar_sha256": {},
   "flake_metadata": {}
 }

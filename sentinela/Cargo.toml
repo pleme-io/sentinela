@@ -34,18 +34,7 @@ fs4 = "0.9"
 # The bounded-subprocess primitive: a deadline, a file capture instead of a
 # deadlocking pipe, and a process-GROUP kill. Extracted from this crate into
 # the fleet daemon-lifecycle library once the consumer count reached six.
-# git, not the registry: 0.1.7 carries `error_wedge` and `silent_after`, and
-# the crates.io release is guardrail-blocked from the session that wrote them.
-# Same https form every other fleet consumer uses (amimori, shirase, tobira) —
-# ssh:// cannot be fetched inside the nix sandbox, which has tokens for https
-# and no ssh credentials.
-#
-# Cost, stated rather than discovered later: a git dep blocks `cargo publish`
-# of this crate. sentinela declares `publish = true` but has never been
-# published (crates.io: "crate `sentinela` does not exist") and ships via
-# nix-from-git, so nothing regresses today. Move back to a version pin once
-# tsunagu 0.1.7 is on the registry.
-tsunagu = { git = "https://github.com/pleme-io/tsunagu" }
+tsunagu = "0.1.7"
 
 [dev-dependencies]
 tempfile = "3"
