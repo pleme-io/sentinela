@@ -261,10 +261,43 @@ impl RealEnv {
         // through this same `Result`, and a hang IS a build failure — it must
         // keep feeding the cooldown + `land_last_good_after_failures` machinery
         // rather than being relabelled a broken installation.
-        BoundedRun::new(&self.rebuild_capture_path(verb))
+        // ── ★ SILENCE IS THE ONLY SIGNAL THAT SEPARATES STUCK FROM SLOW ──
+        // The deadline above is generous by design, and a wedge exploits
+        // exactly that: it costs the FULL bound to notice, every tick.
+        // Measured on cid 2026-08-11 — four ticks, 5400s each, while the tree
+        // was provably idle (zero /nix/store writes, no nix process, a `jq`
+        // holding at 89 minutes for an EOF nothing would send). The wedge sat
+        // inside `darwin-rebuild`'s own `nix build --json … | jq -r` command
+        // substitution, a level BELOW anything handed to BoundedRun — so it
+        // can only be detected here, never prevented.
+        //
+        // Only the build verb gets it. A `switch` is `OnTimeout::Abandon`
+        // precisely because it may be mid-activation, and a silence-kill is
+        // still a kill — the one place where killing is the damage.
+        let silence = std::time::Duration::from_secs(self.cfg.build_silence_seconds);
+        // Bound to a local: the builder borrows this path, and splitting the
+        // chain across `let`s (below) means the temporary would otherwise die
+        // at the end of this statement while still borrowed.
+        let capture_path = self.rebuild_capture_path(verb);
+        let run = BoundedRun::new(&capture_path)
             .timeout(timeout)
-            .on_timeout(on_timeout)
-            .run(cmd)
+            .on_timeout(on_timeout);
+        let run = if verb == "switch" || silence.is_zero() {
+            run
+        } else {
+            run.silent_after(silence)
+        };
+        // The stronger signal: nix reports its own failures with an `error:`
+        // line, so a rebuild that has printed one and then stopped moving is
+        // wedged, not slow. Same switch-verb exclusion and for the same
+        // reason — a silence-kill mid-activation is the damage.
+        let err_quiet = std::time::Duration::from_secs(self.cfg.build_error_quiet_seconds);
+        let run = if verb == "switch" || err_quiet.is_zero() {
+            run
+        } else {
+            run.error_wedge("error:", err_quiet)
+        };
+        run.run(cmd)
             .map_err(|e| {
                 exec_err(self.cfg.rebuild_tool.binary(), &e, |msg| {
                     Self::rebuild_err(verb, msg)

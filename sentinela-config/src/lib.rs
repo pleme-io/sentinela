@@ -261,6 +261,46 @@ pub struct SentinelaConfig {
     /// hang for a routine regression. `0` disables the bound entirely and
     /// restores the pre-0.1.10 "wait forever" behaviour.
     pub build_timeout_seconds: u64,
+    /// Seconds a rebuild may produce **no output at all** before the daemon
+    /// treats it as wedged, independent of `build_timeout_seconds`.
+    ///
+    /// ── ★ A DEADLINE ALONE CANNOT TELL SLOW FROM STUCK ──
+    /// `build_timeout_seconds` is generous because a legitimate cold rebuild
+    /// is slow, and that generosity is exactly what a wedge exploits: it
+    /// costs the FULL bound to notice, every tick, forever. Measured on cid
+    /// 2026-08-11 — four consecutive ticks each burned the whole 5400s while
+    /// the tree was provably doing nothing: zero `/nix/store` writes, no
+    /// `nix` process alive, and a `jq` sitting 89 minutes waiting for an EOF
+    /// that nothing would ever send. Six hours of wall clock to learn a fact
+    /// that was true after the first minute.
+    ///
+    /// The wedge was inside `darwin-rebuild`'s own
+    /// `nix build --json … | jq -r` command substitution — one level below
+    /// anything sentinela hands to `BoundedRun`, so it cannot be prevented
+    /// here, only *detected*. Silence is the signal that separates it from
+    /// slow work, and `BoundedRun` already reports it distinctly ("no
+    /// output; a wedge, not slow work") rather than as a plain timeout.
+    ///
+    /// Generous for the same reason the deadline is: a single long crate
+    /// compile inside `nix build` legitimately emits nothing for many
+    /// minutes, so this must sit well above the quietest honest stretch or
+    /// it trades a rare hang for a routine false kill — the precise error
+    /// `build_timeout_seconds`' own doc warns about. 1800s is ~3x the
+    /// longest silent stretch observed and still cuts a wedged tick to a
+    /// third of its cost. `0` disables the check.
+    pub build_silence_seconds: u64,
+    /// Seconds of quiet AFTER the rebuild has printed `error:` before the
+    /// daemon calls it wedged. Short on purpose, and safe to be short:
+    /// unlike [`Self::build_silence_seconds`] this needs the failure to
+    /// already be reported, so it is not competing with honest slow work —
+    /// a build that prints an error and keeps going resets the window and is
+    /// never killed. `0` disables the check.
+    ///
+    /// This is the guard that would have ended the 2026-08-11 incident in
+    /// about a minute instead of 5400s per tick: nix had errored and exited
+    /// while a downstream `jq` held the tree open, so the reason was on disk
+    /// almost immediately and nothing was ever going to read it.
+    pub build_error_quiet_seconds: u64,
     /// Seconds a `darwin-rebuild switch` may run before the daemon stops
     /// waiting. The child is deliberately NOT killed — it may be
     /// mid-activation, and killing it there is how a machine ends up half
@@ -314,6 +354,17 @@ pub const DEFAULT_GIT_TIMEOUT_SECONDS: u64 = 120;
 /// Default switch deadline, seconds (30 min). Activation is minutes, not
 /// tens of minutes, so this can be tighter than the build bound.
 pub const DEFAULT_SWITCH_TIMEOUT_SECONDS: u64 = 30 * 60;
+
+/// Default for [`SentinelaConfig::build_silence_seconds`] — 30 minutes with
+/// no output at all. Sits well above the longest honest silent stretch (a
+/// single long crate compile) and a third of the 90-minute deadline, so a
+/// wedge costs one third as much to detect as it did on 2026-08-11.
+pub const DEFAULT_BUILD_SILENCE_SECONDS: u64 = 30 * 60;
+
+/// Default for [`SentinelaConfig::build_error_quiet_seconds`] — 60s of quiet
+/// after a reported error. Two orders of magnitude below the deadline, and
+/// specific enough to afford it.
+pub const DEFAULT_BUILD_ERROR_QUIET_SECONDS: u64 = 60;
 
 impl Default for SentinelaConfig {
     fn default() -> Self {
@@ -372,6 +423,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_ancestor_after_deferrals: 0,
             land_last_good_after_failures: 0,
             build_timeout_seconds: 0,
+            build_silence_seconds: 0,
+            build_error_quiet_seconds: 0,
             switch_timeout_seconds: 0,
             git_timeout_seconds: 0,
             rebuild_tool: RebuildTool::DarwinRebuild,
@@ -390,6 +443,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_ancestor_after_deferrals: DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS,
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
+            build_silence_seconds: DEFAULT_BUILD_SILENCE_SECONDS,
+            build_error_quiet_seconds: DEFAULT_BUILD_ERROR_QUIET_SECONDS,
             switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
             git_timeout_seconds: DEFAULT_GIT_TIMEOUT_SECONDS,
             rebuild_tool: RebuildTool::DarwinRebuild,
@@ -460,6 +515,8 @@ mod tests {
             land_ancestor_after_deferrals: 2,
             land_last_good_after_failures: 3,
             build_timeout_seconds: 5400,
+            build_silence_seconds: 1800,
+            build_error_quiet_seconds: 60,
             switch_timeout_seconds: 1800,
             git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
