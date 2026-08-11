@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "1e258ba94f344ffefd9037770d3d6992cc89d086afee9a97a4752bbadaafe4b0",
+  "cargo_lock_sha256": "59e36f088fd8026deead69a359ee3c54ea67c61c095ec703ce09e6ba76658c93",
   "manifest_sha256": {
     "Cargo.toml": "4ce6324e03a031b1e6e5741b543d96e782f7303c0d0448b0ad91e50d346efc10",
     "sentinela-config/Cargo.toml": "40c611e94837822c6526b6364fe584a956b3a98bc82c47712ac02b7e37e7aff4",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
-    "sentinela/Cargo.toml": "9704ce7fe72c2cf0b6a99751a290a3f523c4b36fa902aa0d49c180de967dcd54"
+    "sentinela/Cargo.toml": "ff9a772bb4807ed4793cd54a212045c2fdb8558e5b6af4865f92098efc9f50e3"
   },
   "target_resolves": {
     "base": {
@@ -2022,7 +2022,9 @@
           }
         ],
         "build_dependencies": [],
-        "features": []
+        "features": [
+          "default"
+        ]
       },
       "sentinela-config-0.1.18": {
         "runtime_dependencies": [

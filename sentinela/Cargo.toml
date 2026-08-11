@@ -16,8 +16,48 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# The in-process sui driver (M2). OFF by default, deliberately: enabling it
+# pulls the whole sui workspace into this build — the evaluator, the store
+# layer, the builder — which is a large cost to impose on every node just to
+# make one alternative driver available. A node opts in; `RebuildTool::Sui`
+# already exists as the typed selector, and `preflight` refuses the pairing
+# when the node's flake ref is one sui cannot resolve.
+sui-driver = ["dep:sui-orchestrate", "dep:tokio"]
+
 [dependencies]
 sentinela-core = { path = "../sentinela-core" }
+# In-process rebuild driver — the thing that removes the wedge CLASS rather
+# than detecting it (no subprocess ⇒ no pipe ⇒ no `jq` waiting on an EOF).
+#
+# ── ★ REGISTRY, NOT GIT — AND CURRENTLY BLOCKED ON sui's PUBLISH ────────
+# Fleet rule: dependencies come from crates.io. A git dep would also block
+# `cargo publish` of this crate, which is how the tsunagu detour went wrong
+# earlier in this same change.
+#
+# PINNED TO THE NEWEST PUBLISHED VERSION, WHICH IS NOT THE ONE WE WANT.
+# Measured 2026-08-11: crates.io has sui-orchestrate 0.1.156 / sui-compat
+# 0.1.157, while sui's own workspace deps already require 0.1.175 —
+# member-crate publishing has been failing for ~20 releases while tags kept
+# advancing. `github:owner/repo/<rev>` resolution landed in 0.1.176, so THIS
+# pin cannot yet resolve the only ref shape sentinela produces.
+#
+# Pinning the unpublished 0.1.176 is not an option even behind an optional
+# feature: cargo resolves optional dependencies during lock resolution, so it
+# breaks the DEFAULT build for every node. Measured, not assumed —
+# `failed to select a version for the requirement sui-orchestrate ^0.1.176`.
+#
+# So the driver builds and is honest about the gap: `SuiDriver::build` refuses
+# a `github:` ref with a typed error naming the version that fixes it, rather
+# than passing it down to fail as a confusing `No such file or directory`.
+# When sui's publish catches up, this becomes a one-line version bump and the
+# refusal deletes itself.
+sui-orchestrate = { version = "0.1.156", optional = true }
+# `rebuild_native` is async and this daemon's loop is not. One current-thread
+# runtime, created per call, is enough: a rebuild is a single long await, not
+# a concurrency problem.
+tokio = { version = "1", features = ["rt"], optional = true }
 sentinela-config = { path = "../sentinela-config" }
 serde = { workspace = true }
 serde_yaml = "0.9"

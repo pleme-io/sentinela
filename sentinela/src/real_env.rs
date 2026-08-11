@@ -148,8 +148,33 @@ impl RealEnv {
     /// the existing typed `RebuildTool` sum — a config that names sui is
     /// already refused by `preflight` when sui cannot resolve the node's
     /// flake ref, so an unusable pairing never reaches here.
-    fn driver(&self) -> ShellDriver<'_> {
-        ShellDriver { env: self }
+    fn driver(&self) -> Result<Box<dyn RebuildDriver + '_>, EnvError> {
+        match self.cfg.rebuild_tool {
+            sentinela_config::RebuildTool::DarwinRebuild
+            | sentinela_config::RebuildTool::NixosRebuild => Ok(Box::new(ShellDriver { env: self })),
+            sentinela_config::RebuildTool::Sui => self.sui_driver(),
+        }
+    }
+
+    /// The sui driver, when this binary was built with it.
+    ///
+    /// A build WITHOUT the `sui-driver` feature refuses the selection rather
+    /// than silently falling back to the shell: a node whose config asks for
+    /// the in-process driver and quietly gets the subprocess one would report
+    /// success while carrying exactly the wedge class it opted out of. The
+    /// same reasoning as `preflight` refusing a sui/remote-ref pairing —
+    /// fail loudly at the boundary, never behind a green heartbeat.
+    #[cfg(feature = "sui-driver")]
+    fn sui_driver(&self) -> Result<Box<dyn RebuildDriver + '_>, EnvError> {
+        Ok(Box::new(SuiDriver))
+    }
+
+    #[cfg(not(feature = "sui-driver"))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn sui_driver(&self) -> Result<Box<dyn RebuildDriver + '_>, EnvError> {
+        Err(EnvError::ToolMissing {
+            tool: "sui (built without the `sui-driver` feature)".to_owned(),
+        })
     }
 
     /// Where the rebuild tool is run from. See [`Self::run_rebuild`]
@@ -501,7 +526,7 @@ impl GitopsEnv for RealEnv {
         // Through the driver seam, not `run_rebuild` directly: this is the
         // one axis an in-process sui driver replaces, and everything else in
         // this impl (probe, chain, generation read) stays shared.
-        self.driver().build(&self.flake_ref(rev))
+        self.driver()?.build(&self.flake_ref(rev))
     }
 
     fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {
@@ -522,7 +547,7 @@ impl GitopsEnv for RealEnv {
         // because fixing it would require holding the lock in a child we
         // deliberately orphan.
         let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
-        self.driver().switch(&self.flake_ref(rev))?;
+        self.driver()?.switch(&self.flake_ref(rev))?;
         // Read the new generation from the system profile symlink; a
         // parse miss is non-fatal (the switch succeeded) — record 0.
         Ok(current_generation().unwrap_or(Generation(0)))
@@ -1240,5 +1265,104 @@ impl RebuildDriver for ShellDriver<'_> {
 
     fn name(&self) -> &'static str {
         "shell"
+    }
+}
+
+/// The in-process sui driver — M2 of the sui plan.
+///
+/// ── ★ WHY THIS EXISTS: IT REMOVES THE CLASS, NOT THE SYMPTOM ───────────
+/// [`ShellDriver`] spawns a rebuild tool which internally builds
+/// `nix build --json … | jq -r '.[0].outputs.out'`. That command substitution
+/// is where cid wedged on 2026-08-11: nix errored and exited, a descendant
+/// kept the pipe's write end open, and `jq` waited 89 minutes for an EOF that
+/// was never coming — a level below anything `BoundedRun` can bound. The two
+/// guards added that day (`build_error_quiet_seconds`,
+/// `build_silence_seconds`) DETECT it, and detection is all a subprocess
+/// driver can ever offer.
+///
+/// Calling `sui-orchestrate` as a library removes every ingredient: no
+/// subprocess, so no pipe, no EOF contract, no `jq`. "Did it error" stops
+/// being a scan of captured bytes and becomes a `Result`.
+///
+/// ── ★ ACTIVATION REMAINS ATOMIC ────────────────────────────────────────
+/// `rebuild_native` evaluates, realises the closure, and sets the profile
+/// ONCE. sui can realise derivation by derivation internally — that is the
+/// per-drv streaming M3 builds on — but the profile flip stays single and
+/// total, because that flip is the rollback boundary.
+#[cfg(feature = "sui-driver")]
+pub struct SuiDriver;
+
+#[cfg(feature = "sui-driver")]
+impl SuiDriver {
+    /// Run one async orchestrate call to completion.
+    ///
+    /// A fresh current-thread runtime per call rather than a shared one: a
+    /// rebuild is a single long await, so there is no concurrency to schedule,
+    /// and a runtime that outlives the call would be state this daemon has to
+    /// reason about across ticks.
+    fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output, EnvError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EnvError::BuildFailed(["sui runtime: ", &e.to_string()].concat()))
+            .map(|rt| rt.block_on(fut))
+    }
+
+    fn orchestrator() -> Result<sui_orchestrate::system::SystemOrchestrator, EnvError> {
+        sui_orchestrate::system::SystemOrchestrator::new()
+            .map_err(|e| EnvError::BuildFailed(["sui orchestrator: ", &e.to_string()].concat()))
+    }
+}
+
+#[cfg(feature = "sui-driver")]
+impl SuiDriver {
+    /// Refuse a ref the pinned sui cannot resolve, naming the fix.
+    ///
+    /// crates.io has sui-orchestrate 0.1.156; `github:owner/repo/<rev>`
+    /// resolution landed in 0.1.176, which is not published yet (see this
+    /// crate's Cargo.toml for the measurement). Passing such a ref down would
+    /// surface as `getFlake: …/flake.nix: No such file or directory` — an
+    /// error that reads like a broken checkout and sent one investigation
+    /// down the wrong path already. Better to name the actual cause here.
+    ///
+    /// This whole function deletes itself when the pin moves to 0.1.176.
+    fn reject_unresolvable(flake_ref: &str) -> Result<(), EnvError> {
+        if flake_ref.starts_with("github:") {
+            return Err(EnvError::BuildFailed(
+                [
+                    "sui driver cannot resolve remote ref `",
+                    flake_ref,
+                    "`: the pinned sui-orchestrate (0.1.156, the newest on \
+                     crates.io) predates github:owner/repo/<rev> support, \
+                     which landed in 0.1.176. Publish sui 0.1.176+ and bump \
+                     the pin, or select rebuild_tool = darwin-rebuild.",
+                ]
+                .concat(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sui-driver")]
+impl RebuildDriver for SuiDriver {
+    fn build(&self, flake_ref: &str) -> Result<(), EnvError> {
+        Self::reject_unresolvable(flake_ref)?;
+        let orch = Self::orchestrator()?;
+        Self::block_on(orch.build_toplevel(flake_ref))?
+            .map(|_out_path| ())
+            .map_err(|e| EnvError::BuildFailed(e.to_string()))
+    }
+
+    fn switch(&self, flake_ref: &str) -> Result<(), EnvError> {
+        Self::reject_unresolvable(flake_ref)?;
+        let orch = Self::orchestrator()?;
+        Self::block_on(orch.rebuild_native(flake_ref, sui_orchestrate::system::RebuildAction::Switch))?
+            .map(|_result| ())
+            .map_err(|e| EnvError::SwitchFailed(e.to_string()))
+    }
+
+    fn name(&self) -> &'static str {
+        "sui"
     }
 }
