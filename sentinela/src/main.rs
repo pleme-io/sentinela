@@ -532,10 +532,14 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         // `converged` is the SAME `convergence_gate` the `--gate` exit code
         // uses — one function, one answer, every reader.
         "phase": beat.as_ref().map(|b| b.phase),
+        // The DISTILLED cause of the most recent failure. See
+        // `distill_failure` — the raw receipt is mostly cascade.
+        "last_failure": last_failure_lines(&chain),
         "converged": convergence_gate(
             &beat,
             env.now_unix_ms(),
             cfg.poll_seconds,
+            cfg.build_timeout_seconds,
             chain.consecutive_failures(),
             verified,
         )
@@ -566,6 +570,7 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         &beat,
         now_ms,
         cfg.poll_seconds,
+        cfg.build_timeout_seconds,
         chain.consecutive_failures(),
         verified,
     ) {
@@ -587,6 +592,7 @@ fn convergence_gate(
     beat: &Option<sentinela_core::Heartbeat>,
     now_unix_ms: u64,
     poll_seconds: u64,
+    build_timeout_seconds: u64,
     consecutive_failures: usize,
     chain_verified: bool,
 ) -> Result<(), String> {
@@ -602,6 +608,10 @@ fn convergence_gate(
     };
     let silent_ms = now_unix_ms.saturating_sub(beat.at_unix_ms);
     let budget_ms = STALE_AFTER_POLLS * poll_seconds.max(1) * 1000;
+    // The operator's own configured ceiling on a build, not a second opinion
+    // invented here — `build_timeout_seconds` is what the loop already agreed
+    // a build may take, so a tick past it has outlived its own contract.
+    let build_budget_ms = build_timeout_seconds.max(1) * 1000;
     // ── ★ A BUILD IS NOT SILENCE ─────────────────────────────────────────
     // The poll budget answers "should another tick have happened by now?",
     // which is only a question about a loop BETWEEN ticks. A tick that is
@@ -613,7 +623,32 @@ fn convergence_gate(
     // Matched with NO wildcard arm: a future phase must be classified here
     // rather than silently inheriting the stopped-loop verdict.
     match beat.phase {
-        sentinela_core::Phase::InFlight => {}
+        // ── ★ AND A HANG IS NOT A BUILD ──────────────────────────────────
+        // Exempting an in-flight tick from the POLL budget is right — it has
+        // not missed a cycle, it is doing the work. Exempting it from every
+        // bound is not: this arm was empty, so a tick that entered `building`
+        // and never came back stayed "converging" forever.
+        //
+        // Measured on cid 2026-08-12: a tick sat `building` for 4h39m — the
+        // daemon had in fact been dead since it wrote that phase — and
+        // `status` printed `● CONVERGED` the whole time, beside its own
+        // `← BEHIND` and `4h40m ago · building`. Three surfaces, one state,
+        // and the green one is the one an operator reads. The MCP verdict
+        // applied a build budget and said `stopped` correctly, which is what
+        // makes this a bug in the gate rather than a disagreement.
+        //
+        // So a build gets its own, much larger budget, and past it says the
+        // thing that is actually true: a build this long is a hang.
+        sentinela_core::Phase::InFlight => {
+            if silent_ms > build_budget_ms {
+                return Err(format!(
+                    "tick has been building for {}s, past the {}s build budget \
+                     — a build this long is a hang, not progress",
+                    silent_ms / 1000,
+                    build_budget_ms / 1000
+                ));
+            }
+        }
         sentinela_core::Phase::Resolved => {
             if silent_ms > budget_ms {
                 return Err(format!(
@@ -847,16 +882,22 @@ mod gate_tests {
         );
 
         assert!(
-            convergence_gate(&in_flight_beat_at(ancient), NOW_MS, POLL, 0, true).is_ok(),
+            convergence_gate(&in_flight_beat_at(ancient), NOW_MS, POLL, BUILD_BUDGET, 0, true).is_ok(),
             "a tick still inside its build has not missed a cycle — it is doing the work"
         );
 
         // The same timestamp with a RESOLVED phase IS stopped. Without this
         // half the test would pass on a gate that ignored staleness entirely.
-        let err = convergence_gate(&beat_at(ancient), NOW_MS, POLL, 0, true)
+        let err = convergence_gate(&beat_at(ancient), NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect_err("a finished tick that old means the loop stopped");
         assert!(err.contains("stopped"), "got: {err}");
     }
+
+    /// The build ceiling the gate is handed. Comfortably larger than every
+    /// legitimate-build fixture below (12m, 29m), so those keep meaning
+    /// exactly what they meant — and small enough that the hang fixture is
+    /// unambiguously past it.
+    const BUILD_BUDGET: u64 = 2700;
 
     fn beat_at(ms: u64) -> Option<Heartbeat> {
         Some(Heartbeat {
@@ -898,20 +939,14 @@ mod gate_tests {
             "the scenario must exceed the budget, or this proves nothing"
         );
         assert_eq!(
-            convergence_gate(
-                &in_flight_beat_at(NOW_MS - silent_ms),
-                NOW_MS,
-                POLL,
-                0,
-                true
-            ),
+            convergence_gate(&in_flight_beat_at(NOW_MS - silent_ms), NOW_MS, POLL, BUILD_BUDGET, 0, true),
             Ok(()),
             "a build in flight is work, not silence"
         );
         // And the same silence from a RESOLVED tick is still a stopped loop —
         // otherwise the fix would have deleted the check rather than scoped it.
         assert!(
-            convergence_gate(&beat_at(NOW_MS - silent_ms), NOW_MS, POLL, 0, true).is_err(),
+            convergence_gate(&beat_at(NOW_MS - silent_ms), NOW_MS, POLL, BUILD_BUDGET, 0, true).is_err(),
             "a resolved tick that old IS a stopped loop"
         );
     }
@@ -921,7 +956,7 @@ mod gate_tests {
         // The phase exempts a build from the STALENESS check only. A loop
         // that is building while its last ticks failed is still degraded.
         assert!(
-            convergence_gate(&in_flight_beat_at(NOW_MS - 722_000), NOW_MS, POLL, 3, true).is_err(),
+            convergence_gate(&in_flight_beat_at(NOW_MS - 722_000), NOW_MS, POLL, BUILD_BUDGET, 3, true).is_err(),
             "in-flight must not suppress the failure-streak verdict"
         );
     }
@@ -932,7 +967,7 @@ mod gate_tests {
     /// No evidence must be a refusal, not a pass.
     #[test]
     fn no_heartbeat_is_a_refusal_not_a_pass() {
-        let err = convergence_gate(&None, NOW_MS, POLL, 0, true)
+        let err = convergence_gate(&None, NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect_err("absent liveness evidence must never gate green");
         assert!(err.contains("no heartbeat"), "{err}");
     }
@@ -940,7 +975,7 @@ mod gate_tests {
     /// cid's real numbers: last tick 1785664639s, judged at 1785724816s.
     #[test]
     fn cids_16_hour_silence_fails_the_gate() {
-        let err = convergence_gate(&beat_at(1_785_664_639_000), NOW_MS, POLL, 0, true)
+        let err = convergence_gate(&beat_at(1_785_664_639_000), NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect_err("a loop silent for 16.7h against a 60s poll is stopped");
         assert!(err.contains("60177s"), "{err}");
         assert!(err.contains("stopped, not idle"), "{err}");
@@ -948,7 +983,7 @@ mod gate_tests {
 
     #[test]
     fn a_fresh_tick_on_a_verified_chain_passes() {
-        convergence_gate(&beat_at(NOW_MS - 30_000), NOW_MS, POLL, 0, true)
+        convergence_gate(&beat_at(NOW_MS - 30_000), NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect("a loop that ticked 30s ago on a 60s poll is alive");
     }
 
@@ -958,22 +993,22 @@ mod gate_tests {
     #[test]
     fn the_staleness_boundary_is_three_poll_intervals() {
         let budget_ms = 3 * POLL * 1000;
-        convergence_gate(&beat_at(NOW_MS - budget_ms), NOW_MS, POLL, 0, true)
+        convergence_gate(&beat_at(NOW_MS - budget_ms), NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect("exactly at the budget is not yet stale");
-        convergence_gate(&beat_at(NOW_MS - budget_ms - 1), NOW_MS, POLL, 0, true)
+        convergence_gate(&beat_at(NOW_MS - budget_ms - 1), NOW_MS, POLL, BUILD_BUDGET, 0, true)
             .expect_err("one millisecond past the budget is stale");
     }
 
     #[test]
     fn a_failure_streak_fails_even_with_a_fresh_pulse() {
-        let err = convergence_gate(&beat_at(NOW_MS - 1000), NOW_MS, POLL, 4136, true)
+        let err = convergence_gate(&beat_at(NOW_MS - 1000), NOW_MS, POLL, BUILD_BUDGET, 4136, true)
             .expect_err("the ryn outage shape must not gate green");
         assert!(err.contains("4136"), "{err}");
     }
 
     #[test]
     fn an_unverifiable_chain_fails_before_anything_else_is_considered() {
-        let err = convergence_gate(&beat_at(NOW_MS - 1000), NOW_MS, POLL, 0, false)
+        let err = convergence_gate(&beat_at(NOW_MS - 1000), NOW_MS, POLL, BUILD_BUDGET, 0, false)
             .expect_err("tamper-evidence outranks liveness");
         assert!(err.contains("verification"), "{err}");
     }
@@ -1128,6 +1163,24 @@ impl std::fmt::Display for StatusView<'_> {
         writeln!(f, "    {:<11} {}   {}", "last tick", tick,
                  paint(&["(poll ", &n("poll_seconds").unwrap_or(0).to_string(), "s)"].concat(), "2"))?;
 
+        // ── WHY IT FAILED, on the panel, not in a 38 MB log ──────────────
+        //
+        // Printed directly under the liveness line because that is where the
+        // eye already is once `last tick` says `buildFailed`, and the very
+        // next question is always "failed at what". Everything here was
+        // already on disk; the only thing missing was showing it.
+        if let Some(lines) = v.get("last_failure").and_then(serde_json::Value::as_array) {
+            if !lines.is_empty() {
+                writeln!(f)?;
+                writeln!(f, "    {:<11} {}", "failure", paint("the last tick failed at", "31;1"))?;
+                for l in lines {
+                    if let Some(t) = l.as_str() {
+                        writeln!(f, "      {}", paint(t, "31"))?;
+                    }
+                }
+            }
+        }
+
         let verified = v.get("chain_verified").and_then(serde_json::Value::as_bool).unwrap_or(false);
         writeln!(f, "    {:<11} {} · chain {}", "receipts", n("receipts").unwrap_or(0),
                  if verified { paint("verified", "32") } else { paint("UNVERIFIED", "31;1") })?;
@@ -1227,5 +1280,222 @@ mod next_step_tests {
         let age_10min = NOW - 600 * 1000;
         assert!(next_step(Some(age_10min), NOW, 60, 0).starts_with("sudo launchctl"));
         assert_eq!(next_step(Some(age_10min), NOW, 600, 0), "sentinela probe");
+    }
+}
+
+/// The distilled cause of the most recent failed receipt, newest first.
+///
+/// `None` when the chain's latest failure is older than its latest success —
+/// a fixed problem must stop being reported, or the panel becomes a place
+/// operators learn to ignore.
+fn last_failure_lines(chain: &sentinela_core::ReceiptChain) -> Option<Vec<String>> {
+    let mut seen_success = false;
+    for r in chain.entries().iter().rev() {
+        match &r.outcome {
+            sentinela_core::Outcome::Activated { .. } => seen_success = true,
+            sentinela_core::Outcome::Failed { error } if !seen_success => {
+                return Some(distill_failure(error));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reduce a nix build failure to the lines that name the CAUSE.
+///
+/// # Why this exists
+///
+/// A failed darwin build writes hundreds of lines of which almost all are
+/// cascade: every derivation downstream of the one that actually broke
+/// reports `Cannot build …` / `Reason: 1 dependency failed` / `Output paths`.
+/// Diagnosing cid on 2026-08-12 meant grepping a 38 MB log, then a receipts
+/// file, then filtering four kinds of cascade noise, to arrive at ONE line:
+///
+/// ```text
+/// build failed: …-rust_serde_derive_internals-0.29.1.drv
+/// ```
+///
+/// Everything needed to print that was already on disk. The operator should
+/// never have to do that walk, so `status` does it.
+///
+/// The rule is subtractive on purpose — drop the shapes that are known to be
+/// consequence, keep the rest — because an allowlist of "real" errors would
+/// silently swallow a failure mode nobody had seen yet. Keeping too much is a
+/// worse panel; keeping too little is a lie.
+fn distill_failure(raw: &str) -> Vec<String> {
+    /// A line that is downstream noise rather than a cause.
+    fn is_cascade(l: &str) -> bool {
+        let t = l.trim();
+        t.is_empty()
+            || t.starts_with("Reason:")
+            || t.starts_with("Output paths:")
+            || t.starts_with("/nix/store/")
+            || t.contains("Build failed due to failed dependency")
+            || t.contains("Cannot build '")
+            || t.starts_with("building '")
+            || t.starts_with("unpacking ")
+            || t.starts_with("these ")
+            || t.starts_with("copying ")
+            || t.starts_with("warning:")
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if is_cascade(line) {
+            continue;
+        }
+        let t = line.trim().to_owned();
+        // Collapse the exact repeats a cascade produces — the same
+        // `build failed: X` is emitted once per dependent.
+        if out.last().map(String::as_str) == Some(t.as_str()) {
+            continue;
+        }
+        out.push(t);
+    }
+    out.dedup();
+
+    // Bound it. A panel is a summary; the receipt keeps the whole text.
+    const MAX_LINES: usize = 6;
+    if out.len() > MAX_LINES {
+        let dropped = out.len() - MAX_LINES;
+        out.truncate(MAX_LINES);
+        let mut note = String::from("… ");
+        note.push_str(&dropped.to_string());
+        note.push_str(" more line(s) in the receipt");
+        out.push(note);
+    }
+    out
+}
+
+#[cfg(test)]
+mod distill_tests {
+    use super::distill_failure;
+
+    /// **THE MEASURED CASE.** The real cid failure: one causal line buried in
+    /// cascade. If this ever stops surfacing `serde_derive_internals`, the
+    /// panel has gone back to being a wall of consequence.
+    #[test]
+    fn the_root_cause_survives_the_cascade() {
+        let raw = "\
+building '/nix/store/aaa-rust_thing.drv'...
+      build failed: bylq-rust_serde_derive_internals-0.29.1.drv
+        /nix/store/412niara-rust_async-trait-0.1.89.drv
+      error: Cannot build '/nix/store/397p-home-manager-generation.drv'.
+             Reason: 1 dependency failed.
+             Output paths:
+               /nix/store/9m25-home-manager-generation
+      error: Build failed due to failed dependency
+";
+        let out = distill_failure(raw);
+        assert!(
+            out.iter().any(|l| l.contains("serde_derive_internals")),
+            "the cause must survive: {out:?}",
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("Cannot build")),
+            "the cascade must not: {out:?}",
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("home-manager-generation")),
+            "nor its output paths: {out:?}",
+        );
+    }
+
+    /// Repeats collapse — a cascade emits the same causal line once per
+    /// dependent, and six copies of one line is not six facts.
+    #[test]
+    fn repeated_causes_collapse_to_one() {
+        let raw = "      build failed: X.drv\n      build failed: X.drv\n      build failed: X.drv\n";
+        assert_eq!(distill_failure(raw), vec!["build failed: X.drv".to_owned()]);
+    }
+
+    /// An unrecognised failure shape is KEPT. The filter is subtractive so a
+    /// mode nobody has seen yet still reaches the operator.
+    #[test]
+    fn an_unknown_error_shape_is_kept_rather_than_swallowed() {
+        let raw = "error: attribute 'darwinConfigurations.cid' missing\n";
+        let out = distill_failure(raw);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("attribute"), "{out:?}");
+    }
+
+    /// Bounded, and it says so — a truncation that looks like the whole story
+    /// is how a panel starts lying.
+    #[test]
+    fn a_long_failure_is_bounded_and_says_it_was() {
+        let raw: String = (0..40)
+            .map(|i| {
+                let mut l = String::from("error: distinct problem ");
+                l.push_str(&i.to_string());
+                l.push('\n');
+                l
+            })
+            .collect();
+        let out = distill_failure(&raw);
+        assert_eq!(out.len(), 7, "6 lines + the elision note: {out:?}");
+        assert!(out.last().expect("note").contains("more line(s)"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod hang_gate_tests {
+    use super::convergence_gate;
+    use sentinela_core::Heartbeat;
+
+    const NOW_MS: u64 = 1_785_724_816_000;
+    const POLL: u64 = 60;
+    const BUILD_BUDGET: u64 = 2700;
+
+    fn in_flight_at(ms: u64) -> Option<Heartbeat> {
+        Some(Heartbeat {
+            at_unix_ms: ms,
+            outcome: "building".to_owned(),
+            phase: sentinela_core::Phase::InFlight,
+            head_rev: None,
+            poll_seconds: POLL,
+            in_flight: None,
+        })
+    }
+
+    /// **THE MEASURED BUG.** cid, 2026-08-12: a tick sat `building` for
+    /// 4h39m — the daemon had in fact been dead since it wrote that phase —
+    /// and `status` printed `● CONVERGED` the whole time, beside its own
+    /// `← BEHIND` and `4h40m ago · building`. The in-flight arm exempted a
+    /// build from the poll budget, correctly, and from every other bound too.
+    #[test]
+    fn a_build_past_its_own_budget_is_a_hang_not_progress() {
+        let stuck = NOW_MS - (4 * 3600 + 39 * 60) * 1000;
+        let err = convergence_gate(&in_flight_at(stuck), NOW_MS, POLL, BUILD_BUDGET, 0, true)
+            .expect_err("a 4h39m build is a hang, and must not gate green");
+        assert!(err.contains("hang"), "the reason must say so: {err}");
+        assert!(err.contains("2700"), "and name the budget: {err}");
+    }
+
+    /// And the fix must not undo what it scoped: a build INSIDE its budget is
+    /// still work, not silence, however far past the poll budget it is.
+    #[test]
+    fn a_build_inside_its_budget_is_still_work() {
+        let running = NOW_MS - 29 * 60 * 1000; // the measured 29-minute case
+        assert!(
+            29 * 60 > 3 * POLL,
+            "the fixture must exceed the POLL budget or it proves nothing",
+        );
+        assert_eq!(
+            convergence_gate(&in_flight_at(running), NOW_MS, POLL, BUILD_BUDGET, 0, true),
+            Ok(()),
+            "29m < 45m budget — converging normally",
+        );
+    }
+
+    /// The boundary is the configured ceiling, not a constant invented here:
+    /// a smaller configured budget makes the same build a hang.
+    #[test]
+    fn the_budget_is_the_operators_not_a_hardcoded_one() {
+        let running = NOW_MS - 29 * 60 * 1000;
+        assert!(
+            convergence_gate(&in_flight_at(running), NOW_MS, POLL, 600, 0, true).is_err(),
+            "29m against a 10m ceiling is past it",
+        );
     }
 }
