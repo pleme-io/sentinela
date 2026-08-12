@@ -48,6 +48,17 @@ pub enum State {
     CoolingDown {
         /// Wall-clock (unix-ms) the cooldown ends.
         until_unix_ms: u64,
+        /// The rev whose failure caused this backoff.
+        ///
+        /// A cooldown exists to stop hammering an input that just failed. It
+        /// is NOT a reason to ignore a DIFFERENT input: when HEAD moves, the
+        /// thing that failed is no longer the thing on offer, and the new rev
+        /// may well be the fix. Carrying the rev is what lets the gate ask
+        /// "same input?" instead of only "has the clock run out?".
+        ///
+        /// `None` for a failure with no resolved rev (a probe error), where
+        /// there is nothing to compare against and the clock is all there is.
+        failed_rev: Option<Rev>,
     },
 }
 
@@ -302,13 +313,50 @@ impl Sentinela {
     /// The cycle proper. Every `return` here is a completed tick; the
     /// heartbeat is applied by [`Sentinela::tick`], which wraps this.
     fn tick_inner<E: GitopsEnv>(&mut self, env: &E) -> TickOutcome {
-        // Cooldown gate — during a backoff the loop touches nothing.
-        if let State::CoolingDown { until_unix_ms } = self.state {
+        // ── Cooldown gate — a backoff from an INPUT, not from the clock ──
+        //
+        // The cooldown stops the loop hammering a rev that just failed. It
+        // must not also stop it noticing that somebody pushed a fix: a new
+        // HEAD is a different input, and the whole reason a human reacts to a
+        // red build by committing is that they expect the next build to be
+        // attempted. Waiting out five minutes of backoff against a rev nobody
+        // is proposing any more is dead time in exactly the moment an
+        // operator is watching.
+        //
+        // So the gate probes HEAD first and releases early when it moved.
+        // Same rev ⇒ the clock still rules, which is the case the cooldown
+        // was built for.
+        if let State::CoolingDown {
+            until_unix_ms,
+            ref failed_rev,
+        } = self.state
+        {
             let now = env.now_unix_ms();
             if now < until_unix_ms {
-                return TickOutcome::CoolingDown {
-                    remaining_ms: until_unix_ms - now,
+                // A cheap `git ls-remote`, the same call the observe step
+                // makes a line later — no build, no switch.
+                // SHORT-CIRCUIT on purpose: `match (failed_rev, env.probe_head())`
+                // evaluates both elements before matching, so it probes even
+                // when there is no rev to compare against — spending a
+                // `git ls-remote` to reach a `_ => false` arm. Caught by
+                // `cooldown_blocks_ticks_until_it_elapses`, where the wasted
+                // probe consumed the answer the later freshness re-check
+                // needed and turned a Deployed into a ReprobeInconclusive.
+                let moved = match failed_rev {
+                    Some(failed) => {
+                        matches!(env.probe_head(), Ok(Some(head)) if &head != failed)
+                    }
+                    // Nothing to compare — the clock is all there is.
+                    None => false,
                 };
+                if !moved {
+                    return TickOutcome::CoolingDown {
+                        remaining_ms: until_unix_ms - now,
+                    };
+                }
+                tracing::info!(
+                    "sentinela: HEAD moved during cooldown — releasing early to try the new rev"
+                );
             }
             self.state = State::Idle;
         }
@@ -703,8 +751,15 @@ impl Sentinela {
     /// Move to [`State::CoolingDown`] for `cooldown_after_failure_ms`.
     fn enter_cooldown<E: GitopsEnv>(&mut self, env: &E, out: TickOutcome) -> TickOutcome {
         let until = env.now_unix_ms() + self.cfg.cooldown_after_failure_ms;
+        // Remember WHICH input failed, so the gate can release early when a
+        // different one shows up. Read off the outcome rather than threaded
+        // through every call site: the outcome already names the rev, and a
+        // second parameter would be one more thing to get wrong at each of
+        // the failure edges.
+        let failed_rev = out.observed_head().cloned();
         self.state = State::CoolingDown {
             until_unix_ms: until,
+            failed_rev,
         };
         out
     }
@@ -1374,8 +1429,81 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 6_000
+            until_unix_ms: 6_000,
+            // No HEAD was ever observed, so there is nothing to
+                // compare a later probe against — the clock is all there is.
+                failed_rev: None
             }
+        );
+    }
+
+    /// **A COOLDOWN BACKS OFF FROM AN INPUT, NOT FROM THE CLOCK.**
+    ///
+    /// The scenario is the one that motivated it: a build fails, a human sees
+    /// the red, pushes a fix — and the loop is still sitting in a five-minute
+    /// backoff against a rev nobody is proposing any more. The new HEAD is a
+    /// different input and may well be the fix, so the gate releases early.
+    #[test]
+    fn a_new_head_during_cooldown_releases_it_early() {
+        // Probe 1 fails the build at rev 1; probes 2+ answer rev 2 — the fix.
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        env.set_build_result(Err(EnvError::BuildFailed("boom".into())));
+        env.set_now_ms(0);
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::BuildFailed { .. }));
+        let State::CoolingDown { until_unix_ms, .. } = *s.state() else {
+            panic!("a failed build must cool down, got {:?}", s.state());
+        };
+
+        // WELL INSIDE the cooldown — the clock alone would refuse.
+        env.set_now_ms(until_unix_ms - 1);
+        env.set_build_result(Ok(()));
+        let out = s.tick(&env);
+        assert!(
+            !matches!(out, TickOutcome::CoolingDown { .. }),
+            "a moved HEAD must release the cooldown early, got {out:?}",
+        );
+        assert!(
+            env.builds.borrow().iter().any(|r| r == &rev(2)),
+            "and the NEW rev is what gets built: {:?}",
+            env.builds.borrow(),
+        );
+    }
+
+    /// The other half, and the one that keeps the cooldown meaning anything:
+    /// the SAME rev still waits out the clock. Without this the change would
+    /// have deleted the backoff rather than scoped it, and a rev that fails
+    /// deterministically would be rebuilt every single tick.
+    #[test]
+    fn the_same_head_during_cooldown_still_waits() {
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+        ]);
+        env.set_build_result(Err(EnvError::BuildFailed("boom".into())));
+        env.set_now_ms(0);
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::BuildFailed { .. }));
+        let State::CoolingDown { until_unix_ms, .. } = *s.state() else {
+            panic!("a failed build must cool down");
+        };
+        let builds_before = env.builds.borrow().len();
+
+        env.set_now_ms(until_unix_ms - 1);
+        assert!(
+            matches!(s.tick(&env), TickOutcome::CoolingDown { .. }),
+            "an unchanged HEAD must keep waiting",
+        );
+        assert_eq!(
+            env.builds.borrow().len(),
+            builds_before,
+            "and must not rebuild the rev that just failed",
         );
     }
 
@@ -1395,7 +1523,8 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 11_000
+            until_unix_ms: 11_000,
+            failed_rev: Some(rev(1))
             }
         );
     }
@@ -1414,7 +1543,8 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 21_000
+            until_unix_ms: 21_000,
+            failed_rev: Some(rev(1))
             }
         );
     }
@@ -1536,7 +1666,8 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 2_000
+            until_unix_ms: 2_000,
+            failed_rev: Some(rev(1))
             }
         );
         // The chain was NOT advanced (persist failed) — so no false
@@ -1564,7 +1695,10 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 4_000
+            until_unix_ms: 4_000,
+            // No HEAD was ever observed, so there is nothing to
+                // compare a later probe against — the clock is all there is.
+                failed_rev: None
             }
         );
     }
@@ -1601,7 +1735,10 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 1_500
+            until_unix_ms: 1_500,
+            // No HEAD was ever observed, so there is nothing to
+                // compare a later probe against — the clock is all there is.
+                failed_rev: None
             }
         );
     }
@@ -1620,7 +1757,8 @@ mod tests {
         assert_eq!(
             s.state(),
             &State::CoolingDown {
-                until_unix_ms: 1_000
+            until_unix_ms: 1_000,
+            failed_rev: Some(rev(1))
             }
         );
         // Cooldown elapses; build now succeeds → same rev deploys.
