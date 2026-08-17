@@ -157,6 +157,49 @@ impl RealEnv {
         if t.is_empty() { None } else { Some(t.to_owned()) }
     }
 
+    /// Whether the ancestry mirror can be trusted as-is.
+    ///
+    /// Two conditions, and a failure of either means "re-clone", never
+    /// "carry on":
+    ///
+    /// 1. **It is a real bare repository.** `git rev-parse --git-dir` is the
+    ///    question; `Path::exists()` is not. A clone killed mid-transfer
+    ///    leaves a directory that passes the second and fails the first.
+    /// 2. **Its stored remote URL carries no credential.** `git clone --bare
+    ///    <url-with-userinfo>` persists that URL into `config`, so every
+    ///    mirror created before the credential moved to a header still holds
+    ///    a live PAT at mode 0644 — measured on ryn, unchanged for 14 days.
+    ///    Nothing else in the loop ever rewrites an existing mirror, so
+    ///    without this arm no future tick would ever clean it.
+    ///
+    /// Deliberately conservative: any error reading the config counts as
+    /// unusable. Re-cloning costs one tick; trusting a mirror we could not
+    /// inspect costs the guarantee the caller is about to relax.
+    fn mirror_is_usable(&self, mirror: &Path) -> bool {
+        if !mirror.exists() {
+            return false;
+        }
+        let valid_repo = self
+            .run_git(
+                {
+                    let mut c = Command::new("git");
+                    c.arg("--git-dir").arg(mirror).arg("rev-parse").arg("--git-dir");
+                    c
+                },
+                EnvError::AncestryFailed,
+            )
+            .is_ok_and(|o| o.status.success());
+        if !valid_repo {
+            return false;
+        }
+        // Read the config directly rather than shelling out again: this runs
+        // on every ancestry call and the file is a few hundred bytes.
+        match std::fs::read_to_string(mirror.join("config")) {
+            Ok(cfg) => !cfg.contains('@') || !cfg.contains("url = http"),
+            Err(_) => false,
+        }
+    }
+
     /// Attach HTTP basic auth to a git subprocess **without** putting it in
     /// argv or in any on-disk config.
     ///
@@ -509,18 +552,58 @@ impl GitopsEnv for RealEnv {
         let url = self.probe_url();
         let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
 
-        if !mirror.exists() {
+        // ── ★ `.exists()` ASKS THE WRONG QUESTION ─────────────────────────
+        // The invariant is "is a valid bare repo carrying no credential",
+        // not "is a directory". `git clone` CREATES the target before it is a
+        // repository, so a clone killed by the `git_timeout_seconds` deadline
+        // — or by any `kill -9` during the first cold clone on a fresh node —
+        // leaves a path that satisfies `.exists()` forever. Every later tick
+        // then skips the clone, fetches into a non-repository, and returns
+        // `AncestryFailed`.
+        //
+        // The blast radius is why this is worth a validation rather than a
+        // comment: BOTH starvation escapes route through `is_ancestor` (the
+        // deferral escape at fsm.rs:509/514 and `try_land_last_good` at
+        // fsm.rs:620/624), and both fail closed on `Err`. So a poisoned
+        // mirror disables both at once while the daemon keeps ticking, keeps
+        // publishing a fresh heartbeat, and keeps printing CONVERGED. That is
+        // the rio-2026-08-05 shape — a loop that cannot make progress while
+        // every liveness surface reads green.
+        //
+        // Validating also makes it SELF-HEALING, which a rename-only fix does
+        // not: a mirror poisoned before this shipped is repaired on the next
+        // tick, with no operator action, on every node.
+        //
+        // The credential half is the same predicate for the same reason.
+        // Until today the clone URL carried `x-access-token:<PAT>@`, which
+        // `git clone --bare` persists verbatim into the mirror's config; the
+        // fix that stopped NEW mirrors leaking does nothing for the ones
+        // already on disk, because nothing ever rewrites an existing mirror.
+        // Folding it in here means one tick repairs both, fleet-wide.
+        if !self.mirror_is_usable(&mirror) {
+            let staging = Path::new(&self.cfg.state_dir).join("ancestry.git.new");
+            let _ = std::fs::remove_dir_all(&staging);
             let out = self.run_git({ let mut c = Command::new("git");
                 c.arg("clone")
                 .arg("--bare")
                 .arg("--filter=blob:none")
                 .arg(&url)
-                .arg(&mirror);
+                .arg(&staging);
                 self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
             if !out.status.success() {
+                let _ = std::fs::remove_dir_all(&staging);
                 return Err(EnvError::AncestryFailed(
                     String::from_utf8_lossy(&out.stderr).trim().to_owned(),
                 ));
+            }
+            // Clone into a sibling and rename, so a kill during the clone can
+            // never leave a half-built directory at the live path again.
+            // `rename` onto a non-empty directory is ENOTEMPTY, so the old
+            // one goes first — it is already known-unusable at this point.
+            let _ = std::fs::remove_dir_all(&mirror);
+            if let Err(e) = std::fs::rename(&staging, &mirror) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(EnvError::AncestryFailed(e.to_string()));
             }
         }
 
@@ -563,7 +646,21 @@ impl GitopsEnv for RealEnv {
             .arg("merge-base")
             .arg("--is-ancestor")
             .arg(ancestor.as_str())
-            .arg(descendant.as_str());c }, EnvError::AncestryFailed)?;
+            .arg(descendant.as_str());
+            // The mirror is a PROMISOR remote (`--filter=blob:none` sets
+            // `promisor = true` — confirmed in ryn's mirror config), so a
+            // walk here may lazily fetch a missing object. This was the one
+            // git call without auth, and it used to work by accident: the
+            // credential was embedded in the stored remote URL. Now that the
+            // URL is clean, an unauthenticated lazy fetch against a private
+            // repo would exit non-0/1 → AncestryFailed → both starvation
+            // escapes down, silently.
+            //
+            // Tier-honest: I could not construct a case that actually
+            // lazy-fetches (`--is-ancestor` walks commits, and blob:none
+            // keeps every commit and tree), so this is a guard against an
+            // INFERRED path, not an observed one. It costs one env var.
+            self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -871,9 +968,28 @@ mod tests {
     /// The file is real rather than mocked because `probe_token` reads it,
     /// and a mock there would test the mock rather than the read.
     fn cfg_with_token(token: Option<&str>) -> SentinelaConfig {
+        // ── ★ ONE SCRATCH FILE PER CALL, NOT PER (pid, token) ─────────────
+        // The first version keyed the path on pid + token text, so the two
+        // tests that both ask for "TKN" wrote the SAME file. `fs::write`
+        // truncates before writing, so a concurrent reader saw a zero-length
+        // file, `probe_token` read it as empty and returned None, and the
+        // auth assertions failed — intermittently, only under parallelism,
+        // and only once the test count grew enough to change scheduling.
+        //
+        // A shared mutable fixture path is the same defect class as the
+        // production bug this file is full of; a per-call counter removes it
+        // rather than serializing around it.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let token_file = token.map(|t| {
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p = std::env::temp_dir().join(
-                ["sentinela-test-token-", &std::process::id().to_string(), "-", t].concat(),
+                [
+                    "sentinela-test-token-",
+                    &std::process::id().to_string(),
+                    "-",
+                    &n.to_string(),
+                ]
+                .concat(),
             );
             std::fs::write(&p, [t, "\n"].concat()).expect("write scratch token");
             p.to_string_lossy().into_owned()
@@ -1073,6 +1189,7 @@ mod tests {
 
     #[test]
     fn a_held_lock_reports_its_holder() {
+        let _fork_free = fork_free();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         let _first = acquire_switch_lock(&path).expect("first acquisition");
@@ -1087,6 +1204,7 @@ mod tests {
 
     #[test]
     fn an_uncontended_lock_is_acquired_and_released_on_drop() {
+        let _fork_free = fork_free();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock");
         {
@@ -1101,6 +1219,7 @@ mod tests {
 
     #[test]
     fn the_lock_file_is_group_and_other_writable() {
+        let _fork_free = fork_free();
         // Cross-user flock needs a 0666 file: the daemon (root) and the
         // operator both create it, and whoever comes second must still be
         // able to open it for WRITE to take the exclusive flock.
@@ -1297,6 +1416,38 @@ mod tests {
     // starvation escapes), so a rename that orphans it is worse than the
     // misleading filename it fixes.
 
+    /// Serializes the tests that `flock` against the tests that `fork`.
+    ///
+    /// ── ★ THE MECHANISM, WHICH THIS REPO ALREADY KNEW ─────────────────────
+    /// `flock(2)` is held by the OPEN FILE DESCRIPTION, and a forked child
+    /// transiently inherits every descriptor between `fork` and `exec`. So a
+    /// test that spawns a real subprocess keeps another test's lock alive past
+    /// its guard's `Drop`, and the re-acquisition fails with `EWOULDBLOCK`.
+    ///
+    /// `tests/bounded_run_enoent.rs` exists as a separate binary for exactly
+    /// this reason and documents it in its header (measured on cid
+    /// 2026-08-05: 0 failures in 25 runs → 19 in 25 when that test lived
+    /// here). Two spawning tests were added to this module afterwards and
+    /// missed the lesson. Re-measured 2026-08-17, n=65: lock tests alone
+    /// 0/15; lock tests + these two 9/15; everything except these two 0/15 —
+    /// necessary and sufficient.
+    ///
+    /// TIER: this is a MITIGATION, not the isolation the header of
+    /// `bounded_run_enoent.rs` calls genuine. The real fix is a `[lib]`
+    /// target so these two can move into their own test binary, where cargo's
+    /// serial execution isolates them for free. This crate is `[[bin]]`-only
+    /// today, so that is a refactor rather than a move.
+    /// `pending-fork-isolation: sentinela needs a lib target`
+    static FORK_FREE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`FORK_FREE`], surviving a poisoned mutex — a panic in one test
+    /// must not cascade into unrelated failures in the others.
+    fn fork_free() -> std::sync::MutexGuard<'static, ()> {
+        FORK_FREE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn env_with_state(dir: &std::path::Path) -> RealEnv {
         RealEnv::new(SentinelaConfig {
             state_dir: dir.to_string_lossy().into_owned(),
@@ -1321,6 +1472,7 @@ mod tests {
     /// silent breakage described above, made loud.
     #[test]
     fn run_git_keeps_stdout_separate_or_probe_head_reads_nothing() {
+        let _fork_free = fork_free();
         let d = tempfile::tempdir().unwrap();
         let env = env_with_state(d.path());
 
@@ -1353,6 +1505,7 @@ mod tests {
     /// reading the branch.
     #[test]
     fn git_timeout_zero_disables_the_bound() {
+        let _fork_free = fork_free();
         let d = tempfile::tempdir().unwrap();
         let env = RealEnv::new(SentinelaConfig {
             state_dir: d.path().to_string_lossy().into_owned(),
