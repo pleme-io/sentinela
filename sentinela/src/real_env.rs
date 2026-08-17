@@ -119,26 +119,74 @@ impl RealEnv {
         .concat()
     }
 
-    /// Resolve the probe URL, injecting a token when configured.
-    fn probe_url(&self) -> Result<String, EnvError> {
-        let base = &self.cfg.rev_probe.git_url;
-        match &self.cfg.rev_probe.token_file {
-            Some(tf) => match std::fs::read_to_string(tf) {
-                Ok(raw) => {
-                    let token = raw.trim();
-                    if token.is_empty() {
-                        Ok(base.clone())
-                    } else {
-                        inject_token(base, token)
-                    }
-                }
-                // A missing/unreadable token file → probe unauthenticated
-                // (public repos still resolve; private ones fail-closed at
-                // the probe, which is correct).
-                Err(_) => Ok(base.clone()),
-            },
-            None => Ok(base.clone()),
-        }
+    /// The probe URL — **never carries a credential**.
+    ///
+    /// ── ★ THE CREDENTIAL LEFT THE URL (2026-08-17) ────────────────────────
+    /// This used to return `https://x-access-token:<PAT>@github.com/...`, and
+    /// that one decision leaked the token to two places at once:
+    ///
+    /// 1. **argv.** The URL is an argument to `ls-remote`, `clone` and
+    ///    `fetch`, and argv is world-readable via `ps` on every tick — ~98k
+    ///    probes over 68 days on this fleet.
+    /// 2. **disk, permanently.** `git clone --bare <url>` writes the remote
+    ///    URL verbatim into the mirror's `config`. Measured on ryn: the PAT
+    ///    sat in `/var/log/pleme-gitops/ancestry.git/config` at mode 0644
+    ///    root:wheel, in a *log* directory, written 2026-08-03 and unchanged
+    ///    for 14 days — outliving any rotation of the source secret, because
+    ///    nothing rewrites a mirror that already exists.
+    ///
+    /// The credential now travels via [`Self::apply_git_auth`] instead. Note
+    /// the honest tier: this moves the secret from **world-readable** (argv +
+    /// a 0644 file) to **same-uid-or-root** (the child's environment). That is
+    /// mitigation, not unrepresentability — a root-capable reader still sees
+    /// it, and the only structural fix is a credential the process never holds
+    /// in plaintext at all.
+    fn probe_url(&self) -> String {
+        self.cfg.rev_probe.git_url.clone()
+    }
+
+    /// The configured token, if one is readable and non-empty.
+    ///
+    /// A missing/unreadable token file yields `None` → the git call runs
+    /// unauthenticated. Public repos still resolve; private ones fail closed
+    /// at the probe, which is the correct direction.
+    fn probe_token(&self) -> Option<String> {
+        let tf = self.cfg.rev_probe.token_file.as_ref()?;
+        let raw = std::fs::read_to_string(tf).ok()?;
+        let t = raw.trim();
+        if t.is_empty() { None } else { Some(t.to_owned()) }
+    }
+
+    /// Attach HTTP basic auth to a git subprocess **without** putting it in
+    /// argv or in any on-disk config.
+    ///
+    /// Uses git's environment-variable config form (`GIT_CONFIG_COUNT` /
+    /// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`), which git applies as if
+    /// the key had been passed with `-c` — but an env var is not in argv, so
+    /// it never appears in `ps`, and it is not written to `.git/config`, so a
+    /// cloned mirror cannot persist it.
+    ///
+    /// Basic, not Bearer: measured against github.com 2026-08-17, the git
+    /// smart-HTTP endpoint returns **401 for `Authorization: Bearer <valid>`**
+    /// and 200 for `Basic base64("x-access-token:<valid>")`. The Bearer form
+    /// is the REST-API plane's, not the git plane's.
+    fn apply_git_auth(&self, cmd: &mut Command) {
+        let Some(token) = self.probe_token() else {
+            return;
+        };
+        let mut header = String::from("Authorization: Basic ");
+        header.push_str(&base64_std(
+            ["x-access-token:", token.as_str()].concat().as_bytes(),
+        ));
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", &header);
+        // Best-effort scrub of our own copies. Not `zeroize`: taking that
+        // dependency means a `gen build` regeneration and the D2 freshness
+        // tie, for a buffer whose lifetime is one exec. Labelled best-effort
+        // rather than claimed as zeroization.
+        scrub(header);
+        scrub(token);
     }
 
     /// The driver for this node's configured rebuild tool.
@@ -428,12 +476,13 @@ impl RealEnv {
 
 impl GitopsEnv for RealEnv {
     fn probe_head(&self) -> Result<Option<Rev>, EnvError> {
-        let url = self.probe_url()?;
+        let url = self.probe_url();
         let refspec = ["refs/heads/", self.cfg.rev_probe.branch.as_str()].concat();
         let out = self.run_git({ let mut c = Command::new("git");
             c.arg("ls-remote")
             .arg(&url)
-            .arg(&refspec);c }, EnvError::ProbeFailed)?;
+            .arg(&refspec);
+            self.apply_git_auth(&mut c);c }, EnvError::ProbeFailed)?;
         if !out.status.success() {
             return Err(EnvError::ProbeFailed(
                 String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -457,7 +506,7 @@ impl GitopsEnv for RealEnv {
         // question must read as "do not activate", never as "probably fine":
         // the whole point of the caller is that it is about to relax the
         // strictest safety rule the loop has.
-        let url = self.probe_url()?;
+        let url = self.probe_url();
         let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
 
         if !mirror.exists() {
@@ -466,7 +515,8 @@ impl GitopsEnv for RealEnv {
                 .arg("--bare")
                 .arg("--filter=blob:none")
                 .arg(&url)
-                .arg(&mirror);c }, EnvError::AncestryFailed)?;
+                .arg(&mirror);
+                self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
             if !out.status.success() {
                 return Err(EnvError::AncestryFailed(
                     String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -493,6 +543,7 @@ impl GitopsEnv for RealEnv {
                         "+refs/heads/{}:refs/heads/probe",
                         self.cfg.rev_probe.branch
                     ));
+                self.apply_git_auth(&mut c);
                 c
             },
             EnvError::AncestryFailed,
@@ -738,15 +789,50 @@ fn acquire_switch_lock(lock_path: &Path) -> Result<File, EnvError> {
     Ok(file)
 }
 
-/// Inject `x-access-token:<token>` basic-auth into an https git URL, via
-/// the typed [`Url`] builder (no string surgery of the scheme).
-fn inject_token(git_url: &str, token: &str) -> Result<String, EnvError> {
-    let mut u = Url::parse(git_url).map_err(|e| EnvError::ProbeFailed(e.to_string()))?;
-    u.set_username("x-access-token")
-        .map_err(|()| EnvError::ProbeFailed("url cannot carry a username".to_owned()))?;
-    u.set_password(Some(token))
-        .map_err(|()| EnvError::ProbeFailed("url cannot carry a password".to_owned()))?;
-    Ok(u.to_string())
+/// Standard-alphabet base64, no line wrapping.
+///
+/// Hand-rolled rather than taking the `base64` crate: this is ~20 lines used
+/// at exactly one call site, and a new dependency here costs a `gen build`
+/// regeneration plus the D2 freshness tie on every consumer.
+fn base64_std(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Best-effort overwrite of a `String`'s bytes before it is dropped.
+///
+/// Deliberately NOT called zeroization: without `zeroize`'s compiler fences
+/// this can be optimised away, and the allocator may already have copied the
+/// bytes. It is a cheap reduction in exposure window, and it is labelled as
+/// such rather than as a guarantee.
+fn scrub(mut s: String) {
+    // SAFETY-free: operate on the String's own buffer through safe APIs.
+    let len = s.len();
+    s.clear();
+    s.reserve(len);
+    for _ in 0..len {
+        s.push('\0');
+    }
+    drop(s);
 }
 
 /// The first sha of `git ls-remote` output — the resolved HEAD, or `None`
@@ -779,19 +865,123 @@ fn current_generation() -> Option<Generation> {
 mod tests {
     use super::*;
 
+    /// A config whose probe points at the fleet's real repo, with `token`
+    /// written to a scratch file when `Some`.
+    ///
+    /// The file is real rather than mocked because `probe_token` reads it,
+    /// and a mock there would test the mock rather than the read.
+    fn cfg_with_token(token: Option<&str>) -> SentinelaConfig {
+        let token_file = token.map(|t| {
+            let p = std::env::temp_dir().join(
+                ["sentinela-test-token-", &std::process::id().to_string(), "-", t].concat(),
+            );
+            std::fs::write(&p, [t, "\n"].concat()).expect("write scratch token");
+            p.to_string_lossy().into_owned()
+        });
+        SentinelaConfig {
+            rev_probe: sentinela_config::RevProbeConfig {
+                git_url: "https://github.com/pleme-io/nix.git".to_owned(),
+                branch: "main".to_owned(),
+                token_file,
+            },
+            ..SentinelaConfig::default()
+        }
+    }
+
+    // ── ★ THE TWO TESTS THAT USED TO PIN THE LEAK AS CORRECT ─────────────
+    // `inject_token_builds_basic_auth_url` asserted, as the expected value,
+    // the exact string that ended up world-readable in the mirror's config:
+    //
+    //     "https://x-access-token:TKN@github.com/pleme-io/nix"
+    //
+    // A green test asserting the defect is worse than no test — it converts
+    // the leak from an oversight into a specified behaviour, and any fix
+    // reads as a regression. Both are replaced by their inverse.
+
     #[test]
-    fn inject_token_builds_basic_auth_url() {
-        let out = inject_token("https://github.com/pleme-io/nix", "TKN").unwrap();
-        assert_eq!(out, "https://x-access-token:TKN@github.com/pleme-io/nix");
+    fn the_probe_url_never_carries_a_credential() {
+        let cfg = cfg_with_token(Some("TKN"));
+        let env = RealEnv::new(cfg);
+        let url = env.probe_url();
+        assert_eq!(
+            url, "https://github.com/pleme-io/nix.git",
+            "the URL must be byte-identical to the configured one"
+        );
+        assert!(!url.contains("x-access-token"), "no basic-auth userinfo");
+        assert!(!url.contains("TKN"), "the token must not reach the URL");
+        assert!(!url.contains('@'), "no userinfo separator at all");
     }
 
     #[test]
-    fn inject_token_percent_encodes_special_chars() {
-        // A token with URL-special chars must be encoded, not injected raw.
-        let out = inject_token("https://github.com/o/r", "a/b@c").unwrap();
-        assert!(out.starts_with("https://x-access-token:"));
-        assert!(out.contains("@github.com/o/r"));
-        assert!(!out.contains("a/b@c"), "special chars must be encoded");
+    fn auth_travels_by_env_not_argv_and_the_url_stays_clean() {
+        let cfg = cfg_with_token(Some("TKN"));
+        let env = RealEnv::new(cfg);
+        let mut c = Command::new("git");
+        c.arg("ls-remote").arg(env.probe_url());
+        env.apply_git_auth(&mut c);
+
+        // argv is world-readable via `ps` on every tick — nothing secret here.
+        let argv: Vec<String> = std::iter::once(c.get_program())
+            .chain(c.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv.iter().any(|a| a.contains("TKN")),
+            "the token must never appear in argv, got {argv:?}"
+        );
+
+        // …and it must actually be applied, or this is a vacuous pass.
+        let envs: Vec<(String, Option<String>)> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let get = |key: &str| {
+            envs.iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.clone())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0").as_deref(),
+            Some("http.extraHeader")
+        );
+        // base64("x-access-token:TKN")
+        assert_eq!(
+            get("GIT_CONFIG_VALUE_0").as_deref(),
+            Some("Authorization: Basic eC1hY2Nlc3MtdG9rZW46VEtO"),
+            "Basic, not Bearer: github's git plane 401s on Bearer even with a \
+             valid token (measured 2026-08-17)"
+        );
+    }
+
+    #[test]
+    fn no_token_configured_means_no_auth_env_at_all() {
+        let env = RealEnv::new(cfg_with_token(None));
+        let mut c = Command::new("git");
+        env.apply_git_auth(&mut c);
+        assert_eq!(
+            c.get_envs().count(),
+            0,
+            "an unauthenticated probe must not set a half-formed auth config"
+        );
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 §10 plus the exact string this crate encodes.
+        assert_eq!(base64_std(b""), "");
+        assert_eq!(base64_std(b"f"), "Zg==");
+        assert_eq!(base64_std(b"fo"), "Zm8=");
+        assert_eq!(base64_std(b"foo"), "Zm9v");
+        assert_eq!(base64_std(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_std(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_std(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_std(b"x-access-token:TKN"), "eC1hY2Nlc3MtdG9rZW46VEtO");
     }
 
     #[test]
