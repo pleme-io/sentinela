@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod introspect;
 mod real_env;
 
 use clap::{Parser, Subcommand};
@@ -265,7 +266,21 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     // the outcome produces, so "sleep the wrong interval" has no expression
     // rather than being a rule someone has to remember.
     let loop_cfg = cfg.loop_config();
-    let env = RealEnv::new(cfg);
+    let env = std::sync::Arc::new(RealEnv::new(cfg));
+
+    // ── ★ THE RECONCILER BECOMES ASKABLE ───────────────────────────────
+    // Bound before the loop so a node is answerable from its first tick.
+    // `spawn_sidecar` returns `Some(path)` only when the socket is actually
+    // BOUND, not merely when a thread started, so announcing it here is not a
+    // lie. A `None` is logged and the loop continues: introspection is how you
+    // ask what converged, never a precondition for converging.
+    match kanshou::Server::spawn_sidecar(
+        "sentinela",
+        introspect::SentinelaIntrospect::new(std::sync::Arc::clone(&env)),
+    ) {
+        Some(sock) => tracing::info!(socket = %sock.display(), "introspection live"),
+        None => tracing::warn!("introspection unavailable — the loop still converges"),
+    }
     let mut sentinela = Sentinela::new(loop_cfg);
     tracing::info!(
         poll_seconds = loop_cfg.poll_seconds,
@@ -305,7 +320,7 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     // loop stays silent after its startup line, a broken one says so on
     // every tick, and the transition back to healthy is announced once.
     loop {
-        let outcome = sentinela.tick(&env);
+        let outcome = sentinela.tick(&*env);
         log_outcome(&outcome);
 
         let now = health(&env);
@@ -319,62 +334,22 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
 }
 
 /// Emit one tick's outcome as a typed structured log line.
-/// What the receipt chain says about this loop, as a VALUE rather than a log
-/// line — so the caller can decide whether saying it again is worth saying.
-///
-/// Separating the verdict from its emission is the whole point. While this
-/// lived inline before `loop`, "is this loop working?" could only ever be
-/// answered once per process, and a 19.5-hour outage passed in silence
-/// because the answer had already been given at a moment when it was still
-/// uninteresting.
-///
-/// ── ★ THREE STATES, NOT TWO ──
-/// "not converged" is not one condition. A loop whose builds FAIL needs a
-/// human; a loop that keeps DEFERRING because the branch moves faster than
-/// it can build needs nothing — it converges the moment pushing stops.
-/// Reporting both as DEGRADED is what trains an operator to ignore the word.
-/// Broken outranks starved: if anything is genuinely failing, say that first.
-enum Health {
-    /// Chain readable, nothing deployed yet. An empty chain has a ZERO
-    /// streak, so a naive `streak == 0` reports a loop that has NEVER
-    /// deployed as converged. Absence of failure is not evidence of
-    /// convergence; only an activation is. Seen for real on cid 2026-08-02,
-    /// freshly migrated onto this engine: receipts=0, streak=0,
-    /// last_activated=never.
-    NeverDeployed,
-    Degraded { streak: usize, last_ok: String },
-    Starved { deferrals: usize, last_ok: String },
-    Converged { last_ok: String },
-    /// An unreadable chain is itself worth saying out loud: it means the
-    /// audit trail — the only durable record of whether we converge —
-    /// cannot be consulted.
-    Unreadable { error: String },
-}
+// ── ★ `Health` + its derivation MOVED to `introspect` (2026-08-28) ─────
+// They used to live here, private to the binary, which is exactly why the
+// loop could not be ASKED what it was doing -- the verdict existed as a value
+// and had no surface but a log line. A monitor built on that log text read a
+// DEGRADED emitted twenty minutes before the build it was watching.
+//
+// Moved rather than copied: the logger below and the kanshou socket are now
+// two renderings of ONE derivation. Deriving them separately would let the
+// log say DEGRADED while the socket said converged, with no way to tell which
+// was lying -- the precise class this crate exists to close.
+use introspect::Health;
 
+/// The loop's health. A thin alias over the one derivation, kept so every
+/// call site and test here reads unchanged.
 fn health(env: &RealEnv) -> Health {
-    let chain = match env.load_chain() {
-        Ok(c) => c,
-        Err(e) => {
-            return Health::Unreadable {
-                error: e.to_string(),
-            }
-        }
-    };
-    if chain.is_empty() {
-        return Health::NeverDeployed;
-    }
-    let last_ok = chain
-        .last_activated_rev()
-        .map_or_else(|| "never".to_owned(), |r| r.short().to_owned());
-    let streak = chain.consecutive_failures();
-    if streak > 0 {
-        return Health::Degraded { streak, last_ok };
-    }
-    let deferrals = chain.consecutive_deferrals();
-    if deferrals > 0 {
-        return Health::Starved { deferrals, last_ok };
-    }
-    Health::Converged { last_ok }
+    introspect::health_of(env)
 }
 
 /// Say something whenever anything is wrong, and once more on the transition

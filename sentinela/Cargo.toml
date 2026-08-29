@@ -28,6 +28,11 @@ sui-driver = ["dep:sui-orchestrate", "dep:tokio"]
 
 [dependencies]
 sentinela-core = { path = "../sentinela-core" }
+# ★★ The reconciler, made askable. See src/introspect.rs: this was the one
+# pleme-io daemon with no kanshou surface, and it is the one whose entire job
+# is converging state you cannot see -- so the only way to ask "is this node
+# deploying?" was to read journalctl and interpret prose.
+kanshou = "0.1"
 # In-process rebuild driver — the thing that removes the wedge CLASS rather
 # than detecting it (no subprocess ⇒ no pipe ⇒ no `jq` waiting on an EOF).
 #

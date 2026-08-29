@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "929e332fbbda56f7e05b67a2ae59c9692d5fafb8f28a13a7f88c06ea71597925",
+  "cargo_lock_sha256": "7e27d3f5c5bad3b2e30eb15e71be8664df6291014f14f8d6ac0963b45901e5df",
   "manifest_sha256": {
     "Cargo.toml": "fcc8cb61ac72b470875d6db41c3180c46047430e81c97a99e118525e4fc2a553",
     "sentinela-config/Cargo.toml": "40c611e94837822c6526b6364fe584a956b3a98bc82c47712ac02b7e37e7aff4",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
-    "sentinela/Cargo.toml": "ff9a772bb4807ed4793cd54a212045c2fdb8558e5b6af4865f92098efc9f50e3"
+    "sentinela/Cargo.toml": "1fe98db5347234ad6e8a23c690f7cfbcf57bcf85c4167f75dd064916cb027bc7"
   },
   "target_resolves": {
     "base": {
@@ -1485,6 +1485,132 @@
         "build_dependencies": [],
         "features": []
       },
+      "kanshou-0.1.6": {
+        "runtime_dependencies": [
+          {
+            "name": "kanshou_derive",
+            "package_key": "kanshou-derive-0.1.6",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "okiba",
+            "package_key": "okiba-0.2.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "derive"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "thiserror",
+            "package_key": "thiserror-2.0.18",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tokio",
+            "package_key": "tokio-1.53.1",
+            "kind": "normal",
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt",
+              "sync",
+              "time"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "tracing",
+            "package_key": "tracing-0.1.44",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "derive"
+        ]
+      },
+      "kanshou-derive-0.1.6": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-2.0.118",
+            "kind": "normal",
+            "features": [
+              "full"
+            ],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "lazy_static-1.5.0": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -1609,6 +1735,11 @@
             "tree": "host"
           }
         ],
+        "features": []
+      },
+      "okiba-0.2.1": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
         "features": []
       },
       "once_cell-1.21.4": {
@@ -1909,6 +2040,16 @@
           {
             "name": "fs4",
             "package_key": "fs4-0.9.1",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "kanshou",
+            "package_key": "kanshou-0.1.6",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -6561,6 +6702,13 @@
     "itoa-1.0.18": {
       "edition": "2021"
     },
+    "kanshou-0.1.6": {
+      "edition": "2024"
+    },
+    "kanshou-derive-0.1.6": {
+      "edition": "2024",
+      "proc_macro": true
+    },
     "lazy_static-1.5.0": {
       "edition": "2015"
     },
@@ -6601,6 +6749,9 @@
     "num-traits-0.2.19": {
       "edition": "2021",
       "build_script": "build.rs"
+    },
+    "okiba-0.2.1": {
+      "edition": "2024"
     },
     "once_cell-1.21.4": {
       "edition": "2021"
