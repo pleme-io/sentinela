@@ -31,9 +31,21 @@
 //!   after its build — the in-flight rollback is unreachable.
 //! - **receipt-before-idle** — a successful switch persists its receipt
 //!   before the tick returns; the persisted chain is the source of truth.
+//!
+//! And one guard that looks AFTER the switch rather than before it, off
+//! unless a [`RollbackPolicy`] is attached ([`Sentinela::with_rollback`]):
+//!
+//! - **health-gated rollback** — an activation enters
+//!   [`State::Verifying`]; each tick runs one probe round until the required
+//!   consecutive passes land (`Verified`) or the window closes on a failing
+//!   round, which re-activates the PREVIOUS system generation, attests
+//!   `RolledBack` with the failing probe's evidence, and quarantines the rev
+//!   until HEAD moves. See [`crate::probation`] for why this is not the
+//!   no-downgrade rule.
 
-use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig};
-use crate::receipt::{Generation, Outcome, ReceiptChain};
+use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
+use crate::probation::{ProbeFailure, Probation, RollbackPolicy};
+use crate::receipt::{Generation, Outcome, ReceiptChain, bound_text};
 use crate::rev::Rev;
 
 /// The persistent state between ticks. The rich intra-cycle phases
@@ -60,6 +72,11 @@ pub enum State {
         /// there is nothing to compare against and the clock is all there is.
         failed_rev: Option<Rev>,
     },
+    /// An activation is on health probation. While here the loop runs one
+    /// probe round per tick and does NOT probe HEAD or deploy: stacking a new
+    /// activation on an unverified one would make the unverified one the
+    /// rollback target. The window bounds how long that can last.
+    Verifying(Probation),
 }
 
 /// What one [`Sentinela::tick`] did — a total sum over every terminal
@@ -141,6 +158,64 @@ pub enum TickOutcome {
         /// The new darwin generation.
         generation: Generation,
     },
+    /// One probe round ran; the probation is still open. Carries the
+    /// probation as it stands, including the failing probe when the round
+    /// failed inside the window.
+    Verifying(Probation),
+    /// The probation passed its required consecutive rounds.
+    Verified {
+        /// The rev whose activation is now verified.
+        rev: Rev,
+        /// Its generation.
+        generation: Generation,
+    },
+    /// The window closed on a failing round and the previous generation was
+    /// re-activated. `rev` is quarantined until HEAD moves.
+    RolledBack {
+        /// The rev whose activation was undone.
+        rev: Rev,
+        /// The generation that failed its probation.
+        from: Generation,
+        /// The generation now active.
+        to: Generation,
+        /// Which probe failed, and what it said.
+        failure: ProbeFailure,
+    },
+    /// A rollback was due, but an operator rebuild holds the machine lock.
+    /// Stays in probation and retries on the probe interval — racing the
+    /// operator's activation is worse than a few seconds' delay.
+    RollbackDeferred {
+        /// The rev awaiting its rollback.
+        rev: Rev,
+        /// Who holds the machine lock.
+        holder: String,
+    },
+    /// A rollback was attempted and did not complete. The machine may still
+    /// be on the bad generation, so the loop stays in probation and tries
+    /// again; nothing is attested until a rollback actually lands.
+    RollbackFailed {
+        /// The rev awaiting its rollback.
+        rev: Rev,
+        /// Why the rollback failed.
+        error: String,
+    },
+    /// The system profile is no longer on the generation under probation —
+    /// somebody else (an operator rebuild) activated something. Judging it
+    /// further would mean rolling back THEIR switch, so probation ends.
+    ProbationAbandoned {
+        /// The rev whose probation ended.
+        rev: Rev,
+        /// The generation that was on trial.
+        expected: Generation,
+        /// What the profile points at now, when readable.
+        found: Option<Generation>,
+    },
+    /// HEAD is a rev a health-gated rollback quarantined. Nothing built,
+    /// nothing switched, nothing recorded; lifts when HEAD moves.
+    Quarantined {
+        /// The quarantined rev (HEAD).
+        rev: Rev,
+    },
 }
 
 impl TickOutcome {
@@ -161,6 +236,50 @@ impl TickOutcome {
             Self::SwitchDeferred { .. } => "switchDeferred",
             Self::DeployedBehind { .. } => "deployedBehind",
             Self::Deployed { .. } => "deployed",
+            Self::Verifying(_) => "verifying",
+            Self::Verified { .. } => "verified",
+            Self::RolledBack { .. } => "rolledBack",
+            Self::RollbackDeferred { .. } => "rollbackDeferred",
+            Self::RollbackFailed { .. } => "rollbackFailed",
+            Self::ProbationAbandoned { .. } => "probationAbandoned",
+            Self::Quarantined { .. } => "quarantined",
+        }
+    }
+
+    /// Whether the pulse for this outcome reports a finished convergence or
+    /// one still in flight.
+    ///
+    /// ── ★ A PROBATION IS CONVERGENCE STILL IN FLIGHT ──────────────────────
+    /// A verifying tick observes no HEAD (it does not probe the branch), so
+    /// published as `Resolved` it would read to the fleet reader exactly like
+    /// a loop that is alive and doing nothing — its `ineffective` verdict.
+    /// It is not that: the activation it is judging has not resolved yet,
+    /// which is what `InFlight` means. `outcome` then names the pending
+    /// action (`verifying`), the documented widening that field already has.
+    ///
+    /// `RollbackFailed` is deliberately `Resolved`: it is a finished attempt
+    /// that failed, and must not hide inside an in-progress verdict.
+    /// Exhaustive, no `_` arm, like [`Self::kind`].
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        match self {
+            Self::Verifying(_) | Self::RollbackDeferred { .. } => Phase::InFlight,
+            Self::CoolingDown { .. }
+            | Self::Unchanged { .. }
+            | Self::Unresolvable
+            | Self::ProbeError { .. }
+            | Self::BuildFailed { .. }
+            | Self::Deferred { .. }
+            | Self::ReprobeInconclusive { .. }
+            | Self::SwitchFailed { .. }
+            | Self::SwitchDeferred { .. }
+            | Self::DeployedBehind { .. }
+            | Self::Deployed { .. }
+            | Self::Verified { .. }
+            | Self::RolledBack { .. }
+            | Self::RollbackFailed { .. }
+            | Self::ProbationAbandoned { .. }
+            | Self::Quarantined { .. } => Phase::Resolved,
         }
     }
 
@@ -207,10 +326,22 @@ impl TickOutcome {
         match self {
             // Same reasoning as a deferral: a newer rev is already known,
             // so converge toward it now rather than after a full poll.
-            Self::Deferred { .. } | Self::DeployedBehind { .. } => {
+            //
+            // And a probation just ended (verified / rolled back /
+            // abandoned): the loop has not looked at HEAD since the switch,
+            // so look now rather than a poll from now — a verified node
+            // should reach `unchanged` promptly, and a rolled-back one
+            // should publish that HEAD is quarantined.
+            Self::Deferred { .. }
+            | Self::DeployedBehind { .. }
+            | Self::Verified { .. }
+            | Self::RolledBack { .. }
+            | Self::ProbationAbandoned { .. } => {
                 std::time::Duration::from_secs(DEFERRED_RETRY_SECS)
             }
-            Self::SwitchDeferred { .. } => {
+            // A due rollback waiting on the operator's lock waits like a
+            // switch does.
+            Self::SwitchDeferred { .. } | Self::RollbackDeferred { .. } => {
                 std::time::Duration::from_secs(SWITCH_DEFERRED_RETRY_SECS)
             }
             // Everything else waits a normal cycle. Note `CoolingDown` is
@@ -225,7 +356,15 @@ impl TickOutcome {
             | Self::BuildFailed { .. }
             | Self::ReprobeInconclusive { .. }
             | Self::SwitchFailed { .. }
-            | Self::Deployed { .. } => poll,
+            | Self::Deployed { .. }
+            // The probation cadence is the POLICY's interval, which this
+            // outcome cannot see — `Sentinela::next_delay` applies it while
+            // the loop is verifying. A poll is the fallback, and it is also
+            // right for a failed rollback: each retry is a whole activation
+            // attempt and should not run at the probe rate.
+            | Self::Verifying(_)
+            | Self::RollbackFailed { .. }
+            | Self::Quarantined { .. } => poll,
         }
     }
 
@@ -241,8 +380,20 @@ impl TickOutcome {
     #[must_use]
     pub fn observed_head(&self) -> Option<&Rev> {
         match self {
-            Self::CoolingDown { .. } | Self::Unresolvable | Self::ProbeError { .. } => None,
+            // Probation ticks never probe the branch either. The rev under
+            // trial is REMEMBERED from the deploy tick, not observed, so it
+            // is not reported as HEAD.
+            Self::CoolingDown { .. }
+            | Self::Unresolvable
+            | Self::ProbeError { .. }
+            | Self::Verifying(_)
+            | Self::Verified { .. }
+            | Self::RolledBack { .. }
+            | Self::RollbackDeferred { .. }
+            | Self::RollbackFailed { .. }
+            | Self::ProbationAbandoned { .. } => None,
             Self::Unchanged { rev }
+            | Self::Quarantined { rev }
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::SwitchDeferred { rev, .. }
@@ -259,6 +410,14 @@ impl TickOutcome {
 pub struct Sentinela {
     state: State,
     cfg: LoopConfig,
+    /// `None` = health-gated rollback OFF, which is the default and is
+    /// today's behaviour exactly: no generation reads, no probes, no
+    /// probation receipts, no quarantine.
+    rollback: Option<RollbackPolicy>,
+    /// Whether this process has looked for a probation left open by a
+    /// previous one. Checked once: after that, the in-memory state is the
+    /// authority.
+    resume_checked: bool,
 }
 
 impl Sentinela {
@@ -268,7 +427,38 @@ impl Sentinela {
         Self {
             state: State::Idle,
             cfg,
+            rollback: None,
+            resume_checked: false,
         }
+    }
+
+    /// Attach (or, with `None`, keep off) health-gated rollback.
+    ///
+    /// A separate step rather than a [`LoopConfig`] field: `LoopConfig` is
+    /// `Copy` plain bounds, and a probe list is neither — and keeping it out
+    /// means every existing construction of the loop is unchanged.
+    #[must_use]
+    pub fn with_rollback(mut self, policy: Option<RollbackPolicy>) -> Self {
+        self.rollback = policy;
+        self
+    }
+
+    /// How long the caller should sleep before the next tick.
+    ///
+    /// The outcome's own [`TickOutcome::next_delay`], except while an
+    /// activation is on probation, where the policy's probe interval rules —
+    /// a 60s poll against a 300s window would give the probes five chances,
+    /// and the interval is what the operator configured instead. A failed
+    /// rollback keeps its outcome's (slower) cadence: each retry is a whole
+    /// activation attempt.
+    #[must_use]
+    pub fn next_delay(&self, outcome: &TickOutcome) -> std::time::Duration {
+        if let (State::Verifying(_), Some(policy)) = (&self.state, &self.rollback)
+            && !matches!(outcome, TickOutcome::RollbackFailed { .. })
+        {
+            return std::time::Duration::from_secs(policy.interval_seconds.max(1));
+        }
+        outcome.next_delay(&self.cfg)
     }
 
     /// The current between-tick state.
@@ -296,13 +486,22 @@ impl Sentinela {
         let beat = Heartbeat {
             at_unix_ms: env.now_unix_ms(),
             outcome: outcome.kind().to_owned(),
-            phase: crate::env::Phase::Resolved,
+            // `Resolved` for every outcome that existed before probation;
+            // see `TickOutcome::phase` for the two that are not.
+            phase: outcome.phase(),
             head_rev: outcome.observed_head().cloned(),
             poll_seconds: self.cfg.poll_seconds,
             // A resolved tick has nothing in flight by definition. Clearing
             // it rather than carrying the last step forward: a stale drv
             // beside a finished outcome reads as a build still running.
             in_flight: None,
+            // The probation as it stands AFTER this tick — including on the
+            // deploy tick that opened it — so the pulse says what the loop
+            // is waiting on and which probe failed last.
+            verification: match &self.state {
+                State::Verifying(p) => Some(p.clone()),
+                State::Idle | State::CoolingDown { .. } => None,
+            },
         };
         if let Err(e) = env.write_heartbeat(&beat) {
             tracing::warn!(error = %e, "sentinela: could not write heartbeat (loop is fine)");
@@ -313,6 +512,18 @@ impl Sentinela {
     /// The cycle proper. Every `return` here is a completed tick; the
     /// heartbeat is applied by [`Sentinela::tick`], which wraps this.
     fn tick_inner<E: GitopsEnv>(&mut self, env: &E) -> TickOutcome {
+        // ── Probation first, and BEFORE any network call ─────────────────
+        // A generation that broke the network also breaks `probe_head`; if
+        // probation waited behind the head probe, the fail-closed probe
+        // error would enter a cooldown and the bad generation would never be
+        // judged. Both calls are no-ops unless rollback is enabled.
+        self.resume_probation(env);
+        if matches!(self.state, State::Verifying(_))
+            && let Some(out) = self.verify_tick(env)
+        {
+            return out;
+        }
+
         // ── Cooldown gate — a backoff from an INPUT, not from the clock ──
         //
         // The cooldown stops the loop hammering a rev that just failed. It
@@ -396,6 +607,19 @@ impl Sentinela {
         if chain.last_activated_rev() == Some(&head) {
             return TickOutcome::Unchanged { rev: head };
         }
+        // ── Quarantine — a rev this machine already rolled back ──────────
+        // After a rollback the node runs the previous rev, so HEAD (still the
+        // bad rev) differs from `last_activated_rev` and would be rebuilt and
+        // re-activated every tick — a rollback loop. Refused until HEAD moves.
+        // Only while rollback is on: configured off means off, and a node
+        // that turned it off wants to converge.
+        if self.rollback.is_some() && chain.quarantined_rev() == Some(&head) {
+            tracing::warn!(
+                rev = head.short(),
+                "HEAD is a rev this node rolled back — not re-attempting until HEAD moves"
+            );
+            return TickOutcome::Quarantined { rev: head };
+        }
 
         // ── ★ PULSE BEFORE THE BUILD, NOT ONLY AFTER IT ──────────────────
         // `env.build` is the long pole — measured at 12m02s on ryn — and the
@@ -426,6 +650,8 @@ impl Sentinela {
             // pulse as it goes; one that cannot leaves it None, which reads
             // as "not measured" rather than "not moving".
             in_flight: None,
+            // A tick reaching a build is by construction not on probation.
+            verification: None,
         };
         if let Err(e) = env.write_heartbeat(&in_flight) {
             tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");
@@ -663,6 +889,13 @@ impl Sentinela {
         rev: Rev,
         behind: Option<Rev>,
     ) -> TickOutcome {
+        // Read BEFORE the switch: afterwards the profile points at the new
+        // generation and "the one before" is no longer a fact we observed.
+        // Only when rollback is on — off means no new env calls at all.
+        let previous = self
+            .rollback
+            .as_ref()
+            .and_then(|_| env.current_generation());
         match env.switch(&rev) {
             Ok(generation) => {
                 // Attest before idle. A persist failure would leave the
@@ -677,6 +910,7 @@ impl Sentinela {
                 ) {
                     Ok(()) => {
                         self.state = State::Idle;
+                        self.begin_probation(&mut chain, env, &rev, generation, previous);
                         match behind {
                             None => TickOutcome::Deployed { rev, generation },
                             Some(newer) => TickOutcome::DeployedBehind {
@@ -718,6 +952,311 @@ impl Sentinela {
                 let _ = self.record(&mut chain, env, rev, Outcome::failed(e.to_string()));
                 self.enter_cooldown(env, out)
             }
+        }
+    }
+
+    /// Open a probation for the activation just attested, when rollback is on
+    /// and a rollback is actually possible.
+    ///
+    /// Declines — logging why, never failing the deploy — when the previous
+    /// generation could not be read (nothing to return to), when the switch
+    /// produced no readable generation (the superseded check could never
+    /// pass), or when the generation did not change (the same system cannot
+    /// have been broken by this switch, and "rolling back" to it is a no-op).
+    fn begin_probation<E: GitopsEnv>(
+        &mut self,
+        chain: &mut ReceiptChain,
+        env: &E,
+        rev: &Rev,
+        generation: Generation,
+        previous: Option<Generation>,
+    ) {
+        let Some(policy) = &self.rollback else {
+            return;
+        };
+        let previous_generation = match previous {
+            Some(p) if p != generation && generation.0 != 0 => p,
+            other => {
+                tracing::warn!(
+                    rev = rev.short(),
+                    generation = %generation,
+                    previous = ?other,
+                    "rollback enabled, but this activation has no distinct readable \
+                     previous generation — NOT on probation"
+                );
+                return;
+            }
+        };
+        let deadline_unix_ms = env.now_unix_ms().saturating_add(policy.window_ms);
+        let probation = Probation {
+            rev: rev.clone(),
+            generation,
+            previous_generation,
+            deadline_unix_ms,
+            passes: 0,
+            required_passes: policy.required_consecutive_passes.max(1),
+            last_failure: None,
+        };
+        // Durable, so a restart or reboot resumes the trial. A persist
+        // failure still leaves the in-memory probation guarding this process
+        // — losing the receipt must not also lose the rollback.
+        if let Err(e) = self.record(
+            chain,
+            env,
+            rev.clone(),
+            Outcome::Probation {
+                generation,
+                previous_generation,
+                deadline_unix_ms,
+            },
+        ) {
+            tracing::warn!(error = %e, "probation receipt not persisted — probation holds for this process only");
+        }
+        tracing::info!(
+            rev = rev.short(),
+            generation = %generation,
+            previous = %previous_generation,
+            "activation on health probation"
+        );
+        self.state = State::Verifying(probation);
+    }
+
+    /// Resume a probation a previous process left open — once per process,
+    /// and only with rollback on.
+    ///
+    /// The chain's newest receipt being [`Outcome::Probation`] means the
+    /// trial never concluded: the daemon restarted (its own plist changed,
+    /// it crashed, the machine rebooted — the reboot being exactly when a bad
+    /// generation tends to show). The streak restarts at zero; the deadline
+    /// is the original one.
+    fn resume_probation<E: GitopsEnv>(&mut self, env: &E) {
+        if self.resume_checked {
+            return;
+        }
+        self.resume_checked = true;
+        let Some(policy) = &self.rollback else {
+            return;
+        };
+        if !matches!(self.state, State::Idle) {
+            return;
+        }
+        let Ok(mut chain) = env.load_chain() else {
+            // The normal path loads it again and fails closed with a reason.
+            return;
+        };
+        let Some(head) = chain.head() else {
+            return;
+        };
+        let Outcome::Probation {
+            generation,
+            previous_generation,
+            deadline_unix_ms,
+        } = head.outcome
+        else {
+            return;
+        };
+        let rev = head.rev.clone();
+        match env.current_generation() {
+            Some(g) if g == generation => {
+                tracing::info!(rev = rev.short(), generation = %generation, "resuming an open probation");
+                self.state = State::Verifying(Probation {
+                    rev,
+                    generation,
+                    previous_generation,
+                    deadline_unix_ms,
+                    passes: 0,
+                    required_passes: policy.required_consecutive_passes.max(1),
+                    last_failure: None,
+                });
+            }
+            // The rollback itself landed after the process that started it
+            // died — an activation that changes this daemon's own unit kills
+            // it mid-activation, and the detached child finishes. Attest it
+            // now, or the chain would claim the rev is still running.
+            Some(g) if g == previous_generation => {
+                let _ = self.record(
+                    &mut chain,
+                    env,
+                    rev.clone(),
+                    Outcome::RolledBack {
+                        from: generation,
+                        to: g,
+                        probe: "(unknown)".to_owned(),
+                        evidence: "the rollback completed across a daemon restart; the failing \
+                                   probe's evidence did not survive it"
+                            .to_owned(),
+                    },
+                );
+                tracing::warn!(rev = rev.short(), "a rollback landed across a restart — recorded");
+            }
+            found => {
+                tracing::warn!(
+                    rev = rev.short(),
+                    expected = %generation,
+                    found = ?found,
+                    "open probation found, but the system moved — not resuming"
+                );
+            }
+        }
+    }
+
+    /// One probation tick: one probe round, then verified, still open, or
+    /// rolled back. `None` means the loop was not actually able to verify
+    /// (no policy) and the caller runs a normal cycle.
+    fn verify_tick<E: GitopsEnv>(&mut self, env: &E) -> Option<TickOutcome> {
+        let (State::Verifying(p), Some(policy)) = (&self.state, &self.rollback) else {
+            self.state = State::Idle;
+            return None;
+        };
+        let mut p = p.clone();
+        let round = policy.probes.iter().try_for_each(|probe| {
+            env.run_health_probe(probe).map_err(|evidence| ProbeFailure {
+                probe: probe.name.clone(),
+                evidence: bound_text(evidence),
+            })
+        });
+        match round {
+            Ok(()) => {
+                p.passes = p.passes.saturating_add(1);
+                p.last_failure = None;
+                if p.passes < p.required_passes {
+                    self.state = State::Verifying(p.clone());
+                    return Some(TickOutcome::Verifying(p));
+                }
+                // Best-effort attest: a lost `Verified` receipt leaves the
+                // `Probation` at the head, and the next process re-verifies a
+                // healthy generation — harmless.
+                if let Ok(mut chain) = env.load_chain() {
+                    let _ = self.record(
+                        &mut chain,
+                        env,
+                        p.rev.clone(),
+                        Outcome::Verified {
+                            generation: p.generation,
+                            passes: p.passes,
+                        },
+                    );
+                }
+                tracing::info!(rev = p.rev.short(), generation = %p.generation, "activation verified");
+                self.state = State::Idle;
+                Some(TickOutcome::Verified {
+                    rev: p.rev,
+                    generation: p.generation,
+                })
+            }
+            Err(failure) => {
+                p.passes = 0;
+                p.last_failure = Some(failure.clone());
+                tracing::warn!(
+                    rev = p.rev.short(),
+                    probe = %failure.probe,
+                    evidence = %failure.evidence,
+                    "health probe failed"
+                );
+                // ── ★ ONLY A FAILING ROUND PAST THE DEADLINE ROLLS BACK ────
+                // A passing round at the deadline earns the next round rather
+                // than a rollback: never revert a machine whose most recent
+                // evidence is healthy. Still bounded — the next failing round
+                // rolls back at once, and `required_passes` passing rounds
+                // verify, so the trial ends within that many more rounds.
+                if env.now_unix_ms() < p.deadline_unix_ms {
+                    self.state = State::Verifying(p.clone());
+                    return Some(TickOutcome::Verifying(p));
+                }
+                Some(self.roll_back(env, p, failure))
+            }
+        }
+    }
+
+    /// The window closed on a failing round: re-activate the previous
+    /// generation, attest, quarantine.
+    fn roll_back<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        p: Probation,
+        failure: ProbeFailure,
+    ) -> TickOutcome {
+        // Never revert a generation that is not the one on trial.
+        match env.current_generation() {
+            Some(g) if g == p.generation => {}
+            // A previous attempt's detached activation already landed.
+            Some(g) if g == p.previous_generation => {
+                return self.attest_rollback(env, p, g, failure);
+            }
+            found => {
+                tracing::warn!(
+                    rev = p.rev.short(),
+                    expected = %p.generation,
+                    found = ?found,
+                    "the system moved during probation — not rolling back someone else's switch"
+                );
+                self.state = State::Idle;
+                return TickOutcome::ProbationAbandoned {
+                    rev: p.rev,
+                    expected: p.generation,
+                    found,
+                };
+            }
+        }
+        tracing::error!(
+            rev = p.rev.short(),
+            from = %p.generation,
+            to = %p.previous_generation,
+            probe = %failure.probe,
+            "probation failed — rolling back to the previous generation"
+        );
+        match env.rollback_to(p.previous_generation) {
+            Ok(restored) => self.attest_rollback(env, p, restored, failure),
+            Err(EnvError::SwitchBusy(holder)) => {
+                let rev = p.rev.clone();
+                self.state = State::Verifying(p);
+                TickOutcome::RollbackDeferred { rev, holder }
+            }
+            Err(e) => {
+                let rev = p.rev.clone();
+                self.state = State::Verifying(p);
+                TickOutcome::RollbackFailed {
+                    rev,
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Record the rollback (which quarantines the rev) and return to idle.
+    fn attest_rollback<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        p: Probation,
+        to: Generation,
+        failure: ProbeFailure,
+    ) -> TickOutcome {
+        // Honest residual: if this persist fails, the chain still says the
+        // rev is activated, so the next tick reads HEAD as `Unchanged` — the
+        // node sits on the restored generation rather than re-deploying the
+        // bad one. Safe direction, wrong record; logged loudly.
+        let persisted = env.load_chain().and_then(|mut chain| {
+            self.record(
+                &mut chain,
+                env,
+                p.rev.clone(),
+                Outcome::RolledBack {
+                    from: p.generation,
+                    to,
+                    probe: failure.probe.clone(),
+                    evidence: failure.evidence.clone(),
+                },
+            )
+        });
+        if let Err(e) = persisted {
+            tracing::error!(error = %e, "rolled back, but the rollback receipt was not persisted");
+        }
+        self.state = State::Idle;
+        TickOutcome::RolledBack {
+            rev: p.rev,
+            from: p.generation,
+            to,
+            failure,
         }
     }
 
@@ -1768,6 +2307,377 @@ mod tests {
         env.push_probe(Ok(Some(rev(1)))); // re-probe
         assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(1)));
         assert_eq!(env.chain().last_activated_rev(), Some(&rev(1)));
+    }
+
+    // ── Health-gated rollback ──────────────────────────────────────────
+
+    use crate::probation::{HealthProbe, ProbeCheck};
+
+    /// A 300s window probed every 15s, verified by 2 consecutive passes —
+    /// the shipped defaults — over two probes, so a test can see a round
+    /// stop at its FIRST failure.
+    fn policy() -> RollbackPolicy {
+        let probe = |name: &str| HealthProbe {
+            name: name.to_owned(),
+            check: ProbeCheck::Command {
+                argv: vec!["/usr/bin/true".to_owned()],
+                expect_exit: 0,
+                timeout_seconds: 10,
+            },
+        };
+        RollbackPolicy {
+            window_ms: 300_000,
+            interval_seconds: 15,
+            required_consecutive_passes: 2,
+            probes: vec![probe("network"), probe("tailscale")],
+        }
+    }
+
+    fn guarded() -> Sentinela {
+        Sentinela::new(cfg()).with_rollback(Some(policy()))
+    }
+
+    /// A node running rev(1) at generation 41, about to be offered rev(2).
+    fn node_on_rev1() -> MockEnv {
+        let env = MockEnv::default();
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(
+            rev(1),
+            Outcome::Activated {
+                generation: Generation(41),
+            },
+            0,
+        ))
+        .unwrap();
+        env.persist_chain(&c).unwrap();
+        env.set_generation(Some(Generation(41)));
+        env.set_switch_result(Ok(Generation(42)));
+        env
+    }
+
+    /// Deploy rev(2) under a guarded loop; returns the loop in probation.
+    fn deploy_rev2_on_probation(env: &MockEnv) -> Sentinela {
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+        let mut s = guarded();
+        assert_eq!(
+            s.tick(env),
+            TickOutcome::Deployed {
+                rev: rev(2),
+                generation: Generation(42)
+            }
+        );
+        let State::Verifying(p) = s.state().clone() else {
+            panic!("an activation under a rollback policy must enter probation, got {:?}", s.state());
+        };
+        assert_eq!(p.previous_generation, Generation(41), "read BEFORE the switch");
+        assert_eq!(p.generation, Generation(42));
+        s
+    }
+
+    fn outcomes(env: &MockEnv) -> Vec<&'static str> {
+        env.chain()
+            .entries()
+            .iter()
+            .map(|r| match r.outcome {
+                Outcome::Activated { .. } => "activated",
+                Outcome::Failed { .. } => "failed",
+                Outcome::Deferred { .. } => "deferred",
+                Outcome::Probation { .. } => "probation",
+                Outcome::Verified { .. } => "verified",
+                Outcome::RolledBack { .. } => "rolledBack",
+            })
+            .collect()
+    }
+
+    /// PATH 1 — probes pass, so the activation converges. Two consecutive
+    /// passing rounds verify it; nothing is rolled back; the next tick is the
+    /// ordinary `unchanged`.
+    #[test]
+    fn passing_probes_verify_the_activation_and_the_loop_converges() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+
+        // The deploy tick's pulse already says what the loop waits on.
+        let deploy_beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert!(deploy_beat.verification.is_some(), "the probation is visible from its first tick");
+
+        env.set_now_ms(15_000);
+        let first = s.tick(&env);
+        assert!(
+            matches!(&first, TickOutcome::Verifying(p) if p.passes == 1),
+            "one pass is not two: {first:?}"
+        );
+        assert_eq!(s.next_delay(&first), std::time::Duration::from_secs(15), "the probe interval rules");
+        let beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(beat.outcome, "verifying");
+        assert_eq!(beat.phase, Phase::InFlight, "probation is convergence in flight, not an idle loop");
+
+        env.set_now_ms(30_000);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::Verified {
+                rev: rev(2),
+                generation: Generation(42)
+            }
+        );
+        assert_eq!(s.state(), &State::Idle);
+        assert!(env.rollbacks.borrow().is_empty());
+        assert_eq!(outcomes(&env), ["activated", "activated", "probation", "verified"]);
+        assert_eq!(
+            *env.probe_runs.borrow(),
+            ["network", "tailscale", "network", "tailscale"],
+            "every probe, every round"
+        );
+
+        env.push_probe(Ok(Some(rev(2))));
+        assert_eq!(s.tick(&env), TickOutcome::Unchanged { rev: rev(2) });
+        env.chain().verify().unwrap();
+    }
+
+    /// PATH 2 — the window expires on a failing round: the PREVIOUS
+    /// generation is re-activated, and the rev is marked bad in the chain
+    /// with the failing probe's name and evidence.
+    #[test]
+    fn a_failing_probe_past_the_window_rolls_back_and_marks_the_rev_bad() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+
+        // Inside the window a failure only resets the streak.
+        env.push_probe_result(Err("exit 1: tailscaled not running".to_owned()));
+        env.set_now_ms(15_000);
+        let out = s.tick(&env);
+        match &out {
+            TickOutcome::Verifying(p) => {
+                assert_eq!(p.passes, 0);
+                let f = p.last_failure.as_ref().expect("the failure is carried");
+                assert_eq!(f.probe, "network", "the round stops at its first failure");
+            }
+            other => panic!("inside the window a failure must not roll back: {other:?}"),
+        }
+        assert!(env.rollbacks.borrow().is_empty());
+        let beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(
+            beat.verification.and_then(|p| p.last_failure).map(|f| f.evidence),
+            Some("exit 1: tailscaled not running".to_owned()),
+            "the pulse names the failing probe's output"
+        );
+
+        // Past the deadline, a failing round rolls back.
+        env.push_probe_result(Ok(()));
+        env.push_probe_result(Err("exit 2: no route to host".to_owned()));
+        env.set_now_ms(300_000);
+        let out = s.tick(&env);
+        assert_eq!(
+            out,
+            TickOutcome::RolledBack {
+                rev: rev(2),
+                from: Generation(42),
+                to: Generation(41),
+                failure: ProbeFailure {
+                    probe: "tailscale".to_owned(),
+                    evidence: "exit 2: no route to host".to_owned(),
+                },
+            }
+        );
+        assert_eq!(*env.rollbacks.borrow(), vec![Generation(41)], "back to the generation read before the switch");
+        assert_eq!(env.current_generation(), Some(Generation(41)));
+        assert_eq!(s.state(), &State::Idle);
+
+        let chain = env.chain();
+        match &chain.head().unwrap().outcome {
+            Outcome::RolledBack { from, to, probe, evidence } => {
+                assert_eq!((*from, *to), (Generation(42), Generation(41)));
+                assert_eq!(probe, "tailscale");
+                assert_eq!(evidence, "exit 2: no route to host");
+            }
+            other => panic!("the rev must be marked bad in the chain, got {other:?}"),
+        }
+        assert_eq!(chain.quarantined_rev(), Some(&rev(2)));
+        assert_eq!(chain.last_activated_rev(), Some(&rev(1)), "the node runs rev(1) again");
+        assert!(chain.consecutive_failures() > 0, "and it is not converged");
+        chain.verify().unwrap();
+        // A rollback is NOT the no-downgrade rule: the branch is untouched.
+        assert_eq!(*env.switches.borrow(), vec![rev(2)], "no git-level rollback happened");
+    }
+
+    /// PATH 3 — the bad rev is not retried while it is HEAD, and is tried
+    /// again (with a fresh build) only once HEAD moves.
+    #[test]
+    fn a_rolled_back_rev_is_not_retried_until_head_moves() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.push_probe_result(Err("dead".to_owned()));
+        env.set_now_ms(300_000);
+        assert_eq!(s.tick(&env).kind(), "rolledBack");
+        let builds = env.builds.borrow().len();
+
+        for n in 1..=3u64 {
+            env.set_now_ms(300_000 + n * 60_000);
+            env.push_probe(Ok(Some(rev(2))));
+            assert_eq!(
+                s.tick(&env),
+                TickOutcome::Quarantined { rev: rev(2) },
+                "HEAD is still the rolled-back rev"
+            );
+        }
+        assert_eq!(env.builds.borrow().len(), builds, "never rebuilt");
+        assert_eq!(env.switches.borrow().len(), 1, "never re-activated");
+        assert_eq!(env.chain().len(), 4, "and the refusal writes nothing to the chain");
+        let beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(beat.head_rev, Some(rev(2)), "a quarantined tick did observe HEAD");
+
+        // HEAD moves: the new rev deploys (and goes on probation itself).
+        env.set_switch_result(Ok(Generation(43)));
+        env.push_probe(Ok(Some(rev(3))));
+        env.push_probe(Ok(Some(rev(3))));
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(3)));
+        assert!(matches!(s.state(), State::Verifying(p) if p.previous_generation == Generation(41)));
+    }
+
+    /// PATH 4 — disabled means today's behaviour exactly. No policy: no
+    /// probation, no probes, no rollbacks, no probation receipt, a resolved
+    /// pulse with no verification field — and no quarantine, even over a
+    /// chain that carries a rollback from when it was on. (The existing
+    /// suite is the rest of the proof: every test above this section runs
+    /// `Sentinela::new(cfg())` with no policy and is unchanged.)
+    #[test]
+    fn rollback_off_is_todays_behaviour_exactly() {
+        let env = node_on_rev1();
+        let mut c = env.chain();
+        c.append(c.next_receipt(rev(2), Outcome::Activated { generation: Generation(42) }, 1))
+            .unwrap();
+        c.append(c.next_receipt(
+            rev(2),
+            Outcome::RolledBack {
+                from: Generation(42),
+                to: Generation(41),
+                probe: "network".into(),
+                evidence: "x".into(),
+            },
+            2,
+        ))
+        .unwrap();
+        env.persist_chain(&c).unwrap();
+        for _ in 0..4 {
+            env.push_probe_result(Err("would fail".to_owned()));
+        }
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+
+        let mut s = Sentinela::new(cfg()).with_rollback(None);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::Deployed {
+                rev: rev(2),
+                generation: Generation(42)
+            },
+            "off means the loop converges on HEAD as it always has"
+        );
+        assert_eq!(s.state(), &State::Idle, "no probation");
+        assert!(env.probe_runs.borrow().is_empty(), "no probes run");
+        assert!(env.rollbacks.borrow().is_empty());
+        assert_eq!(
+            outcomes(&env),
+            ["activated", "activated", "rolledBack", "activated"],
+            "one Activated receipt, exactly as before — no probation receipt"
+        );
+        let beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(beat.phase, Phase::Resolved);
+        assert_eq!(beat.verification, None);
+        assert!(
+            !serde_json::to_string(&beat).unwrap().contains("verification"),
+            "the pulse is byte-shaped as before"
+        );
+        assert_eq!(
+            s.next_delay(&TickOutcome::Deployed { rev: rev(2), generation: Generation(42) }),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    /// The reboot case. The daemon dies mid-probation (its own unit
+    /// changed, a crash, a reboot) and the new process must resume the
+    /// trial from the chain — and do it WITHOUT the network, because a
+    /// generation that broke the network breaks `probe_head` too.
+    #[test]
+    fn an_open_probation_survives_a_restart_and_rolls_back_without_the_network() {
+        let env = node_on_rev1();
+        let dead = deploy_rev2_on_probation(&env);
+        drop(dead); // the process that opened the probation is gone
+
+        // Every head probe now fails: the bad generation took the network.
+        for _ in 0..4 {
+            env.push_probe(Err(EnvError::ProbeFailed("network unreachable".into())));
+        }
+        env.push_probe_result(Err("exit 1".to_owned()));
+        env.set_now_ms(400_000);
+        let mut fresh = guarded();
+        assert_eq!(
+            fresh.tick(&env).kind(),
+            "rolledBack",
+            "a restarted loop must finish the trial, not forget it"
+        );
+        assert_eq!(*env.rollbacks.borrow(), vec![Generation(41)]);
+    }
+
+    /// Never revert a generation that is not the one on trial: an operator
+    /// switched during the window, so the rollback would undo THEIR work.
+    #[test]
+    fn a_system_that_moved_during_probation_is_not_rolled_back() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_generation(Some(Generation(50))); // someone else's switch
+        env.push_probe_result(Err("dead".to_owned()));
+        env.set_now_ms(300_000);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::ProbationAbandoned {
+                rev: rev(2),
+                expected: Generation(42),
+                found: Some(Generation(50)),
+            }
+        );
+        assert!(env.rollbacks.borrow().is_empty());
+        assert_eq!(s.state(), &State::Idle);
+    }
+
+    /// A due rollback stands aside for an operator's lock and a failed one
+    /// retries — neither is attested as a rollback, and both stay on trial.
+    #[test]
+    fn a_blocked_or_failed_rollback_stays_on_probation() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_now_ms(300_000);
+
+        env.set_rollback_result(Err(EnvError::SwitchBusy("pid 7 · drzzln".into())));
+        env.push_probe_result(Err("dead".to_owned()));
+        assert_eq!(s.tick(&env).kind(), "rollbackDeferred");
+        assert!(matches!(s.state(), State::Verifying(_)));
+
+        env.set_rollback_result(Err(EnvError::RollbackFailed("activate: exit 1".into())));
+        env.push_probe_result(Err("dead".to_owned()));
+        let out = s.tick(&env);
+        assert_eq!(out.kind(), "rollbackFailed");
+        assert_eq!(out.phase(), Phase::Resolved, "a failed rollback is loud, never in-progress");
+        assert!(matches!(s.state(), State::Verifying(_)));
+        assert!(env.chain().quarantined_rev().is_none(), "nothing attested until a rollback lands");
+
+        env.set_rollback_result(Ok(()));
+        env.push_probe_result(Err("dead".to_owned()));
+        assert_eq!(s.tick(&env).kind(), "rolledBack");
+        assert_eq!(env.rollbacks.borrow().len(), 3);
+    }
+
+    /// A passing round at the deadline earns another round: never revert a
+    /// machine whose latest evidence is healthy.
+    #[test]
+    fn a_passing_round_past_the_deadline_is_not_rolled_back() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_now_ms(999_000);
+        assert!(matches!(s.tick(&env), TickOutcome::Verifying(p) if p.passes == 1));
+        assert_eq!(s.tick(&env).kind(), "verified");
+        assert!(env.rollbacks.borrow().is_empty());
     }
 
     #[test]

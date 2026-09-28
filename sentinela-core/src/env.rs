@@ -8,6 +8,7 @@
 //! with no network, no build, no clock. This is the TYPED-SPEC
 //! Environment-trait discipline.
 
+use crate::probation::{HealthProbe, Probation};
 use crate::receipt::{Generation, ReceiptChain};
 use crate::rev::Rev;
 
@@ -81,6 +82,12 @@ pub enum EnvError {
     /// *probably*.
     #[error("ancestry check failed: {0}")]
     AncestryFailed(String),
+    /// Re-activating the previous system generation after a failed health
+    /// probation did not complete. The machine may still be on the bad
+    /// generation, so the FSM stays in probation and retries — it never
+    /// reads this as "rolled back".
+    #[error("rollback failed: {0}")]
+    RollbackFailed(String),
 }
 
 /// One tick's pulse: proof the loop was ALIVE at a moment, independent of
@@ -187,6 +194,15 @@ pub struct Heartbeat {
     /// discipline as `head_rev`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight: Option<BuildProgress>,
+    /// The activation under health probation, while one is.
+    ///
+    /// Carries which probe failed last and its output tail, so "is this node
+    /// about to roll itself back, and why" is answerable from the pulse alone.
+    /// Skipped when absent, exactly like `in_flight`: a node with rollback
+    /// disabled publishes a pulse byte-identical to one from before this
+    /// field existed, so the fleet reader's golden sample still holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Probation>,
 }
 
 /// A driver's report of what a running build is doing.
@@ -377,6 +393,34 @@ pub trait GitopsEnv {
     /// [`EnvError::HeartbeatIo`]. Callers treat this as non-fatal: a tick
     /// that did its work but could not write its pulse still succeeded.
     fn write_heartbeat(&self, beat: &Heartbeat) -> Result<(), EnvError>;
+
+    /// The system profile's current generation, or `None` when it cannot be
+    /// read. Read BEFORE a switch so a health-gated rollback knows where to
+    /// return, and again before rolling back so the loop never reverts a
+    /// generation somebody else activated in the meantime.
+    fn current_generation(&self) -> Option<Generation>;
+
+    /// Run one health probe. `Ok(())` is healthy; `Err(evidence)` carries
+    /// what the probe said (exit status, output tail) — a probe that could
+    /// not even be started is a failing probe, never a skipped one.
+    ///
+    /// # Errors
+    /// The probe's evidence when it did not pass.
+    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String>;
+
+    /// Re-activate `generation` — the system profile's previous generation —
+    /// the way `darwin-rebuild --switch-generation` /
+    /// `nixos-rebuild switch --rollback` do. Returns the generation the
+    /// profile now points at.
+    ///
+    /// Required, like every other verb here: a defaulted no-op would let a
+    /// real env "roll back" by doing nothing and attest that it had.
+    ///
+    /// # Errors
+    /// [`EnvError::SwitchBusy`] when an operator rebuild holds the machine
+    /// lock (the FSM stands aside and retries), or
+    /// [`EnvError::RollbackFailed`].
+    fn rollback_to(&self, generation: Generation) -> Result<Generation, EnvError>;
 }
 
 #[cfg(any(test, feature = "mock"))]
@@ -416,6 +460,18 @@ mod mock {
         /// not merely that it got the answer it wanted.
         pub ancestry_queries: RefCell<Vec<(Rev, Rev)>>,
         ancestry_result: RefCell<Result<bool, EnvError>>,
+        /// The system profile's generation. `None` until a test programs it
+        /// or a switch sets it — so a test that never thinks about
+        /// generations cannot accidentally enter probation.
+        generation: RefCell<Option<Generation>>,
+        /// Programmed probe results, consumed one per `run_health_probe`
+        /// call; an empty queue answers healthy.
+        probe_results: RefCell<std::collections::VecDeque<Result<(), String>>>,
+        /// Every probe run, by name, in order.
+        pub probe_runs: RefCell<Vec<String>>,
+        rollback_result: RefCell<Result<(), EnvError>>,
+        /// Every rollback target, in order.
+        pub rollbacks: RefCell<Vec<Generation>>,
     }
 
     impl Default for MockEnv {
@@ -437,6 +493,11 @@ mod mock {
                 // Fail-closed by default: a test that does not program an
                 // answer must NOT accidentally exercise the relaxed path.
                 ancestry_result: RefCell::new(Ok(false)),
+                generation: RefCell::new(None),
+                probe_results: RefCell::new(std::collections::VecDeque::new()),
+                probe_runs: RefCell::new(Vec::new()),
+                rollback_result: RefCell::new(Ok(())),
+                rollbacks: RefCell::new(Vec::new()),
             }
         }
     }
@@ -500,6 +561,21 @@ mod mock {
         pub fn set_heartbeat_result(&self, r: Result<(), EnvError>) {
             *self.heartbeat_result.borrow_mut() = r;
         }
+
+        /// Set the system profile's current generation.
+        pub fn set_generation(&self, g: Option<Generation>) {
+            *self.generation.borrow_mut() = g;
+        }
+
+        /// Queue one probe result (consumed per probe run, not per round).
+        pub fn push_probe_result(&self, r: Result<(), String>) {
+            self.probe_results.borrow_mut().push_back(r);
+        }
+
+        /// Program the outcome of subsequent `rollback_to` calls.
+        pub fn set_rollback_result(&self, r: Result<(), EnvError>) {
+            *self.rollback_result.borrow_mut() = r;
+        }
     }
 
     impl GitopsEnv for MockEnv {
@@ -521,7 +597,12 @@ mod mock {
 
         fn switch(&self, rev: &Rev) -> Result<Generation, EnvError> {
             self.switches.borrow_mut().push(rev.clone());
-            self.switch_result.borrow().clone()
+            let r = self.switch_result.borrow().clone();
+            // A switch that landed moves the profile, as the real one does.
+            if let Ok(g) = r {
+                *self.generation.borrow_mut() = Some(g);
+            }
+            r
         }
 
         fn load_chain(&self) -> Result<ReceiptChain, EnvError> {
@@ -546,6 +627,22 @@ mod mock {
             self.heartbeat_result.borrow().clone()?;
             self.heartbeats.borrow_mut().push(beat.clone());
             Ok(())
+        }
+
+        fn current_generation(&self) -> Option<Generation> {
+            *self.generation.borrow()
+        }
+
+        fn run_health_probe(&self, probe: &crate::probation::HealthProbe) -> Result<(), String> {
+            self.probe_runs.borrow_mut().push(probe.name.clone());
+            self.probe_results.borrow_mut().pop_front().unwrap_or(Ok(()))
+        }
+
+        fn rollback_to(&self, generation: Generation) -> Result<Generation, EnvError> {
+            self.rollbacks.borrow_mut().push(generation);
+            self.rollback_result.borrow().clone()?;
+            *self.generation.borrow_mut() = Some(generation);
+            Ok(generation)
         }
     }
 }
@@ -815,6 +912,7 @@ mod rebuild_driver_tests {
             head_rev: None,
             poll_seconds: 60,
             in_flight: None,
+            verification: None,
         };
         let json = serde_json::to_string(&quiet).unwrap();
         assert!(

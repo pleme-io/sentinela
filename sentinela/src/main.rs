@@ -266,6 +266,10 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     // the outcome produces, so "sleep the wrong interval" has no expression
     // rather than being a rule someone has to remember.
     let loop_cfg = cfg.loop_config();
+    // Resolved before `cfg` moves into the env: the plan checks probe
+    // binaries against this filesystem, once, at startup.
+    let rollback = cfg.rollback_plan();
+    log_rollback_plan(&rollback);
     let env = std::sync::Arc::new(RealEnv::new(cfg));
 
     // ── ★ THE RECONCILER BECOMES ASKABLE ───────────────────────────────
@@ -281,7 +285,7 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
         Some(sock) => tracing::info!(socket = %sock.display(), "introspection live"),
         None => tracing::warn!("introspection unavailable — the loop still converges"),
     }
-    let mut sentinela = Sentinela::new(loop_cfg);
+    let mut sentinela = Sentinela::new(loop_cfg).with_rollback(rollback.policy);
     tracing::info!(
         poll_seconds = loop_cfg.poll_seconds,
         "sentinela: daemon started"
@@ -329,7 +333,31 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
         }
         prev = now;
 
-        std::thread::sleep(outcome.next_delay(&loop_cfg));
+        // The loop's `next_delay`, not the outcome's: while an activation is
+        // on probation the policy's probe interval rules, and only the loop
+        // knows it is on probation.
+        std::thread::sleep(sentinela.next_delay(&outcome));
+    }
+}
+
+/// Say what the `rollback:` section resolved to — once, at startup, and
+/// loudly when an operator asked for protection and is not getting it.
+fn log_rollback_plan(plan: &sentinela_config::RollbackPlan) {
+    for r in &plan.refused {
+        tracing::warn!(probe = %r.name, reason = %r.reason, "rollback: probe entry refused (its siblings still load)");
+    }
+    match &plan.policy {
+        Some(p) => tracing::info!(
+            probes = p.probes.len(),
+            window_seconds = p.window_ms / 1000,
+            interval_seconds = p.interval_seconds,
+            required_consecutive_passes = p.required_consecutive_passes,
+            "rollback: health-gated rollback ON"
+        ),
+        None if plan.enabled_without_probes => tracing::error!(
+            "rollback: enabled, but no probe entry is valid — health-gated rollback is OFF"
+        ),
+        None => {}
     }
 }
 
@@ -443,6 +471,76 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::CoolingDown { remaining_ms } => {
             tracing::debug!(remaining_ms, "cooling down");
         }
+        TickOutcome::Verifying(_)
+        | TickOutcome::Verified { .. }
+        | TickOutcome::RolledBack { .. }
+        | TickOutcome::RollbackDeferred { .. }
+        | TickOutcome::RollbackFailed { .. }
+        | TickOutcome::ProbationAbandoned { .. }
+        | TickOutcome::Quarantined { .. } => log_probation_outcome(outcome),
+    }
+}
+
+
+/// The health-gated-rollback half of [`log_outcome`], split so neither match
+/// outgrows a screen. Every other outcome is `log_outcome`'s, which is
+/// exhaustive and routes only these seven here.
+fn log_probation_outcome(outcome: &TickOutcome) {
+    match outcome {
+        TickOutcome::Verifying(p) => match &p.last_failure {
+            None => tracing::info!(
+                rev = p.rev.short(),
+                passes = p.passes,
+                required = p.required_passes,
+                "verifying: probe round passed"
+            ),
+            Some(f) => tracing::warn!(
+                rev = p.rev.short(),
+                probe = %f.probe,
+                evidence = %f.evidence,
+                "verifying: probe round FAILED (window still open)"
+            ),
+        },
+        TickOutcome::Verified { rev, generation } => {
+            tracing::info!(rev = rev.short(), generation = %generation, "activation verified");
+        }
+        TickOutcome::RolledBack {
+            rev,
+            from,
+            to,
+            failure,
+        } => {
+            tracing::error!(
+                rev = rev.short(),
+                from = %from,
+                to = %to,
+                probe = %failure.probe,
+                evidence = %failure.evidence,
+                "ROLLED BACK — probation failed; rev quarantined until HEAD moves"
+            );
+        }
+        TickOutcome::RollbackDeferred { rev, holder } => {
+            tracing::warn!(rev = rev.short(), holder = %holder, "rollback due; another rebuild holds the machine lock");
+        }
+        TickOutcome::RollbackFailed { rev, error } => {
+            tracing::error!(rev = rev.short(), %error, "ROLLBACK FAILED — still on the generation under probation; retrying");
+        }
+        TickOutcome::ProbationAbandoned {
+            rev,
+            expected,
+            found,
+        } => {
+            tracing::warn!(
+                rev = rev.short(),
+                expected = %expected,
+                found = ?found,
+                "probation abandoned: the system moved to another generation"
+            );
+        }
+        TickOutcome::Quarantined { rev } => {
+            tracing::warn!(rev = rev.short(), "HEAD is quarantined (rolled back); waiting for HEAD to move");
+        }
+        _ => {}
     }
 }
 
@@ -507,6 +605,15 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         // `converged` is the SAME `convergence_gate` the `--gate` exit code
         // uses — one function, one answer, every reader.
         "phase": beat.as_ref().map(|b| b.phase),
+        // ── Health-gated rollback, visible where the operator looks ──────
+        // `verification`: the probation in progress, from the pulse — which
+        // probe failed last and its output tail. `last_rollback`: the newest
+        // rollback receipt, from the chain. `quarantined_rev`: set while
+        // that rollback still holds HEAD off.
+        "rollback_enabled": cfg.rollback.enabled,
+        "verification": beat.as_ref().and_then(|b| b.verification.as_ref()),
+        "last_rollback": chain.last_rollback(),
+        "quarantined_rev": chain.quarantined_rev().map(sentinela_core::Rev::as_str),
         // The DISTILLED cause of the most recent failure. See
         // `distill_failure` — the raw receipt is mostly cascade.
         "last_failure": last_failure_lines(&chain),
@@ -662,7 +769,9 @@ fn verify(cfg: &SentinelaConfig) -> std::process::ExitCode {
 /// One cycle, print the outcome, exit 0 (the tick itself is fail-closed).
 fn tick_once(cfg: &SentinelaConfig) -> std::process::ExitCode {
     let env = RealEnv::new(cfg.clone());
-    let mut sentinela = Sentinela::new(cfg.loop_config());
+    let rollback = cfg.rollback_plan();
+    log_rollback_plan(&rollback);
+    let mut sentinela = Sentinela::new(cfg.loop_config()).with_rollback(rollback.policy);
     let outcome = sentinela.tick(&env);
     log_outcome(&outcome);
     if matches!(sentinela.state(), State::CoolingDown { .. }) {
@@ -882,6 +991,7 @@ mod gate_tests {
             head_rev: None,
             poll_seconds: POLL,
             in_flight: None,
+            verification: None,
         })
     }
 
@@ -897,6 +1007,7 @@ mod gate_tests {
             // purpose: the gate's staleness verdict must not depend on a
             // driver being able to report steps.
             in_flight: None,
+            verification: None,
         })
     }
 
@@ -1092,6 +1203,60 @@ fn next_step(
     }
 }
 
+/// The rollback lines of the status panel: the probation in progress (which
+/// probe failed last, its output tail) and a quarantine that still holds.
+/// Silent when neither applies, so a node with rollback off prints what it
+/// always printed.
+fn write_probation(
+    f: &mut std::fmt::Formatter<'_>,
+    v: &serde_json::Value,
+    now_ms: u64,
+) -> std::fmt::Result {
+    if let Some(p) = v.get("verification").filter(|p| !p.is_null()) {
+        let u = |k: &str| p.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let rev = p.get("rev").and_then(serde_json::Value::as_str).unwrap_or("—");
+        let left = u("deadline_unix_ms").saturating_sub(now_ms) / 1000;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "    {:<11} {} gen {} · {}/{} passes · {}s left · rollback target gen {}",
+            "verifying",
+            paint(short(rev), "33;1"),
+            u("generation"),
+            u("passes"),
+            u("required_passes"),
+            left,
+            u("previous_generation"),
+        )?;
+        if let Some(fl) = p.get("last_failure").filter(|x| !x.is_null()) {
+            let probe = fl.get("probe").and_then(serde_json::Value::as_str).unwrap_or("?");
+            writeln!(f, "      {}", paint(&["probe `", probe, "` failing:"].concat(), "31"))?;
+            for l in fl
+                .get("evidence")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                writeln!(f, "        {}", paint(l, "31"))?;
+            }
+        }
+    }
+    if let Some(q) = v.get("quarantined_rev").and_then(serde_json::Value::as_str) {
+        writeln!(
+            f,
+            "    {:<11} {} rolled back — not re-attempted until HEAD moves",
+            "quarantine",
+            paint(short(q), "31;1")
+        )?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for StatusView<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let v = self.0;
@@ -1155,6 +1320,8 @@ impl std::fmt::Display for StatusView<'_> {
                 }
             }
         }
+
+        write_probation(f, v, now_ms)?;
 
         let verified = v.get("chain_verified").and_then(serde_json::Value::as_bool).unwrap_or(false);
         writeln!(f, "    {:<11} {} · chain {}", "receipts", n("receipts").unwrap_or(0),
@@ -1270,6 +1437,25 @@ fn last_failure_lines(chain: &sentinela_core::ReceiptChain) -> Option<Vec<String
             sentinela_core::Outcome::Activated { .. } => seen_success = true,
             sentinela_core::Outcome::Failed { error } if !seen_success => {
                 return Some(distill_failure(error));
+            }
+            sentinela_core::Outcome::RolledBack {
+                from,
+                to,
+                probe,
+                evidence,
+            } if !seen_success => {
+                let mut lines = vec![[
+                    "rolled back generation ",
+                    &from.to_string(),
+                    " → ",
+                    &to.to_string(),
+                    ": probe `",
+                    probe,
+                    "` failed",
+                ]
+                .concat()];
+                lines.extend(distill_failure(evidence));
+                return Some(lines);
             }
             _ => {}
         }
@@ -1430,6 +1616,7 @@ mod hang_gate_tests {
             head_rev: None,
             poll_seconds: POLL,
             in_flight: None,
+            verification: None,
         })
     }
 
@@ -1472,5 +1659,62 @@ mod hang_gate_tests {
             convergence_gate(&in_flight_at(running), NOW_MS, POLL, 600, 0, true).is_err(),
             "29m against a 10m ceiling is past it",
         );
+    }
+}
+
+#[cfg(test)]
+mod rollback_status_tests {
+    use super::{StatusView, last_failure_lines};
+    use sentinela_core::{Generation, Outcome, ReceiptChain, Rev};
+
+    fn rev(c: char) -> Rev {
+        Rev::parse(&c.to_string().repeat(40)).unwrap()
+    }
+
+    /// The panel names the probation, the failing probe and its output tail,
+    /// and a quarantine that still holds — the operator sees why the node
+    /// may revert, and why it did.
+    #[test]
+    fn the_panel_shows_a_probation_its_failing_probe_and_a_quarantine() {
+        let v = serde_json::json!({
+            "hostname": "cid",
+            "converged": {"ok": false, "why": "1 consecutive failed ticks"},
+            "verification": {
+                "rev": "a".repeat(40), "generation": 42, "previous_generation": 41,
+                "deadline_unix_ms": 0, "passes": 0, "required_passes": 2,
+                "last_failure": {"probe": "tailscale", "evidence": "exit 1 (expected 0): tailscaled not running"}
+            },
+            "quarantined_rev": "b".repeat(40),
+        });
+        let out = StatusView(&v).to_string();
+        assert!(out.contains("verifying"), "{out}");
+        assert!(out.contains("0/2 passes"), "{out}");
+        assert!(out.contains("rollback target gen 41"), "{out}");
+        assert!(out.contains("probe `tailscale` failing"), "{out}");
+        assert!(out.contains("tailscaled not running"), "{out}");
+        assert!(out.contains("bbbbbbbb rolled back"), "{out}");
+    }
+
+    /// A rollback is the most recent failure, reported with its probe and
+    /// evidence, until something activates again.
+    #[test]
+    fn a_rollback_is_reported_as_the_last_failure() {
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(rev('a'), Outcome::Activated { generation: Generation(42) }, 1))
+            .unwrap();
+        c.append(c.next_receipt(
+            rev('a'),
+            Outcome::RolledBack {
+                from: Generation(42),
+                to: Generation(41),
+                probe: "tailscale".into(),
+                evidence: "exit 1 (expected 0): no route".into(),
+            },
+            2,
+        ))
+        .unwrap();
+        let lines = last_failure_lines(&c).expect("a rollback is a failure to report");
+        assert_eq!(lines[0], "rolled back generation 42 → 41: probe `tailscale` failed");
+        assert!(lines.iter().any(|l| l.contains("no route")), "{lines:?}");
     }
 }

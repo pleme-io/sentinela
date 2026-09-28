@@ -36,6 +36,22 @@ phases: `nix/docs/gitops-v2-daemon.md`.
   skip-if-unchanged, receipt-before-idle, chain-verify — see
   `sentinela-core/src/fsm.rs` + `receipt.rs`.
 
+## Health-gated rollback (off by default)
+
+`rollback:` in the config (`sentinela-config::RollbackConfig`) attaches a
+`RollbackPolicy` via `Sentinela::with_rollback`. With it, every activation
+enters `State::Verifying` (a `Probation` receipt makes it survive restarts and
+reboots); each tick runs one probe round WITHOUT probing HEAD, until
+`required_consecutive_passes` land (`Verified`) or a round fails past the
+window, which re-activates the previous generation using that generation's own
+tools (`real_env::rollback_argv`), attests `RolledBack`, and quarantines the rev
+until HEAD moves (`ReceiptChain::quarantined_rev`). Probe entries are an open
+list parsed one at a time: a malformed entry is refused by name and its
+siblings load. Kinds: `command` only (no HTTP client in the default build).
+Not the no-downgrade rule: that is about git history, this about the system
+profile. Code: `sentinela-core/src/probation.rs` + the probation methods in
+`fsm.rs`.
+
 ## ★ P5 — why the rebuild is still a subprocess (measured 2026-08-05)
 
 Doctrine P5 (`theory/RECONCILER-LIVENESS.md` §IV.3) wants this daemon off
@@ -76,7 +92,7 @@ else moves), or a rev materializer here plus sui's byte-identity proof.
 ## Build / test
 
 ```
-cargo test            # 100 tests, 0 warnings
+cargo test            # 165 tests (2026-09-27)
 gen build .           # regenerate Cargo.build-spec.json + Cargo.gen.lock
                       # (required after any dep change — the nix build's
                       #  D2 freshness tie fails on a stale gen lock)

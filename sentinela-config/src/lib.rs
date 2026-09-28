@@ -331,6 +331,235 @@ pub struct SentinelaConfig {
     /// Which rebuild tool to drive. Defaults to `darwin-rebuild` so every
     /// existing config is unchanged; a NixOS node sets `nixos-rebuild`.
     pub rebuild_tool: RebuildTool,
+    /// Health-gated rollback after each activation. OFF in both tiers, so an
+    /// existing config that never mentions it behaves exactly as before.
+    pub rollback: RollbackConfig,
+}
+
+/// Default probation window, seconds.
+pub const DEFAULT_ROLLBACK_WINDOW_SECONDS: u64 = 300;
+/// Default seconds between probe rounds.
+pub const DEFAULT_ROLLBACK_INTERVAL_SECONDS: u64 = 15;
+/// Default consecutive passing rounds that verify an activation.
+pub const DEFAULT_ROLLBACK_REQUIRED_PASSES: u32 = 2;
+/// Default per-probe timeout, seconds, when an entry does not state one.
+pub const DEFAULT_PROBE_TIMEOUT_SECONDS: u64 = 10;
+
+/// The `rollback:` section — health-gated rollback after each activation.
+///
+/// ```yaml
+/// rollback:
+///   enabled: true
+///   window_seconds: 300
+///   interval_seconds: 15
+///   required_consecutive_passes: 2
+///   probes:
+///     - name: tailscale
+///       kind: command
+///       argv: ["/run/current-system/sw/bin/tailscale", "status"]
+///       expect_exit: 0      # default 0
+///       timeout_seconds: 10 # default 10
+/// ```
+///
+/// ── ★ THE SECTION IS STRICT, THE PROBE LIST IS OPEN ───────────────────
+/// The section's own keys carry `deny_unknown_fields` like every other part
+/// of this surface: a typo'd `windw_seconds` is one field of one struct, and
+/// silently ignoring it would run the wrong window. The probe LIST is
+/// different — its entries are independent, and a closed-enum `Vec` would let
+/// one malformed entry refuse the whole config, which stops the daemon and
+/// takes every valid sibling (and every deploy) down with it. So entries are
+/// held open ([`ProbeEntry`]) and parsed one at a time by [`Self::plan`]:
+/// a bad entry is refused BY NAME, and its siblings load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RollbackConfig {
+    /// Master switch. `false` is today's behaviour exactly.
+    pub enabled: bool,
+    /// How long after a switch a failing round may still recover, seconds.
+    pub window_seconds: u64,
+    /// Seconds between probe rounds during probation.
+    pub interval_seconds: u64,
+    /// Consecutive passing rounds that verify an activation.
+    pub required_consecutive_passes: u32,
+    /// The probes, as written. See [`ProbeEntry`].
+    pub probes: Vec<ProbeEntry>,
+}
+
+impl Default for RollbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_seconds: DEFAULT_ROLLBACK_WINDOW_SECONDS,
+            interval_seconds: DEFAULT_ROLLBACK_INTERVAL_SECONDS,
+            required_consecutive_passes: DEFAULT_ROLLBACK_REQUIRED_PASSES,
+            probes: Vec::new(),
+        }
+    }
+}
+
+/// One probe entry exactly as written — an open value, so that it cannot
+/// fail the document it sits in. Its typed view is produced by
+/// [`RollbackConfig::plan`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProbeEntry(pub serde_json::Value);
+
+/// The closed kind enum an entry must parse into (minus its `name`).
+///
+/// `deny_unknown_fields`: inside ONE entry a typo'd key (`expect_exti`) is
+/// refused with that entry, rather than silently defaulting the exit code.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ProbeSpec {
+    Command {
+        argv: Vec<String>,
+        #[serde(default)]
+        expect_exit: i32,
+        #[serde(default = "default_probe_timeout")]
+        timeout_seconds: u64,
+    },
+}
+
+fn default_probe_timeout() -> u64 {
+    DEFAULT_PROBE_TIMEOUT_SECONDS
+}
+
+/// A probe entry that was refused, named so an operator can find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeRefusal {
+    /// The entry's `name`, or `#<index>` when it has no usable name.
+    pub name: String,
+    /// Why it was refused.
+    pub reason: String,
+}
+
+impl std::fmt::Display for ProbeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "probe `{}` refused: {}", self.name, self.reason)
+    }
+}
+
+/// What the `rollback:` section resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackPlan {
+    /// The effective policy — `None` when disabled, or when enabled with no
+    /// probe surviving validation (see [`sentinela_core::RollbackPolicy`] on
+    /// why zero probes is not a passing policy).
+    pub policy: Option<sentinela_core::RollbackPolicy>,
+    /// Every entry that was refused, by name.
+    pub refused: Vec<ProbeRefusal>,
+    /// `true` when rollback was enabled but no probe survived — the case an
+    /// operator must hear about, because they asked for protection and are
+    /// not getting it.
+    pub enabled_without_probes: bool,
+}
+
+impl RollbackConfig {
+    /// Resolve the section into an effective policy plus the refused entries.
+    ///
+    /// `exists` answers whether a probe's `argv[0]` is present — injected so
+    /// this stays pure and testable; the daemon passes a filesystem check. A
+    /// probe whose binary is absent at startup would fail every round and roll
+    /// back every deploy forever, so it is refused here, by name, instead.
+    ///
+    /// Refused entries are reported even when rollback is disabled: a config
+    /// error is worth seeing before the day somebody turns it on.
+    #[must_use]
+    pub fn plan(&self, exists: &dyn Fn(&str) -> bool) -> RollbackPlan {
+        let mut probes: Vec<sentinela_core::HealthProbe> = Vec::new();
+        let mut refused = Vec::new();
+        for (index, entry) in self.probes.iter().enumerate() {
+            match parse_probe(index, &entry.0, exists) {
+                Ok(p) if probes.iter().any(|q| q.name == p.name) => refused.push(ProbeRefusal {
+                    name: p.name,
+                    reason: "duplicate name — names identify the failing probe in a receipt"
+                        .to_owned(),
+                }),
+                Ok(p) => probes.push(p),
+                Err(r) => refused.push(r),
+            }
+        }
+        let enabled_without_probes = self.enabled && probes.is_empty();
+        let policy = (self.enabled && !probes.is_empty()).then(|| sentinela_core::RollbackPolicy {
+            window_ms: self.window_seconds.saturating_mul(1000),
+            interval_seconds: self.interval_seconds.max(1),
+            required_consecutive_passes: self.required_consecutive_passes.max(1),
+            probes,
+        });
+        RollbackPlan {
+            policy,
+            refused,
+            enabled_without_probes,
+        }
+    }
+}
+
+/// Parse and validate one entry. Every refusal carries the entry's name.
+fn parse_probe(
+    index: usize,
+    raw: &serde_json::Value,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<sentinela_core::HealthProbe, ProbeRefusal> {
+    let by_index = || ["#", &index.to_string()].concat();
+    let Some(obj) = raw.as_object() else {
+        return Err(ProbeRefusal {
+            name: by_index(),
+            reason: "not a mapping".to_owned(),
+        });
+    };
+    let name = match obj.get("name").and_then(serde_json::Value::as_str) {
+        Some(n) if !n.trim().is_empty() => n.to_owned(),
+        _ => {
+            return Err(ProbeRefusal {
+                name: by_index(),
+                reason: "missing or empty `name`".to_owned(),
+            });
+        }
+    };
+    let refuse = |reason: String| ProbeRefusal {
+        name: name.clone(),
+        reason,
+    };
+    let mut rest = obj.clone();
+    rest.remove("name");
+    let spec: ProbeSpec =
+        serde_json::from_value(serde_json::Value::Object(rest)).map_err(|e| refuse(e.to_string()))?;
+    match spec {
+        ProbeSpec::Command {
+            argv,
+            expect_exit,
+            timeout_seconds,
+        } => {
+            let Some(program) = argv.first() else {
+                return Err(refuse("`argv` is empty".to_owned()));
+            };
+            // Absolute, never a `$PATH` lookup: a launchd/systemd daemon has
+            // no useful PATH (the rio 2026-08-05 lesson). A bare `curl` would
+            // fail every round and roll back every deploy.
+            if !program.starts_with('/') {
+                return Err(refuse(
+                    ["`argv[0]` must be an absolute path, got `", program, "`"].concat(),
+                ));
+            }
+            if !exists(program) {
+                return Err(refuse(["`", program, "` does not exist"].concat()));
+            }
+            if timeout_seconds == 0 {
+                return Err(refuse(
+                    "`timeout_seconds` must be positive — an unbounded probe can wedge the tick"
+                        .to_owned(),
+                ));
+            }
+            Ok(sentinela_core::HealthProbe {
+                name,
+                check: sentinela_core::ProbeCheck::Command {
+                    argv,
+                    expect_exit,
+                    timeout_seconds,
+                },
+            })
+        }
+    }
 }
 
 /// Default poll cadence, seconds.
@@ -373,6 +602,13 @@ impl Default for SentinelaConfig {
 }
 
 impl SentinelaConfig {
+    /// The rollback plan, checking probe binaries against the filesystem.
+    #[must_use]
+    pub fn rollback_plan(&self) -> RollbackPlan {
+        self.rollback
+            .plan(&|p: &str| std::path::Path::new(p).exists())
+    }
+
     /// The [`sentinela_core::LoopConfig`] derived from this surface.
     #[must_use]
     pub fn loop_config(&self) -> sentinela_core::LoopConfig {
@@ -428,6 +664,13 @@ impl shikumi::TieredConfig for SentinelaConfig {
             switch_timeout_seconds: 0,
             git_timeout_seconds: 0,
             rebuild_tool: RebuildTool::DarwinRebuild,
+            rollback: RollbackConfig {
+                enabled: false,
+                window_seconds: 0,
+                interval_seconds: 0,
+                required_consecutive_passes: 0,
+                probes: Vec::new(),
+            },
         }
     }
 
@@ -448,6 +691,9 @@ impl shikumi::TieredConfig for SentinelaConfig {
             switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
             git_timeout_seconds: DEFAULT_GIT_TIMEOUT_SECONDS,
             rebuild_tool: RebuildTool::DarwinRebuild,
+            // Off. Shipping it on would change what every node does on its
+            // next deploy; a node opts in.
+            rollback: RollbackConfig::default(),
         }
     }
 }
@@ -520,12 +766,153 @@ mod tests {
             switch_timeout_seconds: 1800,
             git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
+            rollback: RollbackConfig::default(),
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(cfg, back);
         // deny_unknown_fields guards against a stale/typo'd render.
         assert!(serde_yaml::from_str::<SentinelaConfig>("bogus_key: 1").is_err());
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    const ALL_EXIST: &dyn Fn(&str) -> bool = &|_| true;
+
+    fn from_yaml(y: &str) -> SentinelaConfig {
+        serde_yaml::from_str(y).expect("the document must load")
+    }
+
+    /// Off in both tiers, and absent from an existing config: nothing changes
+    /// for a node that never mentions it.
+    #[test]
+    fn rollback_is_off_unless_a_node_opts_in() {
+        use shikumi::TieredConfig as _;
+        assert!(!SentinelaConfig::prescribed_default().rollback.enabled);
+        assert!(!SentinelaConfig::bare().rollback.enabled);
+        let cfg = from_yaml("flake_url: github:pleme-io/nix\nhostname: cid\n");
+        assert!(cfg.rollback_plan().policy.is_none());
+    }
+
+    /// THE SCOPED REFUSAL. One document, four entries: one good, three bad in
+    /// three different ways. The document loads, the good sibling is in the
+    /// policy, and each bad one is refused BY NAME with its own reason — never
+    /// a whole-config failure that stops the daemon.
+    #[test]
+    fn a_malformed_probe_is_refused_by_name_and_its_siblings_load() {
+        let cfg = from_yaml(
+            r#"
+flake_url: github:pleme-io/nix
+hostname: cid
+rollback:
+  enabled: true
+  probes:
+    - name: tailscale
+      kind: command
+      argv: ["/run/current-system/sw/bin/tailscale", "status"]
+    - name: typo
+      kind: command
+      argv: ["/usr/bin/true"]
+      expect_exti: 0
+    - name: web
+      kind: http
+      url: http://localhost:8123
+    - name: bare-path
+      kind: command
+      argv: ["curl", "-fsS", "http://localhost"]
+    - argv: ["/usr/bin/true"]
+"#,
+        );
+        let plan = cfg.rollback.plan(ALL_EXIST);
+        let policy = plan.policy.expect("a valid sibling keeps the policy alive");
+        assert_eq!(
+            policy.probes.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["tailscale"]
+        );
+        assert_eq!(
+            policy.probes[0].check,
+            sentinela_core::ProbeCheck::Command {
+                argv: vec!["/run/current-system/sw/bin/tailscale".into(), "status".into()],
+                expect_exit: 0,
+                timeout_seconds: DEFAULT_PROBE_TIMEOUT_SECONDS,
+            },
+            "defaults fill what the entry did not state"
+        );
+        let refused: Vec<(&str, &str)> = plan
+            .refused
+            .iter()
+            .map(|r| (r.name.as_str(), r.reason.as_str()))
+            .collect();
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        assert_eq!(refused[0].0, "typo");
+        assert!(refused[0].1.contains("expect_exti"), "{}", refused[0].1);
+        assert_eq!(refused[1].0, "web");
+        assert!(refused[1].1.contains("http"), "{}", refused[1].1);
+        assert_eq!(refused[2].0, "bare-path");
+        assert!(refused[2].1.contains("absolute"), "{}", refused[2].1);
+        assert_eq!(refused[3].0, "#4", "no name: identified by position");
+        assert!(plan.refused[0].to_string().contains("probe `typo` refused"));
+    }
+
+    /// Rollback asked for, nothing to judge with: no policy, and the plan
+    /// says so — a vacuous verification would attest health nobody measured.
+    #[test]
+    fn enabled_with_no_valid_probe_is_no_policy_and_says_so() {
+        let cfg = from_yaml(
+            "rollback:\n  enabled: true\n  probes:\n    - name: x\n      kind: command\n      argv: []\n",
+        );
+        let plan = cfg.rollback.plan(ALL_EXIST);
+        assert!(plan.policy.is_none());
+        assert!(plan.enabled_without_probes);
+        assert_eq!(plan.refused[0].name, "x");
+    }
+
+    /// Absent binaries, zero timeouts and duplicate names are entry-level
+    /// refusals too.
+    #[test]
+    fn missing_binaries_zero_timeouts_and_duplicates_are_refused_per_entry() {
+        let cfg = from_yaml(
+            r#"
+rollback:
+  enabled: true
+  window_seconds: 120
+  interval_seconds: 5
+  required_consecutive_passes: 3
+  probes:
+    - {name: a, kind: command, argv: ["/present"], expect_exit: 3, timeout_seconds: 4}
+    - {name: b, kind: command, argv: ["/absent"]}
+    - {name: c, kind: command, argv: ["/present"], timeout_seconds: 0}
+    - {name: a, kind: command, argv: ["/present"]}
+"#,
+        );
+        let plan = cfg.rollback.plan(&|p: &str| p == "/present");
+        let policy = plan.policy.unwrap();
+        assert_eq!(policy.window_ms, 120_000);
+        assert_eq!(policy.interval_seconds, 5);
+        assert_eq!(policy.required_consecutive_passes, 3);
+        assert_eq!(policy.probes.len(), 1);
+        let names: Vec<&str> = plan.refused.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["b", "c", "a"]);
+    }
+
+    /// The section's OWN keys stay strict: that is one struct, not a list of
+    /// independent entries, and a silently ignored typo would run the wrong
+    /// window.
+    #[test]
+    fn a_typo_in_the_section_itself_is_still_refused() {
+        assert!(serde_yaml::from_str::<SentinelaConfig>("rollback:\n  windw_seconds: 5\n").is_err());
+    }
+
+    #[test]
+    fn the_section_round_trips() {
+        let cfg = from_yaml(
+            "rollback:\n  enabled: true\n  probes:\n    - {name: a, kind: command, argv: [\"/x\"]}\n",
+        );
+        let back: SentinelaConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
     }
 }
 

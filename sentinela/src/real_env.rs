@@ -12,20 +12,26 @@
 
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{
-    BuildProgress, EnvError, Generation, GitopsEnv, Heartbeat, ReceiptChain, RebuildDriver, Rev,
+    BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, ProbeCheck,
+    ReceiptChain, RebuildDriver, Rev,
 };
 use std::fs::File;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsunagu::exec::{BoundedRun, OnTimeout};
 use url::Url;
 
 /// The nix system profile whose generation number a switch advances.
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+
+/// How much of a failing probe's output survives into its evidence. A probe
+/// runs every round of a probation, and its evidence lands in the heartbeat
+/// and — on a rollback — the append-only chain; the diagnosis is at the end.
+const PROBE_TAIL_BYTES: usize = 1024;
 /// `darwin-rebuild` from the running system (root, no sudo needed under
 /// the launchd daemon).
 
@@ -309,7 +315,7 @@ impl RealEnv {
         // HERE rather than in the launchd plist so the daemon is correct
         // under every launcher — plist, `sentinela run` by hand, a test
         // harness — instead of only the one plist we happen to ship.
-        cmd.current_dir(self.rebuild_cwd());
+        self.anchor_activation(&mut cmd);
         // ── ★ DETACH: THE SWITCH OUTLIVES US ON PURPOSE ──────────────────
         // We are a launchd job, and the activation we spawn will reach
         // nix-darwin's "setting up launchd services" step, which for a
@@ -335,7 +341,11 @@ impl RealEnv {
         // still not the last ACTIVATED one, and converges again — this
         // time without a plist change, so it survives and attests. One
         // extra cycle, self-healing, instead of a wedged loop.
-        cmd.process_group(0);
+        //
+        // (Both the cwd anchor above and this detach live in
+        // `anchor_activation`, shared with `rollback_to`: a rollback is an
+        // activation too, and one that restores an older plist hits exactly
+        // the same self-unload.)
 
         // ── ★ CAPTURE TO A FILE, NEVER A PIPE — `output()` DEADLOCKS HERE ─
         // `Command::output()` reads stdout/stderr to EOF and only then
@@ -368,10 +378,7 @@ impl RealEnv {
         // switch may be mid-activation, where killing is the damage — see
         // `OnTimeout`.
         let (timeout, on_timeout) = match verb {
-            "switch" => (
-                std::time::Duration::from_secs(self.cfg.switch_timeout_seconds),
-                OnTimeout::Abandon,
-            ),
+            "switch" => self.activation_bound(),
             _ => (
                 std::time::Duration::from_secs(self.cfg.build_timeout_seconds),
                 OnTimeout::KillGroup,
@@ -434,6 +441,25 @@ impl RealEnv {
                     Self::rebuild_err(verb, msg)
                 })
             })
+    }
+
+    /// Anchor an activating subprocess: a writable cwd and its own process
+    /// group. See the two ★ blocks in [`Self::run_rebuild_ref`] for why each
+    /// is load-bearing. Shared by the switch and the rollback, which are the
+    /// two activations this daemon starts.
+    fn anchor_activation(&self, cmd: &mut Command) {
+        cmd.current_dir(self.rebuild_cwd());
+        cmd.process_group(0);
+    }
+
+    /// The bound every activation runs under: the switch deadline, and
+    /// `Abandon` rather than a kill — a half-activated machine is worse than
+    /// a slow one, for a rollback exactly as for a switch.
+    fn activation_bound(&self) -> (std::time::Duration, OnTimeout) {
+        (
+            std::time::Duration::from_secs(self.cfg.switch_timeout_seconds),
+            OnTimeout::Abandon,
+        )
     }
 
     /// Where one rebuild's merged output is captured. Per-verb rather than
@@ -692,6 +718,7 @@ impl GitopsEnv for RealEnv {
                 head_rev: Some(rev.clone()),
                 poll_seconds: self.cfg.poll_seconds,
                 in_flight: Some(p),
+                verification: None,
             };
             let _ = self.write_heartbeat(&beat);
         };
@@ -772,6 +799,165 @@ impl GitopsEnv for RealEnv {
         std::fs::rename(&tmp, &path).map_err(|e| EnvError::HeartbeatIo(e.to_string()))?;
         Ok(())
     }
+
+    fn current_generation(&self) -> Option<Generation> {
+        current_generation()
+    }
+
+    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String> {
+        match &probe.check {
+            ProbeCheck::Command {
+                argv,
+                expect_exit,
+                timeout_seconds,
+            } => {
+                let Some((program, args)) = argv.split_first() else {
+                    return Err("empty argv".to_owned());
+                };
+                // argv, never a shell string — the config layer already
+                // refused anything but an absolute program path.
+                let mut cmd = Command::new(program);
+                cmd.args(args).stdin(Stdio::null());
+                // Its own group, so a timed-out probe is killed with every
+                // child it spawned rather than leaving them behind.
+                cmd.process_group(0);
+                let capture = Path::new(&self.cfg.state_dir).join("probe.out");
+                let run = BoundedRun::new(&capture)
+                    .timeout(std::time::Duration::from_secs(*timeout_seconds))
+                    .on_timeout(OnTimeout::KillGroup)
+                    .tail_bytes(PROBE_TAIL_BYTES);
+                match run.run(cmd) {
+                    Ok(out) => {
+                        let tail = String::from_utf8_lossy(&out.stderr);
+                        match out.status.code() {
+                            Some(c) if c == *expect_exit => Ok(()),
+                            code => Err(probe_evidence(code, *expect_exit, tail.trim())),
+                        }
+                    }
+                    // A probe that cannot start is a FAILING probe: its
+                    // absence may be exactly what the new generation broke.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(["not found: ", program].concat())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        }
+    }
+
+    fn rollback_to(&self, generation: Generation) -> Result<Generation, EnvError> {
+        // Same machine-wide lock as a switch: an operator rebuild in flight
+        // must not have its activation raced by ours, and a busy lock is a
+        // deferral the FSM retries rather than a failure.
+        let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
+        let link = generation_link(generation);
+        if std::fs::symlink_metadata(&link).is_err() {
+            return Err(EnvError::RollbackFailed(
+                [&link, " no longer exists — was it garbage-collected?"].concat(),
+            ));
+        }
+        for argv in rollback_argv(ActivationPlatform::current(), generation) {
+            let Some((program, args)) = argv.split_first() else {
+                continue;
+            };
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            self.anchor_activation(&mut cmd);
+            let capture = self.rebuild_capture_path("rollback");
+            let (timeout, on_timeout) = self.activation_bound();
+            let out = BoundedRun::new(&capture)
+                .timeout(timeout)
+                .on_timeout(on_timeout)
+                .run(cmd)
+                .map_err(|e| exec_err(program, &e, EnvError::RollbackFailed))?;
+            if !out.status.success() {
+                return Err(EnvError::RollbackFailed(
+                    [program.as_str(), ": ", String::from_utf8_lossy(&out.stderr).trim()].concat(),
+                ));
+            }
+        }
+        Ok(current_generation().unwrap_or(Generation(0)))
+    }
+}
+
+/// Which activation mechanics a rollback uses. The PLATFORM decides, not the
+/// rebuild tool: re-activating a generation that already exists involves no
+/// build, and a node driving sui still activates like its OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationPlatform {
+    Darwin,
+    Nixos,
+}
+
+impl ActivationPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Darwin
+        } else {
+            Self::Nixos
+        }
+    }
+}
+
+/// `/nix/var/nix/profiles/system-<N>-link` — the generation's own root.
+fn generation_link(generation: Generation) -> String {
+    [SYSTEM_PROFILE, "-", &generation.0.to_string(), "-link"].concat()
+}
+
+/// The argv sequence that re-activates `generation`, run in order.
+///
+/// ── ★ EVERY BINARY COMES FROM THE GENERATION BEING RESTORED ─────────────
+/// Not from `/run/current-system`: that is the generation that just failed
+/// its probation, and whatever broke it may be the very tool a rollback would
+/// call. The previous generation is the one known to have worked.
+///
+/// - **Darwin** — that generation's own `darwin-rebuild --switch-generation N`,
+///   which is `darwin-rebuild --rollback` pinned to an exact generation:
+///   `nix-env -p system --switch-generation N`, then `<gen>/activate` (with
+///   the legacy `activate-user` handling the script already carries). Exact
+///   rather than `--rollback`, which means "the generation before the current
+///   one" and would be wrong if anything else switched in between.
+/// - **NixOS** — what `nixos-rebuild switch --rollback` does, pinned the same
+///   way: `nix-env -p system --switch-generation N`, then that generation's
+///   `bin/switch-to-configuration switch`.
+fn rollback_argv(platform: ActivationPlatform, generation: Generation) -> Vec<Vec<String>> {
+    let link = generation_link(generation);
+    let n = generation.0.to_string();
+    match platform {
+        ActivationPlatform::Darwin => vec![vec![
+            [&link, "/sw/bin/darwin-rebuild"].concat(),
+            "--switch-generation".to_owned(),
+            n,
+        ]],
+        ActivationPlatform::Nixos => vec![
+            vec![
+                [&link, "/sw/bin/nix-env"].concat(),
+                "-p".to_owned(),
+                SYSTEM_PROFILE.to_owned(),
+                "--switch-generation".to_owned(),
+                n,
+            ],
+            vec![
+                [&link, "/bin/switch-to-configuration"].concat(),
+                "switch".to_owned(),
+            ],
+        ],
+    }
+}
+
+/// A failing probe's evidence: what it exited with, what was expected, and
+/// the tail of what it printed.
+fn probe_evidence(code: Option<i32>, expected: i32, tail: &str) -> String {
+    let status = match code {
+        Some(c) => ["exit ", &c.to_string()].concat(),
+        None => "killed by a signal".to_owned(),
+    };
+    let mut e = [&status, " (expected ", &expected.to_string(), ")"].concat();
+    if !tail.is_empty() {
+        e.push_str(": ");
+        e.push_str(tail);
+    }
+    e
 }
 
 // ── pure decision helpers (unit-tested; the impure methods wrap these) ──
@@ -1577,6 +1763,102 @@ mod tests {
             "the migrated file is authoritative once written; the legacy copy \
              is left on disk for the operator, never re-read over the new one"
         );
+    }
+
+    /// The rollback re-activates from the RESTORED generation's own tools,
+    /// pinned to its exact number — never `/run/current-system`, which is
+    /// the generation that just failed.
+    #[test]
+    fn rollback_argv_uses_the_restored_generations_own_tools() {
+        assert_eq!(
+            rollback_argv(ActivationPlatform::Darwin, Generation(1710)),
+            vec![vec![
+                "/nix/var/nix/profiles/system-1710-link/sw/bin/darwin-rebuild".to_owned(),
+                "--switch-generation".to_owned(),
+                "1710".to_owned(),
+            ]]
+        );
+        assert_eq!(
+            rollback_argv(ActivationPlatform::Nixos, Generation(88)),
+            vec![
+                vec![
+                    "/nix/var/nix/profiles/system-88-link/sw/bin/nix-env".to_owned(),
+                    "-p".to_owned(),
+                    "/nix/var/nix/profiles/system".to_owned(),
+                    "--switch-generation".to_owned(),
+                    "88".to_owned(),
+                ],
+                vec![
+                    "/nix/var/nix/profiles/system-88-link/bin/switch-to-configuration".to_owned(),
+                    "switch".to_owned(),
+                ],
+            ]
+        );
+        for argvs in [
+            rollback_argv(ActivationPlatform::Darwin, Generation(3)),
+            rollback_argv(ActivationPlatform::Nixos, Generation(3)),
+        ] {
+            for argv in argvs {
+                assert!(!argv[0].starts_with("/run/current-system"), "{argv:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_evidence_names_the_status_the_expectation_and_the_output() {
+        assert_eq!(
+            probe_evidence(Some(1), 0, "tailscaled not running"),
+            "exit 1 (expected 0): tailscaled not running"
+        );
+        assert_eq!(probe_evidence(None, 0, ""), "killed by a signal (expected 0)");
+    }
+
+    /// A real probe run: the verdict is the exit status against
+    /// `expect_exit`, the evidence carries the output, and a missing binary
+    /// is a FAILING probe rather than a skipped one.
+    #[test]
+    fn a_command_probe_judges_the_exit_status_and_keeps_the_output() {
+        let _fork_free = fork_free();
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        let probe = |argv: &[&str], expect_exit| HealthProbe {
+            name: "p".to_owned(),
+            check: ProbeCheck::Command {
+                argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                expect_exit,
+                timeout_seconds: 10,
+            },
+        };
+        assert_eq!(env.run_health_probe(&probe(&["/usr/bin/true"], 0)), Ok(()));
+        assert_eq!(env.run_health_probe(&probe(&["/usr/bin/false"], 1)), Ok(()), "expect_exit is honoured");
+        let e = env
+            .run_health_probe(&probe(&["/bin/sh", "-c", "echo no route to host; exit 3"], 0))
+            .unwrap_err();
+        assert!(e.starts_with("exit 3 (expected 0)"), "{e}");
+        assert!(e.contains("no route to host"), "the output tail is the evidence: {e}");
+        assert_eq!(
+            env.run_health_probe(&probe(&["/nonexistent/probe"], 0)),
+            Err("not found: /nonexistent/probe".to_owned())
+        );
+    }
+
+    /// The timeout is a hard bound, and a timed-out probe fails.
+    #[test]
+    fn a_probe_that_outlives_its_timeout_fails() {
+        let _fork_free = fork_free();
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        let started = std::time::Instant::now();
+        let r = env.run_health_probe(&HealthProbe {
+            name: "slow".to_owned(),
+            check: ProbeCheck::Command {
+                argv: vec!["/bin/sleep".to_owned(), "30".to_owned()],
+                expect_exit: 0,
+                timeout_seconds: 1,
+            },
+        });
+        assert!(r.is_err(), "a hung probe must not pass");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "and must not wedge the tick");
     }
 
     #[test]

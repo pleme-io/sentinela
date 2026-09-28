@@ -21,13 +21,16 @@
 
 mod env;
 mod fsm;
+mod probation;
 mod receipt;
 mod rev;
 
 pub use env::{BuildProgress, EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase, RebuildDriver};
 pub use fsm::{Sentinela, State, TickOutcome};
+pub use probation::{HealthProbe, ProbeCheck, ProbeFailure, Probation, RollbackPolicy};
 pub use receipt::{
-    ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, Outcome, ReceiptChain,
+    ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, MAX_ERROR_BYTES, Outcome,
+    ReceiptChain, bound_text,
 };
 pub use rev::{Rev, RevError};
 

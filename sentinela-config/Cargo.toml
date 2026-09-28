@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# The rollback probe list is an OPEN list: each entry is held as a JSON value
+# and parsed into the closed kind enum one at a time, so a malformed entry is
+# refused by name while its siblings load. Already a workspace dep (core).
+serde_json = { workspace = true }
 shikumi = "0.1.496"
 sentinela-core = { path = "../sentinela-core" }
 

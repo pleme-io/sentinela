@@ -49,6 +49,30 @@ pub enum Outcome {
     Failed { error: String },
     /// A newer HEAD landed mid-build; this rev was deferred, not activated.
     Deferred { newer: Rev },
+    /// The activation just recorded entered health probation — written
+    /// right after its [`Outcome::Activated`], only when rollback is enabled.
+    ///
+    /// Durable on purpose: probation must survive a daemon restart or a
+    /// reboot, which are exactly the moments a bad generation shows itself.
+    /// A restarted loop finds this at the chain head and resumes judging the
+    /// generation instead of forgetting it was ever on trial.
+    Probation {
+        generation: Generation,
+        previous_generation: Generation,
+        deadline_unix_ms: u64,
+    },
+    /// The probation passed its required consecutive rounds.
+    Verified { generation: Generation, passes: u32 },
+    /// The probation window closed on a failing round and the PREVIOUS system
+    /// generation was re-activated. The rev is quarantined: never re-attempted
+    /// while this is the newest receipt, i.e. until the loop records anything
+    /// about a different rev (see [`ReceiptChain::quarantined_rev`]).
+    RolledBack {
+        from: Generation,
+        to: Generation,
+        probe: String,
+        evidence: String,
+    },
 }
 
 impl Outcome {
@@ -61,9 +85,18 @@ impl Outcome {
     #[must_use]
     pub fn health(&self) -> Health {
         match self {
-            Self::Activated { .. } => Health::Converged,
+            // Probation and Verified are further facts about an activation
+            // that already happened, so they classify exactly as the
+            // `Activated` they follow: a stop point for every streak, and
+            // never a "built but unactivated" candidate for the fallback.
+            Self::Activated { .. } | Self::Probation { .. } | Self::Verified { .. } => {
+                Health::Converged
+            }
             Self::Deferred { .. } => Health::Benign,
-            Self::Failed { .. } => Health::Broken,
+            // The loop tried to converge on this rev and the machine did not
+            // survive it. A failure — the DEGRADED banner and the gate must
+            // both say this node is not tracking the branch.
+            Self::Failed { .. } | Self::RolledBack { .. } => Health::Broken,
         }
     }
 
@@ -84,35 +117,45 @@ impl Outcome {
     /// production path rather than making an oversized receipt impossible.
     #[must_use]
     pub fn failed(error: impl Into<String>) -> Self {
-        let e: String = error.into();
-        if e.len() <= MAX_ERROR_BYTES {
-            return Self::Failed { error: e };
+        Self::Failed {
+            error: bound_text(error.into()),
         }
-
-        // A quarter for context, the rest for the diagnosis. The tail gets the
-        // larger share deliberately: the head is usually preamble.
-        let head_budget = MAX_ERROR_BYTES / 4;
-        let tail_budget = MAX_ERROR_BYTES - head_budget;
-
-        // `floor_char_boundary` / `ceil_char_boundary` are still unstable, so
-        // walk to a boundary by hand rather than risk a panic on a multi-byte
-        // split.
-        let mut head_end = head_budget;
-        while head_end > 0 && !e.is_char_boundary(head_end) {
-            head_end -= 1;
-        }
-        let mut tail_start = e.len() - tail_budget;
-        while tail_start < e.len() && !e.is_char_boundary(tail_start) {
-            tail_start += 1;
-        }
-
-        let elided = tail_start.saturating_sub(head_end);
-        let mut out = String::with_capacity(MAX_ERROR_BYTES + 48);
-        out.push_str(&e[..head_end]);
-        out.push_str(&format!("\n… [{elided} bytes elided] …\n"));
-        out.push_str(&e[tail_start..]);
-        Self::Failed { error: out }
     }
+}
+
+/// Bound `e` to [`MAX_ERROR_BYTES`], keeping both ends — the one cut every
+/// text that lands in the append-only chain goes through (a failed build's
+/// error, a failed probe's evidence). See [`Outcome::failed`] for why both
+/// ends, and why the tail gets the larger share.
+#[must_use]
+pub fn bound_text(e: String) -> String {
+    if e.len() <= MAX_ERROR_BYTES {
+        return e;
+    }
+
+    // A quarter for context, the rest for the diagnosis. The tail gets the
+    // larger share deliberately: the head is usually preamble.
+    let head_budget = MAX_ERROR_BYTES / 4;
+    let tail_budget = MAX_ERROR_BYTES - head_budget;
+
+    // `floor_char_boundary` / `ceil_char_boundary` are still unstable, so
+    // walk to a boundary by hand rather than risk a panic on a multi-byte
+    // split.
+    let mut head_end = head_budget;
+    while head_end > 0 && !e.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = e.len() - tail_budget;
+    while tail_start < e.len() && !e.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let elided = tail_start.saturating_sub(head_end);
+    let mut out = String::with_capacity(MAX_ERROR_BYTES + 48);
+    out.push_str(&e[..head_end]);
+    out.push_str(&format!("\n… [{elided} bytes elided] …\n"));
+    out.push_str(&e[tail_start..]);
+    out
 }
 
 /// One entry in the deploy chain.
@@ -226,13 +269,75 @@ impl ReceiptChain {
     /// The most recent *cleanly-activated* rev — the one to compare HEAD
     /// against for `skip-if-unchanged`. A failed/deferred receipt does
     /// not count as deployed.
+    ///
+    /// ── ★ A ROLLED-BACK ACTIVATION IS NOT WHAT THE NODE RUNS ─────────────
+    /// A [`Outcome::RolledBack`] receipt undoes the `Activated` receipt for
+    /// the same rev before it: the system profile is back on the previous
+    /// generation, so the rev the node runs is the activation BEFORE that one.
+    /// Reporting the rolled-back rev here would print it as "deployed" in
+    /// `status` and make every forward-for-this-node ancestry check start from
+    /// a rev the machine is not running. A chain with no rollback receipt —
+    /// every chain written with rollback disabled — answers exactly as before.
     #[must_use]
     pub fn last_activated_rev(&self) -> Option<&Rev> {
+        // Revs whose newest activation was rolled back and not yet passed.
+        let mut undone: Vec<&Rev> = Vec::new();
+        for r in self.entries.iter().rev() {
+            match &r.outcome {
+                Outcome::RolledBack { .. } => undone.push(&r.rev),
+                Outcome::Activated { .. } => match undone.iter().position(|u| *u == &r.rev) {
+                    Some(i) => {
+                        undone.swap_remove(i);
+                    }
+                    None => return Some(&r.rev),
+                },
+                // Exhaustive, no `_`: a new outcome must decide whether it
+                // changes what the node runs.
+                Outcome::Failed { .. }
+                | Outcome::Deferred { .. }
+                | Outcome::Probation { .. }
+                | Outcome::Verified { .. } => {}
+            }
+        }
+        None
+    }
+
+    /// The rev a health-gated rollback quarantined, while the quarantine
+    /// holds: the rev of the NEWEST receipt when that receipt is a
+    /// [`Outcome::RolledBack`].
+    ///
+    /// ── ★ "UNTIL HEAD MOVES", AS THE CHAIN CAN SEE IT ─────────────────────
+    /// A quarantined HEAD writes no receipt (refusing it every poll would
+    /// grow the chain by one entry a minute, forever — the 31 MB lesson), so
+    /// the rollback stays the newest receipt for exactly as long as HEAD sits
+    /// on the bad rev. The first receipt about ANY other rev — a build, a
+    /// deferral, a deploy — means HEAD moved, and lifts it.
+    ///
+    /// Honest residual: if HEAD moves to the rev the node already runs (a
+    /// revert that resets the branch to it), that tick is `Unchanged` and
+    /// writes nothing, so a later return to the bad rev is still refused.
+    /// That is the conservative direction — the rev did break this machine.
+    #[must_use]
+    pub fn quarantined_rev(&self) -> Option<&Rev> {
+        let head = self.head()?;
+        match head.outcome {
+            Outcome::RolledBack { .. } => Some(&head.rev),
+            Outcome::Activated { .. }
+            | Outcome::Failed { .. }
+            | Outcome::Deferred { .. }
+            | Outcome::Probation { .. }
+            | Outcome::Verified { .. } => None,
+        }
+    }
+
+    /// The newest rollback receipt anywhere in the chain — what `status`
+    /// shows as the last rollback.
+    #[must_use]
+    pub fn last_rollback(&self) -> Option<&DeployReceipt> {
         self.entries
             .iter()
             .rev()
-            .find(|r| r.is_activated())
-            .map(|r| &r.rev)
+            .find(|r| matches!(r.outcome, Outcome::RolledBack { .. }))
     }
 
     /// The newest rev we BUILT successfully but did not activate, searching
@@ -649,6 +754,74 @@ mod tests {
         );
         assert_eq!(Outcome::Deferred { newer: rev(2) }.health(), Health::Benign);
         assert_eq!(Outcome::failed("boom").health(), Health::Broken);
+        // The probation family: facts about an activation classify as the
+        // activation; a rollback is a failure to converge.
+        assert_eq!(
+            Outcome::Probation {
+                generation: Generation(2),
+                previous_generation: Generation(1),
+                deadline_unix_ms: 9
+            }
+            .health(),
+            Health::Converged
+        );
+        assert_eq!(
+            Outcome::Verified {
+                generation: Generation(2),
+                passes: 2
+            }
+            .health(),
+            Health::Converged
+        );
+        assert_eq!(rolled_back().health(), Health::Broken);
+    }
+
+    fn rolled_back() -> Outcome {
+        Outcome::RolledBack {
+            from: Generation(2),
+            to: Generation(1),
+            probe: "tailscale".into(),
+            evidence: "exit 1".into(),
+        }
+    }
+
+    fn activated(g: u64) -> Outcome {
+        Outcome::Activated {
+            generation: Generation(g),
+        }
+    }
+
+    /// A rollback undoes the activation it follows: the node runs the rev
+    /// activated BEFORE it, and `status` must say so rather than print the
+    /// rolled-back rev as deployed.
+    #[test]
+    fn a_rolled_back_activation_is_not_what_the_node_runs() {
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(rev(1), activated(1), 1)).unwrap();
+        c.append(c.next_receipt(rev(2), activated(2), 2)).unwrap();
+        c.append(c.next_receipt(
+            rev(2),
+            Outcome::Probation {
+                generation: Generation(2),
+                previous_generation: Generation(1),
+                deadline_unix_ms: 9,
+            },
+            3,
+        ))
+        .unwrap();
+        assert_eq!(c.last_activated_rev(), Some(&rev(2)), "on trial, still running");
+        c.append(c.next_receipt(rev(2), rolled_back(), 4)).unwrap();
+        assert_eq!(c.last_activated_rev(), Some(&rev(1)), "back on the previous rev");
+        assert_eq!(c.quarantined_rev(), Some(&rev(2)));
+        assert_eq!(c.consecutive_failures(), 1, "a rollback is a failure to converge");
+        // HEAD moves: any receipt about another rev lifts the quarantine.
+        c.append(c.next_receipt(rev(3), Outcome::failed("red"), 5))
+            .unwrap();
+        assert_eq!(c.quarantined_rev(), None);
+        // A later re-activation of the same rev counts again.
+        c.append(c.next_receipt(rev(2), activated(3), 6)).unwrap();
+        assert_eq!(c.last_activated_rev(), Some(&rev(2)));
+        c.verify().unwrap();
     }
 
     #[test]
