@@ -949,7 +949,29 @@ impl Sentinela {
                     rev: rev.clone(),
                     error: e.to_string(),
                 };
-                let _ = self.record(&mut chain, env, rev, Outcome::failed(e.to_string()));
+                let _ = self.record(&mut chain, env, rev.clone(), Outcome::failed(e.to_string()));
+                // ── ★ A FAILED SWITCH MAY HAVE MOVED THE MACHINE ─────────────
+                // `switch-to-configuration` exits non-zero when a unit fails to
+                // start, AFTER the new generation is active. Then "failed" means
+                // the machine runs the broken generation, and a cooldown only
+                // retries the same rev on it. With rollback on, judge what is
+                // running exactly as after a clean switch: a probation from the
+                // generation read before the switch.
+                if let (Some(prev), Some(now)) = (
+                    previous,
+                    self.rollback.as_ref().and_then(|_| env.current_generation()),
+                ) && now != prev
+                {
+                    tracing::warn!(
+                        rev = rev.short(),
+                        generation = %now,
+                        "switch failed, but the machine moved to a new generation — judging it"
+                    );
+                    self.begin_probation(&mut chain, env, &rev, now, Some(prev));
+                    if matches!(self.state, State::Verifying(_)) {
+                        return out;
+                    }
+                }
                 self.enter_cooldown(env, out)
             }
         }
@@ -2388,6 +2410,53 @@ mod tests {
                 Outcome::RolledBack { .. } => "rolledBack",
             })
             .collect()
+    }
+
+    /// A switch that FAILED after the machine moved to the new generation is
+    /// judged like a clean one. `switch-to-configuration` exits non-zero when
+    /// a unit fails to start, AFTER the new generation is active, so "switch
+    /// failed" can mean "the machine now runs the broken generation" — the
+    /// case a rollback exists for, and the one a cooldown-and-retry never
+    /// leaves.
+    #[test]
+    fn a_failed_switch_that_moved_the_machine_is_judged_and_rolled_back() {
+        let env = node_on_rev1();
+        env.set_switch_result(Err(EnvError::SwitchFailed(
+            "engenho-daemon.service failed to start".to_owned(),
+        )));
+        env.set_switch_moves_on_error(Some(Generation(42)));
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+        let mut s = guarded();
+        assert!(matches!(s.tick(&env), TickOutcome::SwitchFailed { .. }));
+        let State::Verifying(p) = s.state().clone() else {
+            panic!("a failed switch that moved the machine must enter probation, got {:?}", s.state());
+        };
+        assert_eq!((p.generation, p.previous_generation), (Generation(42), Generation(41)));
+
+        env.push_probe_result(Err("http home-assistant: no answer".to_owned()));
+        env.set_now_ms(p.deadline_unix_ms + 1);
+        assert!(matches!(
+            s.tick(&env),
+            TickOutcome::RolledBack { to: Generation(41), .. }
+        ));
+        assert_eq!(env.rollbacks.borrow().as_slice(), &[Generation(41)]);
+        assert_eq!(env.chain().quarantined_rev(), Some(&rev(2)));
+        assert_eq!(env.chain().last_activated_rev(), Some(&rev(1)));
+    }
+
+    /// A failed switch that left the machine where it was opens nothing: the
+    /// previous generation still runs, and there is nothing to roll back.
+    #[test]
+    fn a_failed_switch_that_left_the_machine_alone_cools_down_as_before() {
+        let env = node_on_rev1();
+        env.set_switch_result(Err(EnvError::SwitchFailed("eval error".to_owned())));
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+        let mut s = guarded();
+        assert!(matches!(s.tick(&env), TickOutcome::SwitchFailed { .. }));
+        assert!(matches!(s.state(), State::CoolingDown { .. }), "{:?}", s.state());
+        assert!(env.probe_runs.borrow().is_empty());
     }
 
     /// PATH 1 — probes pass, so the activation converges. Two consecutive

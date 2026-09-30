@@ -59,6 +59,14 @@ enum Cmd {
     Probe,
     /// Run exactly one cycle and print the typed outcome, then exit.
     TickOnce,
+    /// Re-activate a system generation exactly the way a failed probation
+    /// does (same lock, same steps, same running-closure check), then exit:
+    /// the operator's hand on the loop's own rollback, and what the VM twin
+    /// drives to prove it.
+    RollbackTo {
+        /// The generation number (`/nix/var/nix/profiles/system-<N>-link`).
+        generation: u64,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -84,6 +92,22 @@ fn main() -> std::process::ExitCode {
         Cmd::Verify => verify(&cfg),
         Cmd::Probe => probe(&cfg),
         Cmd::TickOnce => tick_once(&cfg),
+        Cmd::RollbackTo { generation } => rollback_to(&cfg, generation),
+    }
+}
+
+/// Re-activate `generation` through the loop's own rollback path.
+fn rollback_to(cfg: &SentinelaConfig, generation: u64) -> std::process::ExitCode {
+    let env = RealEnv::new(cfg.clone());
+    match env.rollback_to(sentinela_core::Generation(generation)) {
+        Ok(g) => {
+            println!("running generation {g}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, generation, "rollback failed");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

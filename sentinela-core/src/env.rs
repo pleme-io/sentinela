@@ -472,6 +472,12 @@ mod mock {
         rollback_result: RefCell<Result<(), EnvError>>,
         /// Every rollback target, in order.
         pub rollbacks: RefCell<Vec<Generation>>,
+        /// Where a FAILED switch leaves the system profile: `None` (the
+        /// default) leaves it alone; `Some(g)` models a switch that moved the
+        /// machine to `g` and then reported failure (a unit that did not
+        /// start makes `switch-to-configuration` exit non-zero AFTER the new
+        /// generation is active).
+        switch_moves_on_error: RefCell<Option<Generation>>,
     }
 
     impl Default for MockEnv {
@@ -498,6 +504,7 @@ mod mock {
                 probe_runs: RefCell::new(Vec::new()),
                 rollback_result: RefCell::new(Ok(())),
                 rollbacks: RefCell::new(Vec::new()),
+                switch_moves_on_error: RefCell::new(None),
             }
         }
     }
@@ -572,6 +579,11 @@ mod mock {
             self.probe_results.borrow_mut().push_back(r);
         }
 
+        /// Make a failed switch leave the machine on `g` (see the field).
+        pub fn set_switch_moves_on_error(&self, g: Option<Generation>) {
+            *self.switch_moves_on_error.borrow_mut() = g;
+        }
+
         /// Program the outcome of subsequent `rollback_to` calls.
         pub fn set_rollback_result(&self, r: Result<(), EnvError>) {
             *self.rollback_result.borrow_mut() = r;
@@ -599,8 +611,13 @@ mod mock {
             self.switches.borrow_mut().push(rev.clone());
             let r = self.switch_result.borrow().clone();
             // A switch that landed moves the profile, as the real one does.
-            if let Ok(g) = r {
-                *self.generation.borrow_mut() = Some(g);
+            match r {
+                Ok(g) => *self.generation.borrow_mut() = Some(g),
+                Err(_) => {
+                    if let Some(g) = *self.switch_moves_on_error.borrow() {
+                        *self.generation.borrow_mut() = Some(g);
+                    }
+                }
             }
             r
         }
