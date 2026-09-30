@@ -27,6 +27,8 @@ use url::Url;
 
 /// The nix system profile whose generation number a switch advances.
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+/// The closure the machine is running (NixOS and nix-darwin both keep it).
+const RUNNING_SYSTEM: &str = "/run/current-system";
 
 /// How much of a failing probe's output survives into its evidence. A probe
 /// runs every round of a probation, and its evidence lands in the heartbeat
@@ -856,12 +858,13 @@ impl GitopsEnv for RealEnv {
                 [&link, " no longer exists — was it garbage-collected?"].concat(),
             ));
         }
-        for argv in rollback_argv(ActivationPlatform::current(), generation) {
-            let Some((program, args)) = argv.split_first() else {
+        for step in rollback_steps(ActivationPlatform::current(), generation) {
+            let Some((program, args)) = step.argv.split_first() else {
                 continue;
             };
             let mut cmd = Command::new(program);
             cmd.args(args);
+            cmd.envs(step.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             self.anchor_activation(&mut cmd);
             let capture = self.rebuild_capture_path("rollback");
             let (timeout, on_timeout) = self.activation_bound();
@@ -876,7 +879,21 @@ impl GitopsEnv for RealEnv {
                 ));
             }
         }
-        Ok(current_generation().unwrap_or(Generation(0)))
+        // Every step exiting 0 is not the proof; the machine running the
+        // restored generation is.
+        match current_generation() {
+            Some(g) if g == generation => Ok(g),
+            found => Err(EnvError::RollbackFailed(
+                [
+                    "the rollback steps succeeded, but generation ",
+                    &generation.to_string(),
+                    " is not running (found: ",
+                    &found.map_or_else(|| "none".to_owned(), |g| g.to_string()),
+                    ")",
+                ]
+                .concat(),
+            )),
+        }
     }
 }
 
@@ -920,29 +937,71 @@ fn generation_link(generation: Generation) -> String {
 /// - **NixOS** — what `nixos-rebuild switch --rollback` does, pinned the same
 ///   way: `nix-env -p system --switch-generation N`, then that generation's
 ///   `bin/switch-to-configuration switch`.
-fn rollback_argv(platform: ActivationPlatform, generation: Generation) -> Vec<Vec<String>> {
+fn rollback_steps(platform: ActivationPlatform, generation: Generation) -> Vec<RollbackStep> {
     let link = generation_link(generation);
     let n = generation.0.to_string();
+    let step = |argv: Vec<String>| RollbackStep { argv, env: Vec::new() };
     match platform {
-        ActivationPlatform::Darwin => vec![vec![
+        ActivationPlatform::Darwin => vec![step(vec![
             [&link, "/sw/bin/darwin-rebuild"].concat(),
             "--switch-generation".to_owned(),
             n,
-        ]],
+        ])],
         ActivationPlatform::Nixos => vec![
-            vec![
+            step(vec![
                 [&link, "/sw/bin/nix-env"].concat(),
                 "-p".to_owned(),
                 SYSTEM_PROFILE.to_owned(),
                 "--switch-generation".to_owned(),
                 n,
-            ],
-            vec![
-                [&link, "/bin/switch-to-configuration"].concat(),
-                "switch".to_owned(),
-            ],
+            ]),
+            // ★ NIXOS_NO_CHECK=1: skip `system.preSwitchChecks` for this
+            // activation only. The generation being restored already ran here
+            // and passed its checks on the way in; a check that guards FORWARD
+            // moves (plo's engenho restart gate holds any switch that changes
+            // engenho-daemon's unit) would otherwise refuse the one switch that
+            // undoes a bad engenho bump, leaving the node on the broken
+            // generation in `rollbackFailed`.
+            RollbackStep {
+                argv: vec![
+                    [&link, "/bin/switch-to-configuration"].concat(),
+                    "switch".to_owned(),
+                ],
+                env: vec![("NIXOS_NO_CHECK".to_owned(), "1".to_owned())],
+            },
         ],
     }
+}
+
+/// One subprocess of a rollback: its argv and the environment it adds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RollbackStep {
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// The generation whose closure RUNS: the profile's own generation when its
+/// closure is the running one, else the newest generation that holds the
+/// running closure, else `None` (a closure no generation holds is not
+/// reported as one).
+///
+/// `target_of` resolves a generation link to its store path; `running` is
+/// `/run/current-system` resolved the same way. Pure so the failed-rollback
+/// case (profile flipped, activation failed) is provable without a machine.
+fn running_generation(
+    profile: Generation,
+    running: &str,
+    target_of: impl Fn(Generation) -> Option<String>,
+    generations: &[Generation],
+) -> Option<Generation> {
+    if target_of(profile).as_deref() == Some(running) {
+        return Some(profile);
+    }
+    generations
+        .iter()
+        .copied()
+        .filter(|g| target_of(*g).as_deref() == Some(running))
+        .max_by_key(|g| g.0)
 }
 
 /// A failing probe's evidence: what it exited with, what was expected, and
@@ -1141,7 +1200,34 @@ fn parse_generation(link_name: &str) -> Option<Generation> {
 fn current_generation() -> Option<Generation> {
     let target = std::fs::read_link(SYSTEM_PROFILE).ok()?;
     let name = target.file_name()?.to_str()?;
-    parse_generation(name)
+    let profile = parse_generation(name)?;
+    match ActivationPlatform::current() {
+        ActivationPlatform::Darwin => Some(profile),
+        // ── ★ ON NIXOS, THE GENERATION THAT RUNS, NOT THE ONE THE PROFILE
+        // NAMES. A rollback flips the profile before it activates, so after a
+        // failed activation the profile names the previous generation while
+        // the bad closure still runs; read from the profile, the next round
+        // would attest a rollback that never happened.
+        ActivationPlatform::Nixos => {
+            let canon = |p: &str| {
+                std::fs::canonicalize(p)
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned())
+            };
+            let running = canon(RUNNING_SYSTEM)?;
+            let dir = Path::new(SYSTEM_PROFILE).parent()?;
+            let generations: Vec<Generation> = std::fs::read_dir(dir)
+                .ok()?
+                .filter_map(|e| e.ok()?.file_name().to_str().and_then(parse_generation))
+                .collect();
+            running_generation(
+                profile,
+                &running,
+                |g| canon(&generation_link(g)),
+                &generations,
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1769,9 +1855,12 @@ mod tests {
     /// pinned to its exact number — never `/run/current-system`, which is
     /// the generation that just failed.
     #[test]
-    fn rollback_argv_uses_the_restored_generations_own_tools() {
+    fn rollback_steps_use_the_restored_generations_own_tools() {
+        let argvs = |p, g| -> Vec<Vec<String>> {
+            rollback_steps(p, g).into_iter().map(|s| s.argv).collect()
+        };
         assert_eq!(
-            rollback_argv(ActivationPlatform::Darwin, Generation(1710)),
+            argvs(ActivationPlatform::Darwin, Generation(1710)),
             vec![vec![
                 "/nix/var/nix/profiles/system-1710-link/sw/bin/darwin-rebuild".to_owned(),
                 "--switch-generation".to_owned(),
@@ -1779,7 +1868,7 @@ mod tests {
             ]]
         );
         assert_eq!(
-            rollback_argv(ActivationPlatform::Nixos, Generation(88)),
+            argvs(ActivationPlatform::Nixos, Generation(88)),
             vec![
                 vec![
                     "/nix/var/nix/profiles/system-88-link/sw/bin/nix-env".to_owned(),
@@ -1795,13 +1884,71 @@ mod tests {
             ]
         );
         for argvs in [
-            rollback_argv(ActivationPlatform::Darwin, Generation(3)),
-            rollback_argv(ActivationPlatform::Nixos, Generation(3)),
+            argvs(ActivationPlatform::Darwin, Generation(3)),
+            argvs(ActivationPlatform::Nixos, Generation(3)),
         ] {
             for argv in argvs {
                 assert!(!argv[0].starts_with("/run/current-system"), "{argv:?}");
             }
         }
+    }
+
+    /// A NixOS rollback's activation skips the pre-switch checks.
+    ///
+    /// Measured on plo, 2026-09-30: `system.preSwitchChecks` carries an
+    /// engenho restart gate that HOLDS any switch changing engenho-daemon's
+    /// unit. A rollback out of a bad engenho bump changes that unit back, so
+    /// the gate would refuse the one switch that restores the house, and the
+    /// loop would sit in `rollbackFailed` on the broken generation. The
+    /// generation being restored already ran on this machine; its checks
+    /// guarded the forward move that installed it.
+    #[test]
+    fn a_nixos_rollback_skips_the_pre_switch_checks_and_only_that_step() {
+        let steps = rollback_steps(ActivationPlatform::Nixos, Generation(88));
+        let activation = steps.last().expect("an activation step");
+        assert_eq!(
+            activation.env,
+            vec![("NIXOS_NO_CHECK".to_owned(), "1".to_owned())],
+            "the switch-to-configuration step must carry NIXOS_NO_CHECK=1"
+        );
+        assert!(steps[0].env.is_empty(), "the profile flip needs no override");
+        for s in rollback_steps(ActivationPlatform::Darwin, Generation(3)) {
+            assert!(s.env.is_empty(), "darwin has no pre-switch checks: {s:?}");
+        }
+    }
+
+    /// Which generation RUNS, not which one the profile names.
+    ///
+    /// A rollback flips the profile first and activates second. When the
+    /// activation fails, the profile already names the previous generation
+    /// while the machine still runs the bad one — and a profile-only read then
+    /// attests a rollback that never happened.
+    #[test]
+    fn the_running_generation_is_the_one_whose_closure_runs() {
+        let links = |g: Generation| match g.0 {
+            87 => Some("/nix/store/aaa-system".to_owned()),
+            88 => Some("/nix/store/bbb-system".to_owned()),
+            89 => Some("/nix/store/ccc-system".to_owned()),
+            _ => None,
+        };
+        let all = [Generation(87), Generation(88), Generation(89)];
+        // The normal case: the profile's generation is what runs.
+        assert_eq!(
+            running_generation(Generation(89), "/nix/store/ccc-system", links, &all),
+            Some(Generation(89))
+        );
+        // The failed-rollback case: the profile says 88, 89 still runs.
+        assert_eq!(
+            running_generation(Generation(88), "/nix/store/ccc-system", links, &all),
+            Some(Generation(89)),
+            "a profile flipped ahead of a failed activation must not read as rolled back"
+        );
+        // A closure no generation holds (`switch-to-configuration test` of an
+        // unregistered build): not measured, so not reported.
+        assert_eq!(
+            running_generation(Generation(89), "/nix/store/zzz-system", links, &all),
+            None
+        );
     }
 
     #[test]

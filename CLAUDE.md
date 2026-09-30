@@ -52,6 +52,14 @@ Not the no-downgrade rule: that is about git history, this about the system
 profile. Code: `sentinela-core/src/probation.rs` + the probation methods in
 `fsm.rs`.
 
+On NixOS the rollback's `switch-to-configuration` runs with `NIXOS_NO_CHECK=1`
+(a pre-switch gate that holds forward moves, like plo's engenho restart gate,
+must not hold the switch that undoes one), and "which generation" means the one
+whose closure RUNS (`/run/current-system`), not the one the profile names: a
+rollback flips the profile before it activates, so a failed activation must not
+read as rolled back. `rollback_to` returns Ok only once the restored generation
+is running (`real_env::rollback_steps`, `real_env::running_generation`).
+
 ## ★ P5 — why the rebuild is still a subprocess (measured 2026-08-05)
 
 Doctrine P5 (`theory/RECONCILER-LIVENESS.md` §IV.3) wants this daemon off
