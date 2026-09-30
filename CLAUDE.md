@@ -60,6 +60,16 @@ rollback flips the profile before it activates, so a failed activation must not
 read as rolled back. `rollback_to` returns Ok only once the restored generation
 is running (`real_env::rollback_steps`, `real_env::running_generation`).
 
+## A new config is loaded by exiting between ticks
+
+The service manager never restarts this daemon on activation (it performs the
+activation), so `run` compares its config path's resolved target after every
+tick and exits 0 when it moved; systemd `Restart=always` / launchd `KeepAlive`
+start the new generation's daemon, and an open probation resumes from its
+receipt. On nix-managed nodes the resolved target is a store path, so a nix
+renderer that wants a BINARY bump to restart the daemon too makes the config
+file's store path depend on the package (`main::config_moved`).
+
 ## ★ P5 — why the rebuild is still a subprocess (measured 2026-08-05)
 
 Doctrine P5 (`theory/RECONCILER-LIVENESS.md` §IV.3) wants this daemon off

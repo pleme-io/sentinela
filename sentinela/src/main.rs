@@ -79,7 +79,7 @@ fn main() -> std::process::ExitCode {
     };
 
     match cli.command {
-        Cmd::Run => run(cfg),
+        Cmd::Run => run(cfg, &cli.config),
         Cmd::Status { gate, json } => status(&cfg, gate, json),
         Cmd::Verify => verify(&cfg),
         Cmd::Probe => probe(&cfg),
@@ -230,7 +230,7 @@ fn flake_ref_failure(cfg: &SentinelaConfig) -> Option<PreflightFailure> {
 }
 
 /// The daemon loop: one cycle, then sleep `poll_seconds`, forever.
-fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
+fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::ExitCode {
     // ── ★ PREFLIGHT BEFORE THE LOOP, AND EXIT IF IT FAILS ────────────────
     // See `missing_tools`. Exiting non-zero is what makes the fault reach an
     // operator: the unit lands in `activating (auto-restart)` and then, once
@@ -302,6 +302,10 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
     let mut prev = health(&env);
     log_health(&prev);
 
+    // The config document as loaded, resolved to what it points at (a store
+    // path on nix-managed nodes, so it names the content).
+    let loaded_config = std::fs::canonicalize(config_path).ok();
+
     // ── ★ AND RE-ASK IT EVERY TICK ────────────────────────────────────────
     // The announcement above answers "is this loop working?" exactly once,
     // at startup, because it sits before `loop`. That was the whole defect
@@ -333,11 +337,38 @@ fn run(cfg: SentinelaConfig) -> std::process::ExitCode {
         }
         prev = now;
 
+        // ── ★ A NEW CONFIG IS LOADED BY RESTARTING, AT A TICK BOUNDARY ───
+        // The unit is deliberately NOT restarted by activation (it performs
+        // the activation), so without this a switch that changes this
+        // daemon's own config or binary never reaches it: the process keeps
+        // what it started with until something else restarts it. Enabling
+        // health-gated rollback in nix therefore protected nothing until an
+        // unrelated restart. Exiting here, between ticks, lets the service
+        // manager start the new generation's daemon; an open probation is
+        // resumed from its receipt by the next process.
+        if config_moved(
+            loaded_config.as_deref(),
+            std::fs::canonicalize(config_path).ok().as_deref(),
+        ) {
+            tracing::info!(
+                config = %config_path.display(),
+                "sentinela: config changed — exiting so the service manager starts the new one"
+            );
+            return std::process::ExitCode::SUCCESS;
+        }
+
         // The loop's `next_delay`, not the outcome's: while an activation is
         // on probation the policy's probe interval rules, and only the loop
         // knows it is on probation.
         std::thread::sleep(sentinela.next_delay(&outcome));
     }
+}
+
+/// Whether the config this process loaded is no longer the node's config.
+/// An unreadable path on either side is not a change: a switch replaces
+/// `/etc` links in place, and a momentary miss must not restart the loop.
+fn config_moved(loaded: Option<&std::path::Path>, now: Option<&std::path::Path>) -> bool {
+    matches!((loaded, now), (Some(a), Some(b)) if a != b)
 }
 
 /// Say what the `rollback:` section resolved to — once, at startup, and
@@ -778,6 +809,27 @@ fn tick_once(cfg: &SentinelaConfig) -> std::process::ExitCode {
         tracing::info!("entered cooldown after a failure");
     }
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod config_reload_tests {
+    use super::config_moved;
+    use std::path::Path;
+
+    #[test]
+    fn a_different_resolved_config_is_a_change() {
+        let a = Path::new("/nix/store/aaa-pleme-gitops-config.yaml");
+        let b = Path::new("/nix/store/bbb-pleme-gitops-config.yaml");
+        assert!(config_moved(Some(a), Some(b)));
+        assert!(!config_moved(Some(a), Some(a)));
+    }
+
+    #[test]
+    fn an_unreadable_path_is_not_a_change() {
+        let a = Path::new("/nix/store/aaa-pleme-gitops-config.yaml");
+        assert!(!config_moved(Some(a), None), "a momentary miss mid-switch");
+        assert!(!config_moved(None, Some(a)), "nothing resolved at startup");
+    }
 }
 
 #[cfg(test)]
