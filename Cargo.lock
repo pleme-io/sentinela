@@ -4708,7 +4708,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentinela"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "clap",
  "fs4",
@@ -4730,7 +4730,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-config"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "sentinela-core",
  "serde",
@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "sentinela-core"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "blake3",
  "serde",
