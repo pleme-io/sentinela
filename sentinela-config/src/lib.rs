@@ -334,6 +334,50 @@ pub struct SentinelaConfig {
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
+    /// Which revision may be deployed: `head` (both tiers; today's
+    /// behaviour) or `{green: {required: [...]}}`.
+    pub revision_policy: RevisionPolicyConfig,
+}
+
+/// The `revision_policy:` section. See [`sentinela_core::RevisionPolicy`].
+///
+/// ```yaml
+/// revision_policy: { kind: head }          # the default; same as omitting it
+/// revision_policy:
+///   kind: green
+///   required: [promotion-gate]   # check-run names / status contexts
+///   recheck_seconds: 300         # pending/blind answers are re-asked after this
+///   max_candidates: 50           # how far back from HEAD to look
+/// ```
+///
+/// Internally tagged (`kind:`) because the document is also rendered as JSON
+/// by the nix module, and serde_yaml reads an externally tagged enum only
+/// from a YAML `!tag`, which JSON cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RevisionPolicyConfig {
+    /// Branch HEAD.
+    #[default]
+    Head,
+    /// The newest revision whose required checks all passed.
+    Green {
+        /// The check-run names / status contexts that must all conclude success.
+        required: Vec<String>,
+        /// Seconds a pending or blind answer stands before it is asked again.
+        #[serde(default = "default_green_recheck_seconds")]
+        recheck_seconds: u64,
+        /// How far back from HEAD to look for a green revision.
+        #[serde(default = "default_green_max_candidates")]
+        max_candidates: usize,
+    },
+}
+
+fn default_green_recheck_seconds() -> u64 {
+    300
+}
+
+fn default_green_max_candidates() -> usize {
+    50
 }
 
 /// Default probation window, seconds.
@@ -609,6 +653,34 @@ impl SentinelaConfig {
             .plan(&|p: &str| std::path::Path::new(p).exists())
     }
 
+    /// The revision policy, or why it is refused. A `green` policy that
+    /// requires nothing would call every commit green, so it is refused
+    /// (the daemon then refuses to start) rather than run vacuously.
+    ///
+    /// # Errors
+    /// A message naming the refusal.
+    pub fn revision_policy(&self) -> Result<sentinela_core::RevisionPolicy, String> {
+        match &self.revision_policy {
+            RevisionPolicyConfig::Head => Ok(sentinela_core::RevisionPolicy::Head),
+            RevisionPolicyConfig::Green { required, .. }
+                if required.iter().all(|r| r.trim().is_empty()) =>
+            {
+                Err("revision_policy (green): `required` is empty, so every commit would read as green".to_owned())
+            }
+            RevisionPolicyConfig::Green {
+                required,
+                recheck_seconds,
+                max_candidates,
+            } => Ok(sentinela_core::RevisionPolicy::Green(
+                sentinela_core::GreenPolicy {
+                    required: required.clone(),
+                    recheck_ms: recheck_seconds.max(&1).saturating_mul(1000),
+                    max_candidates: *max_candidates.max(&1),
+                },
+            )),
+        }
+    }
+
     /// The [`sentinela_core::LoopConfig`] derived from this surface.
     #[must_use]
     pub fn loop_config(&self) -> sentinela_core::LoopConfig {
@@ -671,6 +743,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
                 required_consecutive_passes: 0,
                 probes: Vec::new(),
             },
+            revision_policy: RevisionPolicyConfig::Head,
         }
     }
 
@@ -694,6 +767,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
+            // HEAD: today's behaviour. A node opts into `green`.
+            revision_policy: RevisionPolicyConfig::Head,
         }
     }
 }
@@ -720,6 +795,36 @@ mod tests {
         // Node-specific coordinates are intentionally empty (module fills).
         assert!(p.flake_url.is_empty());
         assert!(p.hostname.is_empty());
+    }
+
+    #[test]
+    fn revision_policy_defaults_to_head_and_reads_green() {
+        let head: SentinelaConfig = serde_yaml::from_str("hostname: plo").unwrap();
+        assert_eq!(head.revision_policy(), Ok(sentinela_core::RevisionPolicy::Head));
+        let green: SentinelaConfig =
+            serde_yaml::from_str("revision_policy:\n  kind: green\n  required: [promotion-gate]\n").unwrap();
+        match green.revision_policy() {
+            Ok(sentinela_core::RevisionPolicy::Green(g)) => {
+                assert_eq!(g.required, vec!["promotion-gate".to_owned()]);
+                assert_eq!(g.recheck_ms, 300_000);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_green_policy_requiring_nothing_is_refused() {
+        let c: SentinelaConfig =
+            serde_yaml::from_str("revision_policy:\n  kind: green\n  required: []\n").unwrap();
+        assert!(c.revision_policy().is_err());
+        // And as the nix module renders it: JSON.
+        let c: SentinelaConfig = serde_yaml::from_str(
+            r#"{"revision_policy":{"kind":"green","required":["promotion-gate"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(c.revision_policy(), Ok(sentinela_core::RevisionPolicy::Green(_))));
+        let c: SentinelaConfig = serde_yaml::from_str("revision_policy:\n  kind: green\n  required: []\n").unwrap();
+        assert!(c.revision_policy().is_err());
     }
 
     #[test]
@@ -767,6 +872,7 @@ mod tests {
             git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
             rollback: RollbackConfig::default(),
+            revision_policy: RevisionPolicyConfig::Head,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: SentinelaConfig = serde_yaml::from_str(&yaml).unwrap();

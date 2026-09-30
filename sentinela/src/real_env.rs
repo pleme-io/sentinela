@@ -11,6 +11,7 @@
 //! ban): argv pieces are `concat`'d or built with typed builders.
 
 use sentinela_config::SentinelaConfig;
+use sentinela_core::{CheckResult, CheckState};
 use sentinela_core::{
     BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, ProbeCheck,
     ReceiptChain, RebuildDriver, Rev,
@@ -238,6 +239,102 @@ impl RealEnv {
         // rather than claimed as zeroization.
         scrub(header);
         scrub(token);
+    }
+
+    /// The ancestry mirror, cloned if unusable and fetched now — the shared
+    /// first half of [`GitopsEnv::is_ancestor`] and [`GitopsEnv::candidates`].
+    /// Fail-closed: any error is the caller's error variant's business, and
+    /// both callers read an error as "do not relax the rule".
+    fn sync_mirror(&self) -> Result<PathBuf, EnvError> {
+        let url = self.probe_url();
+        let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
+
+        // ── ★ `.exists()` ASKS THE WRONG QUESTION ─────────────────────────
+        // The invariant is "is a valid bare repo carrying no credential",
+        // not "is a directory". `git clone` CREATES the target before it is a
+        // repository, so a clone killed by the `git_timeout_seconds` deadline
+        // — or by any `kill -9` during the first cold clone on a fresh node —
+        // leaves a path that satisfies `.exists()` forever. Every later tick
+        // then skips the clone, fetches into a non-repository, and returns
+        // `AncestryFailed`.
+        //
+        // The blast radius is why this is worth a validation rather than a
+        // comment: BOTH starvation escapes route through `is_ancestor` (the
+        // deferral escape at fsm.rs:509/514 and `try_land_last_good` at
+        // fsm.rs:620/624), and both fail closed on `Err`. So a poisoned
+        // mirror disables both at once while the daemon keeps ticking, keeps
+        // publishing a fresh heartbeat, and keeps printing CONVERGED. That is
+        // the rio-2026-08-05 shape — a loop that cannot make progress while
+        // every liveness surface reads green.
+        //
+        // Validating also makes it SELF-HEALING, which a rename-only fix does
+        // not: a mirror poisoned before this shipped is repaired on the next
+        // tick, with no operator action, on every node.
+        //
+        // The credential half is the same predicate for the same reason.
+        // Until today the clone URL carried `x-access-token:<PAT>@`, which
+        // `git clone --bare` persists verbatim into the mirror's config; the
+        // fix that stopped NEW mirrors leaking does nothing for the ones
+        // already on disk, because nothing ever rewrites an existing mirror.
+        // Folding it in here means one tick repairs both, fleet-wide.
+        if !self.mirror_is_usable(&mirror) {
+            let staging = Path::new(&self.cfg.state_dir).join("ancestry.git.new");
+            let _ = std::fs::remove_dir_all(&staging);
+            let out = self.run_git({ let mut c = Command::new("git");
+                c.arg("clone")
+                .arg("--bare")
+                .arg("--filter=blob:none")
+                .arg(&url)
+                .arg(&staging);
+                self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
+            if !out.status.success() {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(EnvError::AncestryFailed(
+                    String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                ));
+            }
+            // Clone into a sibling and rename, so a kill during the clone can
+            // never leave a half-built directory at the live path again.
+            // `rename` onto a non-empty directory is ENOTEMPTY, so the old
+            // one goes first — it is already known-unusable at this point.
+            let _ = std::fs::remove_dir_all(&mirror);
+            if let Err(e) = std::fs::rename(&staging, &mirror) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(EnvError::AncestryFailed(e.to_string()));
+            }
+        }
+
+        // Fetch both revs explicitly. A branch fetch is not enough: the rev
+        // we built may already have been superseded, and on a force-push it
+        // may be unreachable from any ref at all — which is exactly the case
+        // that must answer "not an ancestor" rather than error out into a
+        // retry loop.
+        // The most network-exposed call in the whole tick: an actual object
+        // transfer from a remote we do not control. Bounded like the rest.
+        let fetch = self.run_git(
+            {
+                let mut c = Command::new("git");
+                c.arg("--git-dir")
+                    .arg(&mirror)
+                    .arg("fetch")
+                    .arg("--quiet")
+                    .arg(&url)
+                    .arg(format!(
+                        "+refs/heads/{}:refs/heads/probe",
+                        self.cfg.rev_probe.branch
+                    ));
+                self.apply_git_auth(&mut c);
+                c
+            },
+            EnvError::AncestryFailed,
+        )?;
+        if !fetch.status.success() {
+            return Err(EnvError::AncestryFailed(
+                String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
+            ));
+        }
+
+        Ok(mirror)
     }
 
     /// The driver for this node's configured rebuild tool.
@@ -577,93 +674,7 @@ impl GitopsEnv for RealEnv {
         // question must read as "do not activate", never as "probably fine":
         // the whole point of the caller is that it is about to relax the
         // strictest safety rule the loop has.
-        let url = self.probe_url();
-        let mirror = Path::new(&self.cfg.state_dir).join("ancestry.git");
-
-        // ── ★ `.exists()` ASKS THE WRONG QUESTION ─────────────────────────
-        // The invariant is "is a valid bare repo carrying no credential",
-        // not "is a directory". `git clone` CREATES the target before it is a
-        // repository, so a clone killed by the `git_timeout_seconds` deadline
-        // — or by any `kill -9` during the first cold clone on a fresh node —
-        // leaves a path that satisfies `.exists()` forever. Every later tick
-        // then skips the clone, fetches into a non-repository, and returns
-        // `AncestryFailed`.
-        //
-        // The blast radius is why this is worth a validation rather than a
-        // comment: BOTH starvation escapes route through `is_ancestor` (the
-        // deferral escape at fsm.rs:509/514 and `try_land_last_good` at
-        // fsm.rs:620/624), and both fail closed on `Err`. So a poisoned
-        // mirror disables both at once while the daemon keeps ticking, keeps
-        // publishing a fresh heartbeat, and keeps printing CONVERGED. That is
-        // the rio-2026-08-05 shape — a loop that cannot make progress while
-        // every liveness surface reads green.
-        //
-        // Validating also makes it SELF-HEALING, which a rename-only fix does
-        // not: a mirror poisoned before this shipped is repaired on the next
-        // tick, with no operator action, on every node.
-        //
-        // The credential half is the same predicate for the same reason.
-        // Until today the clone URL carried `x-access-token:<PAT>@`, which
-        // `git clone --bare` persists verbatim into the mirror's config; the
-        // fix that stopped NEW mirrors leaking does nothing for the ones
-        // already on disk, because nothing ever rewrites an existing mirror.
-        // Folding it in here means one tick repairs both, fleet-wide.
-        if !self.mirror_is_usable(&mirror) {
-            let staging = Path::new(&self.cfg.state_dir).join("ancestry.git.new");
-            let _ = std::fs::remove_dir_all(&staging);
-            let out = self.run_git({ let mut c = Command::new("git");
-                c.arg("clone")
-                .arg("--bare")
-                .arg("--filter=blob:none")
-                .arg(&url)
-                .arg(&staging);
-                self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
-            if !out.status.success() {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(EnvError::AncestryFailed(
-                    String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-                ));
-            }
-            // Clone into a sibling and rename, so a kill during the clone can
-            // never leave a half-built directory at the live path again.
-            // `rename` onto a non-empty directory is ENOTEMPTY, so the old
-            // one goes first — it is already known-unusable at this point.
-            let _ = std::fs::remove_dir_all(&mirror);
-            if let Err(e) = std::fs::rename(&staging, &mirror) {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(EnvError::AncestryFailed(e.to_string()));
-            }
-        }
-
-        // Fetch both revs explicitly. A branch fetch is not enough: the rev
-        // we built may already have been superseded, and on a force-push it
-        // may be unreachable from any ref at all — which is exactly the case
-        // that must answer "not an ancestor" rather than error out into a
-        // retry loop.
-        // The most network-exposed call in the whole tick: an actual object
-        // transfer from a remote we do not control. Bounded like the rest.
-        let fetch = self.run_git(
-            {
-                let mut c = Command::new("git");
-                c.arg("--git-dir")
-                    .arg(&mirror)
-                    .arg("fetch")
-                    .arg("--quiet")
-                    .arg(&url)
-                    .arg(format!(
-                        "+refs/heads/{}:refs/heads/probe",
-                        self.cfg.rev_probe.branch
-                    ));
-                self.apply_git_auth(&mut c);
-                c
-            },
-            EnvError::AncestryFailed,
-        )?;
-        if !fetch.status.success() {
-            return Err(EnvError::AncestryFailed(
-                String::from_utf8_lossy(&fetch.stderr).trim().to_owned(),
-            ));
-        }
+        let mirror = self.sync_mirror()?;
 
         // `--is-ancestor` is exit-code-only: 0 = yes, 1 = no, anything else
         // (including a rev this mirror has never heard of) is an ERROR and
@@ -895,6 +906,181 @@ impl GitopsEnv for RealEnv {
             )),
         }
     }
+
+    fn candidates(&self, since: Option<&Rev>, head: &Rev, limit: usize) -> Result<Vec<Rev>, EnvError> {
+        let mirror = self.sync_mirror().map_err(|e| EnvError::HistoryFailed(e.to_string()))?;
+        let mut c = Command::new("git");
+        c.arg("--git-dir")
+            .arg(&mirror)
+            .arg("rev-list")
+            .arg("--first-parent")
+            .arg(["--max-count=", &limit.to_string()].concat());
+        match since {
+            // `--ancestry-path` keeps only descendants of `since`: nothing
+            // older than what this node runs is ever offered, and a HEAD that
+            // does not descend from it offers nothing at all.
+            Some(since) => {
+                c.arg("--ancestry-path")
+                    .arg([since.as_str(), "..", head.as_str()].concat());
+            }
+            None => {
+                c.arg(head.as_str());
+            }
+        }
+        self.apply_git_auth(&mut c);
+        let out = self.run_git(c, EnvError::HistoryFailed)?;
+        if !out.status.success() {
+            return Err(EnvError::HistoryFailed(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| Rev::parse(l).ok())
+            .collect())
+    }
+
+    fn check_results(&self, rev: &Rev) -> Result<Vec<CheckResult>, EnvError> {
+        let Some((owner, repo)) = github_slug(&self.cfg.rev_probe.git_url) else {
+            return Err(EnvError::ChecksUnavailable(
+                ["not a github.com repository: ", &self.cfg.rev_probe.git_url].concat(),
+            ));
+        };
+        let base = [
+            "https://api.github.com/repos/",
+            &owner,
+            "/",
+            &repo,
+            "/commits/",
+            rev.as_str(),
+        ]
+        .concat();
+        let runs = self.github_get(&[base.as_str(), "/check-runs?per_page=100"].concat())?;
+        let statuses = self.github_get(&[base.as_str(), "/status?per_page=100"].concat())?;
+        let mut results = parse_check_runs(&runs);
+        results.extend(parse_statuses(&statuses));
+        Ok(results)
+    }
+}
+
+impl RealEnv {
+    /// GET one GitHub REST resource as JSON.
+    ///
+    /// curl, no shell, and the token never in argv: the request's headers
+    /// travel as a curl config on stdin (`--config -`). A non-200 answer is
+    /// [`EnvError::ChecksUnavailable`] naming the status, so a rejected token
+    /// (401) or a token without the Checks / Commit statuses read permission
+    /// (403) reads as blind, never as "no checks".
+    fn github_get(&self, url: &str) -> Result<serde_json::Value, EnvError> {
+        let mut config = String::from("header = \"Accept: application/vnd.github+json\"\n");
+        if let Some(token) = self.probe_token() {
+            config.push_str("header = \"Authorization: Bearer ");
+            config.push_str(&token);
+            config.push_str("\"\n");
+            scrub(token);
+        }
+        let mut child = Command::new("curl")
+            .args(["-sS", "-m", "20", "--config", "-", "-w", "\n%{http_code}", url])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| exec_err("curl", &e, EnvError::ChecksUnavailable))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(config.as_bytes());
+        }
+        scrub(config);
+        let out = child
+            .wait_with_output()
+            .map_err(|e| EnvError::ChecksUnavailable(e.to_string()))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (body, code) = text.rsplit_once('\n').unwrap_or(("", text.as_ref()));
+        forge_answer(code.trim(), body, String::from_utf8_lossy(&out.stderr).trim())
+    }
+}
+
+/// Turn one GitHub answer into JSON or the reason it is not one.
+fn forge_answer(code: &str, body: &str, stderr: &str) -> Result<serde_json::Value, EnvError> {
+    match code {
+        "200" => serde_json::from_str(body).map_err(|e| {
+            EnvError::ChecksUnavailable(["unreadable answer from GitHub: ", &e.to_string()].concat())
+        }),
+        "000" | "" => Err(EnvError::ChecksUnavailable(
+            ["GitHub unreachable: ", stderr].concat(),
+        )),
+        "401" => Err(EnvError::ChecksUnavailable(
+            "GitHub rejected the token (401)".to_owned(),
+        )),
+        "403" | "404" => Err(EnvError::ChecksUnavailable(
+            [
+                "GitHub answered ",
+                code,
+                ": the token cannot read this repository's checks (it needs Checks: read and Commit statuses: read)",
+            ]
+            .concat(),
+        )),
+        other => Err(EnvError::ChecksUnavailable(["GitHub answered ", other].concat())),
+    }
+}
+
+/// `(owner, repo)` of a github.com git URL (`https://github.com/o/r(.git)`).
+fn github_slug(git_url: &str) -> Option<(String, String)> {
+    let u = Url::parse(git_url).ok()?;
+    if u.host_str()? != "github.com" {
+        return None;
+    }
+    let mut segs = u.path_segments()?;
+    let owner = segs.next()?.to_owned();
+    let repo = segs.next()?.trim_end_matches(".git").to_owned();
+    (!owner.is_empty() && !repo.is_empty()).then_some((owner, repo))
+}
+
+/// Check runs, the newest run per name (a re-run supersedes the run it
+/// repeats). Only a completed `success` is success.
+fn parse_check_runs(v: &serde_json::Value) -> Vec<CheckResult> {
+    let mut newest: Vec<(u64, CheckResult)> = Vec::new();
+    for run in v.get("check_runs").and_then(|r| r.as_array()).into_iter().flatten() {
+        let Some(name) = run.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let id = run.get("id").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let state = match (
+            run.get("status").and_then(|s| s.as_str()),
+            run.get("conclusion").and_then(|c| c.as_str()),
+        ) {
+            (Some("completed"), Some("success")) => CheckState::Success,
+            (Some("completed"), _) => CheckState::Failed,
+            _ => CheckState::Pending,
+        };
+        let result = CheckResult {
+            name: name.to_owned(),
+            state,
+        };
+        match newest.iter_mut().find(|(_, r)| r.name == name) {
+            Some(slot) if slot.0 < id => *slot = (id, result),
+            Some(_) => {}
+            None => newest.push((id, result)),
+        }
+    }
+    newest.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Commit statuses (the combined view: the latest per context).
+fn parse_statuses(v: &serde_json::Value) -> Vec<CheckResult> {
+    v.get("statuses")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|st| {
+            let name = st.get("context")?.as_str()?.to_owned();
+            let state = match st.get("state")?.as_str()? {
+                "success" => CheckState::Success,
+                "pending" => CheckState::Pending,
+                _ => CheckState::Failed,
+            };
+            Some(CheckResult { name, state })
+        })
+        .collect()
 }
 
 /// Which activation mechanics a rollback uses. The PLATFORM decides, not the
@@ -1949,6 +2135,61 @@ mod tests {
             running_generation(Generation(89), "/nix/store/zzz-system", links, &all),
             None
         );
+    }
+
+    #[test]
+    fn github_slug_reads_owner_and_repo() {
+        assert_eq!(
+            github_slug("https://github.com/pleme-io/nix"),
+            Some(("pleme-io".to_owned(), "nix".to_owned()))
+        );
+        assert_eq!(
+            github_slug("https://github.com/pleme-io/nix.git"),
+            Some(("pleme-io".to_owned(), "nix".to_owned()))
+        );
+        assert_eq!(github_slug("https://gitlab.com/o/r"), None);
+    }
+
+    #[test]
+    fn check_runs_take_the_newest_run_and_only_success_is_success() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"check_runs":[
+                {"id":1,"name":"gate","status":"completed","conclusion":"failure"},
+                {"id":2,"name":"gate","status":"completed","conclusion":"success"},
+                {"id":3,"name":"blue","status":"in_progress","conclusion":null},
+                {"id":4,"name":"lint","status":"completed","conclusion":"neutral"}
+            ]}"#,
+        )
+        .unwrap();
+        let r = parse_check_runs(&v);
+        let state = |n: &str| r.iter().find(|c| c.name == n).map(|c| c.state);
+        assert_eq!(state("gate"), Some(CheckState::Success), "the re-run supersedes");
+        assert_eq!(state("blue"), Some(CheckState::Pending));
+        assert_eq!(state("lint"), Some(CheckState::Failed), "neutral is not success");
+    }
+
+    #[test]
+    fn statuses_map_by_context() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"statuses":[{"context":"ci/a","state":"success"},{"context":"ci/b","state":"pending"},{"context":"ci/c","state":"error"}]}"#,
+        )
+        .unwrap();
+        let r = parse_statuses(&v);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[2].state, CheckState::Failed);
+    }
+
+    /// Measured 2026-09-30: the fleet's fine-grained tokens answer 403 for
+    /// both endpoints. That must read as blind, naming what is missing.
+    #[test]
+    fn a_rejected_or_underpowered_token_is_blind_and_says_which() {
+        let e = forge_answer("403", "", "").unwrap_err().to_string();
+        assert!(e.contains("403") && e.contains("Checks: read"), "{e}");
+        let e = forge_answer("401", "", "").unwrap_err().to_string();
+        assert!(e.contains("rejected the token"), "{e}");
+        let e = forge_answer("000", "", "Could not resolve host").unwrap_err().to_string();
+        assert!(e.contains("unreachable") && e.contains("resolve"), "{e}");
+        assert!(forge_answer("200", "{}", "").is_ok());
     }
 
     #[test]

@@ -224,6 +224,19 @@ fn preflight(cfg: &SentinelaConfig) -> Vec<PreflightFailure> {
 
     failures.extend(flake_ref_failure(cfg));
 
+    // The `green` policy reads check results with curl; without it every
+    // tick would be blind while the loop reported itself alive.
+    if matches!(cfg.revision_policy, sentinela_config::RevisionPolicyConfig::Green { .. })
+        && matches!(
+            std::process::Command::new("curl").arg("--version").output(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        failures.push(PreflightFailure::ToolMissing {
+            tool: "curl".to_owned(),
+        });
+    }
+
     failures
 }
 
@@ -294,6 +307,16 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     // binaries against this filesystem, once, at startup.
     let rollback = cfg.rollback_plan();
     log_rollback_plan(&rollback);
+    let revision_policy = match cfg.revision_policy() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "sentinela: revision_policy refused — refusing to start");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let sentinela_core::RevisionPolicy::Green(g) = &revision_policy {
+        tracing::info!(required = ?g.required, "revision policy: green (deploy only revisions whose required checks passed)");
+    }
     let env = std::sync::Arc::new(RealEnv::new(cfg));
 
     // ── ★ THE RECONCILER BECOMES ASKABLE ───────────────────────────────
@@ -309,7 +332,10 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
         Some(sock) => tracing::info!(socket = %sock.display(), "introspection live"),
         None => tracing::warn!("introspection unavailable — the loop still converges"),
     }
-    let mut sentinela = Sentinela::new(loop_cfg).with_rollback(rollback.policy);
+    let mut sentinela = Sentinela::new(loop_cfg)
+        .with_rollback(rollback.policy)
+        .with_revision_policy(revision_policy);
+    let mut checks_report = ChecksReport::default();
     tracing::info!(
         poll_seconds = loop_cfg.poll_seconds,
         "sentinela: daemon started"
@@ -354,6 +380,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     loop {
         let outcome = sentinela.tick(&*env);
         log_outcome(&outcome);
+        checks_report.log(&outcome);
 
         let now = health(&env);
         if should_report(&prev, &now) {
@@ -385,6 +412,44 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
         // on probation the policy's probe interval rules, and only the loop
         // knows it is on probation.
         std::thread::sleep(sentinela.next_delay(&outcome));
+    }
+}
+
+/// Says a `green` hold that needs a person — a red HEAD, unreadable checks —
+/// once per revision or reason, not once per tick; a steady wait says
+/// nothing at the default level.
+#[derive(Debug, Default)]
+struct ChecksReport {
+    last: Option<String>,
+}
+
+impl ChecksReport {
+    /// The line to emit for this outcome, if it is news.
+    fn news(&mut self, outcome: &TickOutcome) -> Option<String> {
+        let key = match outcome {
+            TickOutcome::ChecksRed { rev, failed } => {
+                ["checks-red ", rev.short(), " (", &failed.join(", "), ")"].concat()
+            }
+            TickOutcome::ChecksBlind { reason, .. } => ["blind ", reason.as_str()].concat(),
+            TickOutcome::WaitingForGreen { .. } => return None,
+            _ => {
+                self.last = None;
+                return None;
+            }
+        };
+        if self.last.as_deref() == Some(key.as_str()) {
+            return None;
+        }
+        self.last = Some(key.clone());
+        Some(key)
+    }
+
+    fn log(&mut self, outcome: &TickOutcome) {
+        if let Some(line) = self.news(outcome) {
+            tracing::warn!(
+                "gitops: {line} — staying on the current generation until a revision passes its required checks"
+            );
+        }
     }
 }
 
@@ -526,6 +591,13 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::CoolingDown { remaining_ms } => {
             tracing::debug!(remaining_ms, "cooling down");
         }
+        // Waiting on CI is the `green` policy's steady state: quiet. A red
+        // HEAD or unreadable checks need a person, and are said once per
+        // revision / reason by `ChecksReport`, not once per tick.
+        TickOutcome::WaitingForGreen { rev } => {
+            tracing::debug!(rev = rev.short(), "waiting-for-green");
+        }
+        TickOutcome::ChecksRed { .. } | TickOutcome::ChecksBlind { .. } => {}
         TickOutcome::Verifying(_)
         | TickOutcome::Verified { .. }
         | TickOutcome::RolledBack { .. }
@@ -833,6 +905,32 @@ fn tick_once(cfg: &SentinelaConfig) -> std::process::ExitCode {
         tracing::info!("entered cooldown after a failure");
     }
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod checks_report_tests {
+    use super::{ChecksReport, TickOutcome};
+    use sentinela_core::Rev;
+
+    fn rev(n: u8) -> Rev {
+        Rev::parse(&format!("{n:02x}").repeat(20)).unwrap()
+    }
+
+    #[test]
+    fn a_red_head_is_said_once_per_revision_and_waiting_is_quiet() {
+        let mut r = ChecksReport::default();
+        let red = |n| TickOutcome::ChecksRed { rev: rev(n), failed: vec!["promotion-gate".to_owned()] };
+        assert!(r.news(&red(2)).is_some());
+        assert!(r.news(&red(2)).is_none(), "the same red HEAD again is not news");
+        assert!(r.news(&TickOutcome::WaitingForGreen { rev: rev(3) }).is_none());
+        assert!(r.news(&red(3)).is_some(), "a new red HEAD is");
+        let blind = TickOutcome::ChecksBlind { head: rev(3), reason: "GitHub answered 403".to_owned() };
+        assert!(r.news(&blind).unwrap().starts_with("blind "));
+        assert!(r.news(&blind).is_none());
+        // A deploy clears it: the next hold is news again.
+        let _ = r.news(&TickOutcome::Unchanged { rev: rev(3) });
+        assert!(r.news(&blind).is_some());
+    }
 }
 
 #[cfg(test)]

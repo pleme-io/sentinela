@@ -43,6 +43,7 @@
 //!   until HEAD moves. See [`crate::probation`] for why this is not the
 //!   no-downgrade rule.
 
+use crate::checks::{Cache, Cached, ChecksVerdict, GreenPolicy, RevisionPolicy, still_valid};
 use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
 use crate::probation::{ProbeFailure, Probation, RollbackPolicy};
 use crate::receipt::{Generation, Outcome, ReceiptChain, bound_text};
@@ -216,6 +217,29 @@ pub enum TickOutcome {
         /// The quarantined rev (HEAD).
         rev: Rev,
     },
+    /// `Green` policy: nothing newer than what runs has passed its required
+    /// checks yet, and HEAD's are still running. Stays on the current
+    /// generation; nothing built, nothing recorded.
+    WaitingForGreen {
+        /// HEAD.
+        rev: Rev,
+    },
+    /// `Green` policy: HEAD's required checks failed, and nothing between
+    /// it and what runs is green. Stays on the current generation.
+    ChecksRed {
+        /// HEAD.
+        rev: Rev,
+        /// The required checks that failed on it.
+        failed: Vec<String>,
+    },
+    /// `Green` policy: the checks could not be read (forge unreachable,
+    /// token rejected, history unreadable). Stays on the current generation.
+    ChecksBlind {
+        /// HEAD, as probed.
+        head: Rev,
+        /// Why the checks could not be read.
+        reason: String,
+    },
 }
 
 impl TickOutcome {
@@ -243,6 +267,9 @@ impl TickOutcome {
             Self::RollbackFailed { .. } => "rollbackFailed",
             Self::ProbationAbandoned { .. } => "probationAbandoned",
             Self::Quarantined { .. } => "quarantined",
+            Self::WaitingForGreen { .. } => "waitingForGreen",
+            Self::ChecksRed { .. } => "checksRed",
+            Self::ChecksBlind { .. } => "checksBlind",
         }
     }
 
@@ -279,7 +306,10 @@ impl TickOutcome {
             | Self::RolledBack { .. }
             | Self::RollbackFailed { .. }
             | Self::ProbationAbandoned { .. }
-            | Self::Quarantined { .. } => Phase::Resolved,
+            | Self::Quarantined { .. }
+            | Self::WaitingForGreen { .. }
+            | Self::ChecksRed { .. }
+            | Self::ChecksBlind { .. } => Phase::Resolved,
         }
     }
 
@@ -364,7 +394,12 @@ impl TickOutcome {
             // attempt and should not run at the probe rate.
             | Self::Verifying(_)
             | Self::RollbackFailed { .. }
-            | Self::Quarantined { .. } => poll,
+            | Self::Quarantined { .. }
+            // Waiting on checks is waiting on CI: a poll is the cadence, and
+            // the per-revision cache keeps it from asking the forge each time.
+            | Self::WaitingForGreen { .. }
+            | Self::ChecksRed { .. }
+            | Self::ChecksBlind { .. } => poll,
         }
     }
 
@@ -394,6 +429,9 @@ impl TickOutcome {
             | Self::ProbationAbandoned { .. } => None,
             Self::Unchanged { rev }
             | Self::Quarantined { rev }
+            | Self::WaitingForGreen { rev }
+            | Self::ChecksRed { rev, .. }
+            | Self::ChecksBlind { head: rev, .. }
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::SwitchDeferred { rev, .. }
@@ -418,6 +456,13 @@ pub struct Sentinela {
     /// previous one. Checked once: after that, the in-memory state is the
     /// authority.
     resume_checked: bool,
+    /// Which revision may be deployed. `Head` (the default) is today's
+    /// behaviour exactly: no history walk, no check reads.
+    policy: RevisionPolicy,
+    /// `Green` policy: each candidate revision's answer, so the forge is
+    /// asked once per revision (final answers) or once per recheck window
+    /// (pending/blind), never every tick. Pruned to the current candidates.
+    checks: Cache,
 }
 
 impl Sentinela {
@@ -429,7 +474,16 @@ impl Sentinela {
             cfg,
             rollback: None,
             resume_checked: false,
+            policy: RevisionPolicy::Head,
+            checks: Cache::new(),
         }
+    }
+
+    /// Choose which revision the loop may deploy (default: `Head`).
+    #[must_use]
+    pub fn with_revision_policy(mut self, policy: RevisionPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Attach (or, with `None`, keep off) health-gated rollback.
@@ -621,6 +675,20 @@ impl Sentinela {
             return TickOutcome::Quarantined { rev: head };
         }
 
+        // ── Which revision: HEAD, or the newest green one ────────────────
+        // `Head` is HEAD, unchanged. `Green` walks back from HEAD to what this
+        // node runs and takes the newest revision whose required checks all
+        // passed; when there is none it stays put and says why. Nothing is
+        // built or recorded on the way: waiting on CI is not a failure.
+        let target = match self.policy.clone() {
+            RevisionPolicy::Head => head.clone(),
+            RevisionPolicy::Green(g) => match self.select_green(env, &chain, &head, &g) {
+                Ok(rev) => rev,
+                Err(out) => return out,
+            },
+        };
+        let green = matches!(self.policy, RevisionPolicy::Green(_));
+
         // ── ★ PULSE BEFORE THE BUILD, NOT ONLY AFTER IT ──────────────────
         // `env.build` is the long pole — measured at 12m02s on ryn — and the
         // wrapper's pulse lands only once it RETURNS. That left the whole
@@ -656,10 +724,11 @@ impl Sentinela {
         if let Err(e) = env.write_heartbeat(&in_flight) {
             tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");
         }
-        tracing::info!(rev = head.short(), "build started");
+        tracing::info!(rev = target.short(), "build started");
 
         // Decide → build rev-pinned.
-        if let Err(e) = env.build(&head) {
+        if let Err(e) = env.build(&target) {
+            let head = target.clone();
             let out = TickOutcome::BuildFailed {
                 rev: head.clone(),
                 error: e.to_string(),
@@ -701,7 +770,29 @@ impl Sentinela {
         // must NOT activate a rev we can no longer confirm is HEAD.
         match env.probe_head() {
             // Re-confirmed still HEAD → fall through to activation.
-            Ok(Some(confirmed)) if confirmed == head => {}
+            Ok(Some(confirmed)) if confirmed == target => {}
+            // `Green`: the target passed its checks; a newer HEAD has not
+            // (or it would have been chosen). Activate the target while the
+            // branch still contains it — a forward step, never the newest
+            // one by force. A branch that moved AWAY from it (a force-push)
+            // or an unanswerable ancestry question defers, fail-closed.
+            Ok(Some(newer)) if green => {
+                return match env.is_ancestor(&target, &newer) {
+                    Ok(true) => self.activate(chain, env, target, Some(newer)),
+                    other => {
+                        if let Err(e) = other {
+                            tracing::warn!(error = %e, "ancestry unanswerable — deferring (fail-closed)");
+                        }
+                        let out = TickOutcome::Deferred {
+                            built: target.clone(),
+                            newer: newer.clone(),
+                        };
+                        let _ = self.record(&mut chain, env, target, Outcome::Deferred { newer });
+                        self.state = State::Idle;
+                        out
+                    }
+                };
+            }
             // HEAD moved during the build → defer; the newer rev deploys
             // next tick (no cooldown — deferral is not a failure).
             Ok(Some(newer)) => {
@@ -774,11 +865,11 @@ impl Sentinela {
             // (transient branch state, no cooldown).
             Ok(None) => {
                 tracing::warn!(
-                    rev = head.short(),
+                    rev = target.short(),
                     "post-build re-probe empty — not activating (fail-closed)"
                 );
                 self.state = State::Idle;
-                return TickOutcome::ReprobeInconclusive { built: head };
+                return TickOutcome::ReprobeInconclusive { built: target };
             }
             // Re-probe errored → cannot confirm freshness. Fail-closed +
             // cooldown (a health problem that must back off, symmetric with
@@ -794,7 +885,95 @@ impl Sentinela {
         }
 
         // Act → switch (re-check confirmed head is still HEAD).
-        self.activate(chain, env, head, None)
+        self.activate(chain, env, target, None)
+    }
+
+    /// `Green` policy: the newest revision, forward for this node, whose
+    /// required checks all passed — or the outcome that says why there is
+    /// none. See [`crate::checks`].
+    fn select_green<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        chain: &ReceiptChain,
+        head: &Rev,
+        g: &GreenPolicy,
+    ) -> Result<Rev, TickOutcome> {
+        let blind = |reason: String| TickOutcome::ChecksBlind {
+            head: head.clone(),
+            reason,
+        };
+        let since = chain.last_activated_rev().cloned();
+        let candidates = env
+            .candidates(since.as_ref(), head, g.max_candidates.max(1))
+            .map_err(|e| blind(e.to_string()))?;
+        if candidates.is_empty() {
+            return Err(blind(
+                "no revision between the active one and HEAD descends from it (history rewritten?)"
+                    .to_owned(),
+            ));
+        }
+        // A rev a rollback quarantined is not offered again while the
+        // quarantine holds, whichever position it has.
+        let quarantined = self
+            .rollback
+            .as_ref()
+            .and(chain.quarantined_rev())
+            .cloned();
+        let now = env.now_unix_ms();
+        self.checks.retain(|rev, _| candidates.contains(rev));
+        let mut newest: Option<ChecksVerdict> = None;
+        for rev in &candidates {
+            if Some(rev) == quarantined.as_ref() {
+                continue;
+            }
+            let v = self.verdict_for(env, rev, g, now);
+            if newest.is_none() {
+                newest = Some(v.clone());
+            }
+            match v {
+                ChecksVerdict::Green => return Ok(rev.clone()),
+                // Unreadable checks say nothing about any revision: stop,
+                // stay, and say so, rather than walking on and asking again.
+                ChecksVerdict::Blind { reason } => return Err(blind(reason)),
+                ChecksVerdict::Red { .. } | ChecksVerdict::Pending { .. } => {}
+            }
+        }
+        Err(match newest {
+            Some(ChecksVerdict::Red { failed }) => TickOutcome::ChecksRed {
+                rev: head.clone(),
+                failed,
+            },
+            _ => TickOutcome::WaitingForGreen { rev: head.clone() },
+        })
+    }
+
+    /// One revision's verdict: cached while it stands, else read once.
+    fn verdict_for<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        rev: &Rev,
+        g: &GreenPolicy,
+        now: u64,
+    ) -> ChecksVerdict {
+        if let Some(c) = self.checks.get(rev)
+            && still_valid(c, now, g.recheck_ms)
+        {
+            return c.verdict.clone();
+        }
+        let verdict = match env.check_results(rev) {
+            Ok(results) => crate::checks::verdict(&g.required, &results),
+            Err(e) => ChecksVerdict::Blind {
+                reason: e.to_string(),
+            },
+        };
+        self.checks.insert(
+            rev.clone(),
+            Cached {
+                verdict: verdict.clone(),
+                at_ms: now,
+            },
+        );
+        verdict
     }
 
     /// After a failed build against `head`, decide whether to fall back to
@@ -2457,6 +2636,155 @@ mod tests {
         assert!(matches!(s.tick(&env), TickOutcome::SwitchFailed { .. }));
         assert!(matches!(s.state(), State::CoolingDown { .. }), "{:?}", s.state());
         assert!(env.probe_runs.borrow().is_empty());
+    }
+
+    // ── Revision policy: Head vs Green ───────────────────────────────────
+
+    fn green_policy() -> RevisionPolicy {
+        RevisionPolicy::Green(crate::checks::GreenPolicy {
+            required: vec!["promotion-gate".to_owned()],
+            recheck_ms: 300_000,
+            max_candidates: 20,
+        })
+    }
+
+    fn checks(state: crate::checks::CheckState) -> Result<Vec<crate::checks::CheckResult>, EnvError> {
+        Ok(vec![crate::checks::CheckResult {
+            name: "promotion-gate".to_owned(),
+            state,
+        }])
+    }
+
+    /// A node running rev(1), with rev(2..=n) on the branch after it.
+    fn green_node(n: u8) -> MockEnv {
+        let env = node_on_rev1();
+        env.set_history((1..=n).map(rev).collect());
+        env
+    }
+
+    fn green_loop() -> Sentinela {
+        Sentinela::new(cfg()).with_revision_policy(green_policy())
+    }
+
+    #[test]
+    fn green_a_red_commit_does_not_stall_a_later_green_one() {
+        use crate::checks::CheckState::{Failed, Success};
+        let env = green_node(3);
+        env.set_checks(rev(2), checks(Failed));
+        env.set_checks(rev(3), checks(Success));
+        env.push_probe(Ok(Some(rev(3))));
+        env.push_probe(Ok(Some(rev(3))));
+        let out = green_loop().tick(&env);
+        assert!(matches!(out, TickOutcome::Deployed { ref rev, .. } if *rev == super::tests::rev(3)), "{out:?}");
+        assert_eq!(env.builds.borrow().as_slice(), &[rev(3)]);
+    }
+
+    #[test]
+    fn green_the_newest_green_is_deployed_even_behind_head() {
+        use crate::checks::CheckState::{Pending, Success};
+        let env = green_node(3);
+        env.set_checks(rev(2), checks(Success));
+        env.set_checks(rev(3), checks(Pending));
+        env.set_ancestry_result(Ok(true));
+        env.push_probe(Ok(Some(rev(3))));
+        env.push_probe(Ok(Some(rev(3))));
+        let out = green_loop().tick(&env);
+        assert!(
+            matches!(out, TickOutcome::DeployedBehind { ref rev, ref newer, .. }
+                if *rev == super::tests::rev(2) && *newer == super::tests::rev(3)),
+            "{out:?}"
+        );
+        assert_eq!(env.switches.borrow().as_slice(), &[rev(2)]);
+    }
+
+    #[test]
+    fn green_pending_means_wait_and_builds_nothing() {
+        use crate::checks::CheckState::Pending;
+        let env = green_node(2);
+        env.set_checks(rev(2), checks(Pending));
+        env.push_probe(Ok(Some(rev(2))));
+        assert_eq!(green_loop().tick(&env), TickOutcome::WaitingForGreen { rev: rev(2) });
+        assert!(env.builds.borrow().is_empty());
+        assert_eq!(env.chain().len(), 1, "waiting on CI writes no receipt");
+    }
+
+    #[test]
+    fn green_red_head_with_nothing_green_stays_and_names_the_failure() {
+        use crate::checks::CheckState::Failed;
+        let env = green_node(2);
+        env.set_checks(rev(2), checks(Failed));
+        env.push_probe(Ok(Some(rev(2))));
+        assert_eq!(
+            green_loop().tick(&env),
+            TickOutcome::ChecksRed {
+                rev: rev(2),
+                failed: vec!["promotion-gate".to_owned()]
+            }
+        );
+        assert!(env.builds.borrow().is_empty());
+    }
+
+    #[test]
+    fn green_blind_means_stay_and_say_why() {
+        let env = green_node(2);
+        env.set_checks(
+            rev(2),
+            Err(EnvError::ChecksUnavailable("GitHub answered 403 (token lacks Checks: read)".to_owned())),
+        );
+        env.push_probe(Ok(Some(rev(2))));
+        let out = green_loop().tick(&env);
+        assert!(
+            matches!(out, TickOutcome::ChecksBlind { ref reason, .. } if reason.contains("403")),
+            "{out:?}"
+        );
+        assert!(env.builds.borrow().is_empty());
+    }
+
+    #[test]
+    fn green_an_older_green_than_the_active_rev_is_never_deployed() {
+        use crate::checks::CheckState::{Failed, Success};
+        // History r0 → r1 (active) → r2 (HEAD, red). r0 is green but older.
+        let env = node_on_rev1();
+        env.set_history(vec![rev(0), rev(1), rev(2)]);
+        env.set_checks(rev(0), checks(Success));
+        env.set_checks(rev(2), checks(Failed));
+        env.push_probe(Ok(Some(rev(2))));
+        let out = green_loop().tick(&env);
+        assert!(matches!(out, TickOutcome::ChecksRed { .. }), "{out:?}");
+        assert!(
+            !env.check_queries.borrow().contains(&rev(0)),
+            "a revision older than the active one is never even considered"
+        );
+        assert!(env.switches.borrow().is_empty());
+    }
+
+    #[test]
+    fn green_asks_the_forge_once_per_revision_not_every_tick() {
+        use crate::checks::CheckState::Pending;
+        let env = green_node(2);
+        env.set_checks(rev(2), checks(Pending));
+        let mut s = green_loop();
+        for _ in 0..3 {
+            env.push_probe(Ok(Some(rev(2))));
+            assert_eq!(s.tick(&env), TickOutcome::WaitingForGreen { rev: rev(2) });
+        }
+        assert_eq!(env.check_queries.borrow().len(), 1, "unchanged pending rev: one fetch");
+        // Past the recheck window a pending answer is asked again.
+        env.set_now_ms(300_000);
+        env.push_probe(Ok(Some(rev(2))));
+        let _ = s.tick(&env);
+        assert_eq!(env.check_queries.borrow().len(), 2);
+    }
+
+    #[test]
+    fn head_policy_is_todays_behaviour_and_never_reads_checks() {
+        let env = green_node(2);
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+        let out = Sentinela::new(cfg()).tick(&env);
+        assert!(matches!(out, TickOutcome::Deployed { .. }), "{out:?}");
+        assert!(env.check_queries.borrow().is_empty(), "Head never reads checks");
+        assert_eq!(env.builds.borrow().as_slice(), &[rev(2)]);
     }
 
     /// PATH 1 — probes pass, so the activation converges. Two consecutive

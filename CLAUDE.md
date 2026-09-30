@@ -60,6 +60,22 @@ rollback flips the profile before it activates, so a failed activation must not
 read as rolled back. `rollback_to` returns Ok only once the restored generation
 is running (`real_env::rollback_steps`, `real_env::running_generation`).
 
+## Revision policy: `head` (default) or `green`
+
+`revision_policy:` (`sentinela-config::RevisionPolicyConfig`, internally tagged
+`kind:` so the JSON the nix module renders parses) chooses what is deployed.
+`head` is branch HEAD, unchanged: no history walk, no check reads. `green`
+walks HEAD's first-parent history back to the active revision
+(`--ancestry-path`, so nothing older than what runs is offered) and deploys
+the newest revision whose `required` check-runs / status contexts all
+concluded success (`sentinela-core/src/checks.rs`). No green revision means no
+build and no receipt: `waitingForGreen` (quiet), `checksRed <rev>` or
+`checksBlind <reason>` (said once per revision / reason). Answers are cached
+per revision: green and red forever, pending and blind for `recheck_seconds`.
+Checks are read over GitHub's REST API with curl, the token on stdin; a 401 /
+403 is `checksBlind` naming the missing permission (Checks: read, Commit
+statuses: read).
+
 ## A new config is loaded by exiting between ticks
 
 The service manager never restarts this daemon on activation (it performs the

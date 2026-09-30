@@ -8,6 +8,7 @@
 //! with no network, no build, no clock. This is the TYPED-SPEC
 //! Environment-trait discipline.
 
+use crate::checks::CheckResult;
 use crate::probation::{HealthProbe, Probation};
 use crate::receipt::{Generation, ReceiptChain};
 use crate::rev::Rev;
@@ -88,6 +89,13 @@ pub enum EnvError {
     /// reads this as "rolled back".
     #[error("rollback failed: {0}")]
     RollbackFailed(String),
+    /// A revision's check results could not be read: the forge is
+    /// unreachable, or it rejected the token. Never read as "no checks".
+    #[error("checks unavailable: {0}")]
+    ChecksUnavailable(String),
+    /// The branch history between two revisions could not be read.
+    #[error("history unavailable: {0}")]
+    HistoryFailed(String),
 }
 
 /// One tick's pulse: proof the loop was ALIVE at a moment, independent of
@@ -421,6 +429,26 @@ pub trait GitopsEnv {
     /// lock (the FSM stands aside and retries), or
     /// [`EnvError::RollbackFailed`].
     fn rollback_to(&self, generation: Generation) -> Result<Generation, EnvError>;
+
+    /// The revisions the `Green` policy may deploy, NEWEST FIRST: HEAD's
+    /// first-parent history back to, and excluding, `since` (what this node
+    /// runs), keeping only descendants of `since` so nothing older than the
+    /// active revision is ever offered; at most `limit`. `since = None` (a
+    /// node that never activated) offers the newest `limit` from HEAD.
+    ///
+    /// Only the `Green` policy calls this; `Head` never does.
+    ///
+    /// # Errors
+    /// [`EnvError::HistoryFailed`] when the history cannot be read.
+    fn candidates(&self, since: Option<&Rev>, head: &Rev, limit: usize) -> Result<Vec<Rev>, EnvError>;
+
+    /// The forge's check results for exactly `rev`.
+    ///
+    /// # Errors
+    /// [`EnvError::ChecksUnavailable`] when they cannot be read — an
+    /// unreachable forge or a rejected token, which the loop reports as
+    /// blind and never as "no checks".
+    fn check_results(&self, rev: &Rev) -> Result<Vec<CheckResult>, EnvError>;
 }
 
 #[cfg(any(test, feature = "mock"))]
@@ -429,6 +457,7 @@ pub use mock::MockEnv;
 #[cfg(any(test, feature = "mock"))]
 mod mock {
     use super::{EnvError, GitopsEnv};
+    use crate::checks::CheckResult;
     use crate::receipt::{Generation, ReceiptChain};
     use crate::rev::Rev;
     use std::cell::RefCell;
@@ -478,6 +507,13 @@ mod mock {
         /// start makes `switch-to-configuration` exit non-zero AFTER the new
         /// generation is active).
         switch_moves_on_error: RefCell<Option<Generation>>,
+        /// The branch's first-parent history, OLDEST first, for `candidates`.
+        history: RefCell<Vec<Rev>>,
+        /// Programmed check results per revision; an unprogrammed revision
+        /// answers with no checks at all (so its required checks are pending).
+        checks: RefCell<std::collections::HashMap<Rev, Result<Vec<CheckResult>, EnvError>>>,
+        /// Every revision whose checks were fetched, in order.
+        pub check_queries: RefCell<Vec<Rev>>,
     }
 
     impl Default for MockEnv {
@@ -505,6 +541,9 @@ mod mock {
                 rollback_result: RefCell::new(Ok(())),
                 rollbacks: RefCell::new(Vec::new()),
                 switch_moves_on_error: RefCell::new(None),
+                history: RefCell::new(Vec::new()),
+                checks: RefCell::new(std::collections::HashMap::new()),
+                check_queries: RefCell::new(Vec::new()),
             }
         }
     }
@@ -584,6 +623,16 @@ mod mock {
             *self.switch_moves_on_error.borrow_mut() = g;
         }
 
+        /// Set the branch's first-parent history, oldest first.
+        pub fn set_history(&self, revs: Vec<Rev>) {
+            *self.history.borrow_mut() = revs;
+        }
+
+        /// Program `rev`'s check results.
+        pub fn set_checks(&self, rev: Rev, r: Result<Vec<CheckResult>, EnvError>) {
+            self.checks.borrow_mut().insert(rev, r);
+        }
+
         /// Program the outcome of subsequent `rollback_to` calls.
         pub fn set_rollback_result(&self, r: Result<(), EnvError>) {
             *self.rollback_result.borrow_mut() = r;
@@ -660,6 +709,36 @@ mod mock {
             self.rollback_result.borrow().clone()?;
             *self.generation.borrow_mut() = Some(generation);
             Ok(generation)
+        }
+
+        fn candidates(
+            &self,
+            since: Option<&Rev>,
+            head: &Rev,
+            limit: usize,
+        ) -> Result<Vec<Rev>, EnvError> {
+            let history = self.history.borrow();
+            let Some(h) = history.iter().position(|r| r == head) else {
+                return Err(EnvError::HistoryFailed("head not in history".to_owned()));
+            };
+            let from = match since {
+                None => 0,
+                // Not an ancestor of HEAD: nothing is forward for this node.
+                Some(s) => match history[..=h].iter().position(|r| r == s) {
+                    Some(i) => i + 1,
+                    None => return Ok(Vec::new()),
+                },
+            };
+            Ok(history[from..=h].iter().rev().take(limit).cloned().collect())
+        }
+
+        fn check_results(&self, rev: &Rev) -> Result<Vec<CheckResult>, EnvError> {
+            self.check_queries.borrow_mut().push(rev.clone());
+            self.checks
+                .borrow()
+                .get(rev)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()))
         }
     }
 }
