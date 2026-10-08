@@ -85,7 +85,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -96,7 +96,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -488,9 +488,9 @@ checksum = "bb1307f12aa967b5a58416e87b3653360e0fd614a016b6e970db08fecbb1b80d"
 
 [[package]]
 name = "canteiro-types"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "641164281fc9087e20329eb78293b0f6cdb455095382191789fe49c6818ab073"
+checksum = "3b4665a8eacc9bca4edba384a3ee3e83ee0266902c8389f9cccbb4062b31d026"
 dependencies = [
  "serde",
  "shigoto-dag",
@@ -925,7 +925,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1013,7 +1013,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2313,6 +2313,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "handan"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "168bce822fe8afd3eaffa21b98bcd7df6964382dd84527c89c2218c988be5a67"
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2810,7 +2816,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3346,7 +3352,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3891,7 +3897,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4372,7 +4378,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4431,7 +4437,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5124,7 +5130,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5371,7 +5377,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5411,9 +5417,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sui-build"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "021715821f5d9caa0c842bc0c055f5b0a8fbb5dc5714c302de71be0897e10325"
+checksum = "ebed30fb3c8f50335f26b082470d7e010621d8c9ec7bb0714cc22fc561771896"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -5428,9 +5434,9 @@ dependencies = [
 
 [[package]]
 name = "sui-bytecode"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1cc2e13759eccfb1fae111be7f8e6107d08775466c35dfcb7f6a64503c81efa"
+checksum = "4170fe6618785cb0e5409e407ee609ca5e7c9ea9d6dd90d9028d7f4d8aec359c"
 dependencies = [
  "rnix",
  "rowan",
@@ -5438,15 +5444,16 @@ dependencies = [
  "sha2",
  "sui-compat",
  "sui-intern",
+ "sui-normalize",
  "sui-spec",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "sui-cache"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd470b19caba8f329ee90ca26fcfee66a8154fa6d7f1db06bdecf7ab09ba5ac"
+checksum = "7c9c5dde482dc051820a47739245133767ae322416020e992f8085bd53f2a497"
 dependencies = [
  "async-trait",
  "axum",
@@ -5469,9 +5476,9 @@ dependencies = [
 
 [[package]]
 name = "sui-castore"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5313406ba9984cf98591af0d66526609e73794bad891e61d5770f497d3936ef"
+checksum = "2f0ead0e9af1771d5b8851a8926c8a6ca20b70cf3e4793ce9f097b0dc7eb9a29"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5487,9 +5494,9 @@ dependencies = [
 
 [[package]]
 name = "sui-compat"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd325584e16e7f8b9b37b772e99e3acfd8304ad1be516484e4dda8cc1ba4052"
+checksum = "100772e77d50cdb6f62a9247cde981f3723489b4da86cd3aea230d9d2547c20b"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -5502,9 +5509,9 @@ dependencies = [
 
 [[package]]
 name = "sui-eval"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877f6b9ad46280275fccaaa90b6ac3264ee4f535dad262124318fa59f3eee3a3"
+checksum = "87f672fba9df69b75df73115f4997859105703e5332969bbba1b453c90933a20"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -5514,6 +5521,7 @@ dependencies = [
  "im-rc",
  "libc",
  "md-5",
+ "okiba 0.3.2",
  "redb",
  "regex",
  "rnix",
@@ -5532,6 +5540,7 @@ dependencies = [
  "sui-compat",
  "sui-graph-store",
  "sui-intern",
+ "sui-normalize",
  "sui-resolve",
  "sui-spec",
  "sui-store",
@@ -5545,9 +5554,9 @@ dependencies = [
 
 [[package]]
 name = "sui-graph-store"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8bed62aa132d29891453dc17175da3a0b10e57988c84f522d6e3504e06ed4a"
+checksum = "9a4062b07a5b32f3897f4ed66c6fadc8ca3b9f00be35a708da578aaca15c9124"
 dependencies = [
  "blake3",
  "bytecheck 0.8.3",
@@ -5561,19 +5570,31 @@ dependencies = [
 
 [[package]]
 name = "sui-intern"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3635363032abaf2583153cd7c65a586e2c2601ab0b42231147739163b4011608"
+checksum = "ca8e5be0d57dfd5cfea93aa01fb14244080f264417a48148065e6ed1bec0bf05"
 dependencies = [
  "blake3",
  "rustc-hash 2.1.3",
 ]
 
 [[package]]
-name = "sui-orchestrate"
-version = "0.1.156"
+name = "sui-normalize"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8679a50c6c21b11c022c330146fc0a46ee8813fe0897ceeb487c33edcfcf7a99"
+checksum = "9921ebfa079e561818efbf358cef4b9c37e95a524bd0ab15b4a9d23a71b89ed1"
+dependencies = [
+ "rnix",
+ "rowan",
+ "rustc-hash 2.1.3",
+ "sui-intern",
+]
+
+[[package]]
+name = "sui-orchestrate"
+version = "0.1.219"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e2230fdeb4e8b058dbd24684e7e8acfa92b8a5163774905da55218d157c7457"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5599,9 +5620,9 @@ dependencies = [
 
 [[package]]
 name = "sui-resolve"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9adb4a3677fd33ce2ab31f5a858fb275da7a478f47327866b763c4bcc714a3a"
+checksum = "7c4017bb1039cfc11b7e1af2d42a47c13000f2d95f072c1537b8069b13d09002"
 dependencies = [
  "rnix",
  "rowan",
@@ -5611,14 +5632,15 @@ dependencies = [
 
 [[package]]
 name = "sui-spec"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "228384e8c2c76a64a8730cff69f7da90a29731504b469b47719bf2eeea1430a3"
+checksum = "c3fbcffa546650abab64d928716631738a9961ebe17da112df04e3159ec2d6a0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytecheck 0.8.3",
  "flate2",
+ "handan",
  "libc",
  "pleme-io-kazari",
  "regex",
@@ -5638,9 +5660,9 @@ dependencies = [
 
 [[package]]
 name = "sui-store"
-version = "0.1.157"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21af4e28a39f0518e8576581ac354e2a3bc403f1982e1ae19d74661f291d1414"
+checksum = "3a34cd98c68c696dcf633f3300a5a081e92eed6d846d6a8ca0e74eca01e46f66"
 dependencies = [
  "async-trait",
  "ed25519-dalek",
@@ -5661,9 +5683,9 @@ dependencies = [
 
 [[package]]
 name = "sui-supercacheci"
-version = "0.1.156"
+version = "0.1.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5976ac5722b483efad30ca87866181d4f523a983a65f6ff195efa8be9c67b05"
+checksum = "a70873ef0bb76e051646990ac72de55f4d0c392dfcfaf42f5815936136ad55d0"
 dependencies = [
  "async-trait",
  "canteiro-types",
@@ -5835,7 +5857,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5845,7 +5867,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6580,7 +6602,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

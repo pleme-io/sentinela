@@ -11,6 +11,7 @@
   outputs = { substrate, ... }: substrate.rust.tool {
     src = ./.;
     member = "sentinela"; # the deployable bin; the other 2 members are libraries
+    variants.sui-driver.specFile = "Cargo.sui-driver.build-spec.json";
     module = {
       description = "sentinela — the Darwin GitOps node-sync daemon (Mac peer of comin)";
     };

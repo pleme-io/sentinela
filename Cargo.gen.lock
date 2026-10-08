@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "b04f83f7dd0c41c1aacab0255118fc8b8d2b9785f9d0afc653172ed4e66237eb",
+  "cargo_lock_sha256": "ef13ee560d3bd6f09ca689f818b237122d2f3d56ceb6bc58e746463c7b6a4a5f",
   "manifest_sha256": {
     "Cargo.toml": "892682566334a60a97f40d302b270310ac68de8dc9bd7139d7a562ad95218153",
     "sentinela-config/Cargo.toml": "5358e992fca19832a5941750f82fe1485973b16eacda3ea6249fc0563777566e",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
-    "sentinela/Cargo.toml": "1fe98db5347234ad6e8a23c690f7cfbcf57bcf85c4167f75dd064916cb027bc7"
+    "sentinela/Cargo.toml": "30f6149dd1ee56ccc2839b28f4741d1d677e0f06afea63ad9495f62bc343f714"
   },
   "target_resolves": {
     "base": {

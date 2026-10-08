@@ -341,14 +341,18 @@ impl RealEnv {
     ///
     /// Constructed per call rather than stored: it borrows the config, and a
     /// driver is a zero-cost dispatch wrapper, not a resource. Selection is
-    /// the existing typed `RebuildTool` sum — a config that names sui is
-    /// already refused by `preflight` when sui cannot resolve the node's
-    /// flake ref, so an unusable pairing never reaches here.
+    /// the typed `RebuildTool` sum plus, for sui, `SuiMode`: `subprocess` runs
+    /// the `sui` CLI through the same bounded shell driver, `embedded` runs
+    /// sui-orchestrate in this process. `preflight` refuses `embedded` on a
+    /// binary built without the `sui-driver` feature.
     fn driver(&self) -> Result<Box<dyn RebuildDriver + '_>, EnvError> {
         match self.cfg.rebuild_tool {
             sentinela_config::RebuildTool::DarwinRebuild
             | sentinela_config::RebuildTool::NixosRebuild => Ok(Box::new(ShellDriver { env: self })),
-            sentinela_config::RebuildTool::Sui => self.sui_driver(),
+            sentinela_config::RebuildTool::Sui => match self.cfg.sui.mode {
+                sentinela_config::SuiMode::Subprocess => Ok(Box::new(ShellDriver { env: self })),
+                sentinela_config::SuiMode::Embedded => self.sui_driver(),
+            },
         }
     }
 
@@ -383,7 +387,7 @@ impl RealEnv {
     /// refs, and building one from a rev is `RealEnv`'s job (it owns the
     /// flake_url and hostname), not the driver's.
     fn run_rebuild_ref(&self, verb: &str, flake_ref: &str) -> Result<std::process::Output, EnvError> {
-        let mut cmd = Command::new(self.cfg.rebuild_tool.binary());
+        let mut cmd = Command::new(self.cfg.rebuild_binary());
         for word in rebuild_argv(
             self.cfg.rebuild_tool,
             verb,
@@ -536,7 +540,7 @@ impl RealEnv {
         };
         run.run(cmd)
             .map_err(|e| {
-                exec_err(self.cfg.rebuild_tool.binary(), &e, |msg| {
+                exec_err(self.cfg.rebuild_binary(), &e, |msg| {
                     Self::rebuild_err(verb, msg)
                 })
             })
@@ -1906,6 +1910,30 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[test]
+    fn the_sui_mode_selects_the_driver() {
+        let with = |tool: sentinela_config::RebuildTool, mode: sentinela_config::SuiMode| {
+            RealEnv::new(SentinelaConfig {
+                rebuild_tool: tool,
+                sui: sentinela_config::SuiConfig {
+                    mode,
+                    ..sentinela_config::SuiConfig::default()
+                },
+                ..SentinelaConfig::default()
+            })
+        };
+        let sub = with(sentinela_config::RebuildTool::Sui, sentinela_config::SuiMode::Subprocess);
+        assert_eq!(sub.driver().map(|d| d.name()).ok(), Some("shell"));
+        let nix = with(sentinela_config::RebuildTool::NixosRebuild, sentinela_config::SuiMode::Embedded);
+        assert_eq!(nix.driver().map(|d| d.name()).ok(), Some("shell"));
+        let emb = with(sentinela_config::RebuildTool::Sui, sentinela_config::SuiMode::Embedded);
+        if cfg!(feature = "sui-driver") {
+            assert_eq!(emb.driver().map(|d| d.name()).ok(), Some("sui"));
+        } else {
+            assert!(matches!(emb.driver().map(|d| d.name()), Err(EnvError::ToolMissing { .. })));
+        }
+    }
+
     fn env_with_state(dir: &std::path::Path) -> RealEnv {
         RealEnv::new(SentinelaConfig {
             state_dir: dir.to_string_lossy().into_owned(),
@@ -2349,39 +2377,8 @@ impl SuiDriver {
 }
 
 #[cfg(feature = "sui-driver")]
-impl SuiDriver {
-    /// Refuse a ref the pinned sui cannot resolve, naming the fix.
-    ///
-    /// crates.io has sui-orchestrate 0.1.156; `github:owner/repo/<rev>`
-    /// resolution landed in 0.1.176, which is not published yet (see this
-    /// crate's Cargo.toml for the measurement). Passing such a ref down would
-    /// surface as `getFlake: …/flake.nix: No such file or directory` — an
-    /// error that reads like a broken checkout and sent one investigation
-    /// down the wrong path already. Better to name the actual cause here.
-    ///
-    /// This whole function deletes itself when the pin moves to 0.1.176.
-    fn reject_unresolvable(flake_ref: &str) -> Result<(), EnvError> {
-        if flake_ref.starts_with("github:") {
-            return Err(EnvError::BuildFailed(
-                [
-                    "sui driver cannot resolve remote ref `",
-                    flake_ref,
-                    "`: the pinned sui-orchestrate (0.1.156, the newest on \
-                     crates.io) predates github:owner/repo/<rev> support, \
-                     which landed in 0.1.176. Publish sui 0.1.176+ and bump \
-                     the pin, or select rebuild_tool = darwin-rebuild.",
-                ]
-                .concat(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "sui-driver")]
 impl RebuildDriver for SuiDriver {
     fn build(&self, flake_ref: &str) -> Result<(), EnvError> {
-        Self::reject_unresolvable(flake_ref)?;
         let orch = Self::orchestrator()?;
         Self::block_on(orch.build_toplevel(flake_ref))?
             .map(|_out_path| ())
@@ -2389,7 +2386,6 @@ impl RebuildDriver for SuiDriver {
     }
 
     fn switch(&self, flake_ref: &str) -> Result<(), EnvError> {
-        Self::reject_unresolvable(flake_ref)?;
         let orch = Self::orchestrator()?;
         Self::block_on(orch.rebuild_native(flake_ref, sui_orchestrate::system::RebuildAction::Switch))?
             .map(|_result| ())

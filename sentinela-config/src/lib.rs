@@ -137,38 +137,13 @@ pub enum RebuildTool {
     DarwinRebuild,
     /// NixOS.
     NixosRebuild,
-    /// sui — the fleet's own pure-Rust nix. **The P5 destination, and NOT
-    /// USABLE BY THIS DAEMON YET.**
-    ///
-    /// ── ★ WHY IT IS HERE ANYWAY (MODULARIZE, DON'T DELETE) ───────────────
-    /// `sui-orchestrate` states its own purpose as *"Replaces darwin-rebuild,
-    /// nixos-rebuild, deploy-rs, and colmena"*
-    /// (`sui/sui-orchestrate/src/lib.rs:3`), so the subprocess this daemon
-    /// spawns is a reimplementation boundary against a primitive the fleet
-    /// already owns — doctrine P5 / `theory/RECONCILER-LIVENESS.md` §IV.3.
-    /// The pipeline behind `sui system rebuild` is real and wired: 10 of 11
-    /// surfaces on the marquee path are REAL
-    /// (`sui/docs/SUI-SUPREMACY-ROADMAP.md:105-121`), M2.6 closed
-    /// (`sui/docs/SUI-EQUIVALENCE.md:110`).
-    ///
-    /// ── ★ WHY IT CANNOT BE SELECTED TODAY ────────────────────────────────
-    /// Its [`flake_ref_syntax`](Self::flake_ref_syntax) is
-    /// [`FlakeRefSyntax::LocalPathOnly`], and every real sentinela config
-    /// names a remote repo — so `sentinela::preflight` REFUSES the pairing and
-    /// the daemon exits rather than failing every tick forever. See
-    /// [`FlakeRefSyntax`] for the measured evidence.
-    ///
-    /// Two things must land before this variant is reachable, and neither is
-    /// in this repo:
-    /// 1. sui gains a fetcher for `github:owner/repo/<rev>` in `FlakeRef` —
-    ///    then this becomes [`FlakeRefSyntax::Remote`] and nothing else moves;
-    ///    **or** sentinela materializes each rev into `<flake_url>/<rev>/` and
-    ///    the config names an absolute path, which needs a materializer this
-    ///    daemon does not have.
-    /// 2. sui's byte-identical toplevel is proven, not just built — the loop
-    ///    inherits that gate (`sui/docs/CONVERGENCE.md` R5). A node reconciler
-    ///    that activates a *different* system than `nix run .#rebuild` is
-    ///    worse than one that shells out.
+    /// sui — the fleet's own pure-Rust nix (doctrine P5,
+    /// `theory/RECONCILER-LIVENESS.md` §IV.3). Resolves the rev-pinned
+    /// `github:owner/repo/<rev>` ref this daemon builds since sui 0.1.176
+    /// (`sui-compat/src/flake_ref.rs`, b53648b). How it runs, in this process
+    /// or as the `sui` CLI, is [`SuiConfig::mode`]. Opt-in per node: sui's own
+    /// byte-identity gate on whole-system closures is still open
+    /// (`sui/docs/SILENT-DIVERGENCE-HUNT.md`).
     Sui,
 }
 
@@ -207,7 +182,31 @@ impl RebuildTool {
     pub fn flake_ref_syntax(self) -> FlakeRefSyntax {
         match self {
             Self::DarwinRebuild | Self::NixosRebuild => FlakeRefSyntax::Remote,
-            Self::Sui => FlakeRefSyntax::LocalPathOnly,
+            Self::Sui => FlakeRefSyntax::Remote,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SuiMode {
+    #[default]
+    Subprocess,
+    Embedded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuiConfig {
+    pub mode: SuiMode,
+    pub binary: String,
+}
+
+impl Default for SuiConfig {
+    fn default() -> Self {
+        Self {
+            mode: SuiMode::Subprocess,
+            binary: RebuildTool::Sui.binary().to_owned(),
         }
     }
 }
@@ -331,6 +330,7 @@ pub struct SentinelaConfig {
     /// Which rebuild tool to drive. Defaults to `darwin-rebuild` so every
     /// existing config is unchanged; a NixOS node sets `nixos-rebuild`.
     pub rebuild_tool: RebuildTool,
+    pub sui: SuiConfig,
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
@@ -709,6 +709,14 @@ impl SentinelaConfig {
     /// make `prescribed_default()` itself unusable. A mis-rendered empty url
     /// is already a visible failure at probe time.
     #[must_use]
+    pub fn rebuild_binary(&self) -> &str {
+        match self.rebuild_tool {
+            RebuildTool::Sui => &self.sui.binary,
+            tool => tool.binary(),
+        }
+    }
+
+    #[must_use]
     pub fn flake_ref_is_resolvable(&self) -> bool {
         self.flake_url.is_empty()
             || self
@@ -736,6 +744,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             switch_timeout_seconds: 0,
             git_timeout_seconds: 0,
             rebuild_tool: RebuildTool::DarwinRebuild,
+            sui: SuiConfig::default(),
             rollback: RollbackConfig {
                 enabled: false,
                 window_seconds: 0,
@@ -764,6 +773,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             switch_timeout_seconds: DEFAULT_SWITCH_TIMEOUT_SECONDS,
             git_timeout_seconds: DEFAULT_GIT_TIMEOUT_SECONDS,
             rebuild_tool: RebuildTool::DarwinRebuild,
+            sui: SuiConfig::default(),
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
@@ -795,6 +805,41 @@ mod tests {
         // Node-specific coordinates are intentionally empty (module fills).
         assert!(p.flake_url.is_empty());
         assert!(p.hostname.is_empty());
+    }
+
+    #[test]
+    fn sui_defaults_to_the_subprocess_cli_and_reads_embedded() {
+        let absent: SentinelaConfig = serde_yaml::from_str("hostname: plo").unwrap();
+        assert_eq!(absent.sui, SuiConfig::default());
+        assert_eq!(absent.sui.mode, SuiMode::Subprocess);
+        assert_eq!(absent.sui.binary, RebuildTool::Sui.binary());
+
+        let embedded: SentinelaConfig =
+            serde_yaml::from_str("rebuild_tool: sui\nsui:\n  mode: embedded\n").unwrap();
+        assert_eq!(embedded.rebuild_tool, RebuildTool::Sui);
+        assert_eq!(embedded.sui.mode, SuiMode::Embedded);
+        assert_eq!(embedded.sui.binary, RebuildTool::Sui.binary());
+
+        let pinned: SentinelaConfig =
+            serde_yaml::from_str("rebuild_tool: sui\nsui:\n  binary: /nix/store/x-sui/bin/sui\n").unwrap();
+        assert_eq!(pinned.rebuild_binary(), "/nix/store/x-sui/bin/sui");
+        assert_eq!(pinned.sui.mode, SuiMode::Subprocess);
+    }
+
+    #[test]
+    fn an_unknown_sui_key_or_mode_is_refused() {
+        assert!(serde_yaml::from_str::<SentinelaConfig>("sui:\n  mode: in-memory\n").is_err());
+        assert!(serde_yaml::from_str::<SentinelaConfig>("sui:\n  bin: /x\n").is_err());
+    }
+
+    #[test]
+    fn sui_resolves_the_remote_ref_the_daemon_builds() {
+        let c = SentinelaConfig {
+            flake_url: "github:pleme-io/nix".to_owned(),
+            rebuild_tool: RebuildTool::Sui,
+            ..SentinelaConfig::prescribed_default()
+        };
+        assert!(c.flake_ref_is_resolvable());
     }
 
     #[test]
@@ -871,6 +916,7 @@ mod tests {
             switch_timeout_seconds: 1800,
             git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
+            sui: SuiConfig::default(),
             rollback: RollbackConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
         };
@@ -1051,33 +1097,14 @@ mod rebuild_tool_tests {
         assert_eq!(RebuildTool::Sui.argv_prefix(), &["system", "rebuild"]);
     }
 
-    /// ── ★ THE MEASURED BLOCKER, AS A TEST ────────────────────────────────
-    /// sui parses the left half of `<ref>#<attr>` as a filesystem path
-    /// (`sui/sui-compat/src/flake_ref.rs:37-58`), so a `github:` ref becomes a
-    /// directory that does not exist. Proven live on cid 2026-08-05 against
-    /// sui 0.1.154:
-    ///   `getFlake: github:pleme-io/nix/<rev>/flake.nix: No such file or directory`
     #[test]
-    fn sui_cannot_resolve_a_remote_flake_ref_and_the_nix_tools_can() {
-        assert_eq!(
-            RebuildTool::Sui.flake_ref_syntax(),
-            FlakeRefSyntax::LocalPathOnly
-        );
-        assert_eq!(
-            RebuildTool::DarwinRebuild.flake_ref_syntax(),
-            FlakeRefSyntax::Remote
-        );
-        assert_eq!(
-            RebuildTool::NixosRebuild.flake_ref_syntax(),
-            FlakeRefSyntax::Remote
-        );
-
+    fn every_tool_resolves_the_rev_pinned_remote_ref_and_local_only_stays_typed() {
+        for tool in [RebuildTool::DarwinRebuild, RebuildTool::NixosRebuild, RebuildTool::Sui] {
+            assert_eq!(tool.flake_ref_syntax(), FlakeRefSyntax::Remote, "{tool:?}");
+        }
         let remote = "github:pleme-io/nix";
         assert!(FlakeRefSyntax::Remote.accepts(remote));
-        assert!(
-            !FlakeRefSyntax::LocalPathOnly.accepts(remote),
-            "a github: ref has no fetcher on sui's path — it is opened as a directory"
-        );
+        assert!(!FlakeRefSyntax::LocalPathOnly.accepts(remote));
     }
 
     /// The accepted local forms are exactly the two sui's parser handles
@@ -1093,10 +1120,10 @@ mod rebuild_tool_tests {
         assert!(!FlakeRefSyntax::LocalPathOnly.accepts("git+https://example.invalid/r"));
     }
 
-    /// The pairing check the preflight refuses on. A remote-capable tool never
-    /// trips it; sui trips it for every realistic sentinela config.
+    /// The pairing check the preflight refuses on. Since sui 0.1.176 no tool
+    /// trips it for the rev-pinned remote ref this daemon builds.
     #[test]
-    fn a_remote_flake_url_is_unresolvable_under_sui_and_fine_under_the_nix_tools() {
+    fn a_remote_flake_url_is_resolvable_under_every_tool() {
         let with = |tool| SentinelaConfig {
             flake_url: "github:pleme-io/nix".to_owned(),
             hostname: "rio".to_owned(),
@@ -1105,12 +1132,7 @@ mod rebuild_tool_tests {
         };
         assert!(with(RebuildTool::DarwinRebuild).flake_ref_is_resolvable());
         assert!(with(RebuildTool::NixosRebuild).flake_ref_is_resolvable());
-        assert!(
-            !with(RebuildTool::Sui).flake_ref_is_resolvable(),
-            "selecting sui against a remote repo must be refused BEFORE the loop \
-             starts — otherwise every tick fails closed forever while the unit \
-             reads active(running) and the heartbeat stays fresh"
-        );
+        assert!(with(RebuildTool::Sui).flake_ref_is_resolvable());
     }
 
     /// The empty url both tiers ship must not be judged, or `bare()` and

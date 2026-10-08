@@ -154,12 +154,19 @@ enum PreflightFailure {
         tool: &'static str,
         flake_url: String,
     },
+    SuiEmbeddedUnavailable,
 }
 
 impl std::fmt::Display for PreflightFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ToolMissing { tool } => write!(f, "required tool not found: {tool}"),
+            Self::SuiEmbeddedUnavailable => write!(
+                f,
+                "rebuild_tool = sui with sui.mode = embedded needs a sentinela built \
+                 with the `sui-driver` feature, and this binary was built without it. \
+                 Select sui.mode = subprocess, or deploy the sui-driver build."
+            ),
             Self::FlakeRefUnsupported { tool, flake_url } => write!(
                 f,
                 "{tool} cannot resolve the flake ref `{flake_url}` — it accepts \
@@ -215,14 +222,17 @@ fn preflight(cfg: &SentinelaConfig) -> Vec<PreflightFailure> {
         Err(_) | Ok(_) => {}
     }
 
-    let rebuild = cfg.rebuild_tool.binary();
-    if !std::path::Path::new(rebuild).exists() {
-        failures.push(PreflightFailure::ToolMissing {
-            tool: rebuild.to_owned(),
-        });
+    if !uses_embedded_sui(cfg) {
+        let rebuild = cfg.rebuild_binary();
+        if !std::path::Path::new(rebuild).exists() {
+            failures.push(PreflightFailure::ToolMissing {
+                tool: rebuild.to_owned(),
+            });
+        }
     }
 
     failures.extend(flake_ref_failure(cfg));
+    failures.extend(sui_mode_failure(cfg, cfg!(feature = "sui-driver")));
 
     // The `green` policy reads check results with curl; without it every
     // tick would be blind while the loop reported itself alive.
@@ -266,6 +276,15 @@ fn flake_ref_failure(cfg: &SentinelaConfig) -> Option<PreflightFailure> {
     })
 }
 
+fn uses_embedded_sui(cfg: &SentinelaConfig) -> bool {
+    cfg.rebuild_tool == sentinela_config::RebuildTool::Sui
+        && cfg.sui.mode == sentinela_config::SuiMode::Embedded
+}
+
+fn sui_mode_failure(cfg: &SentinelaConfig, built_with_sui_driver: bool) -> Option<PreflightFailure> {
+    (uses_embedded_sui(cfg) && !built_with_sui_driver).then_some(PreflightFailure::SuiEmbeddedUnavailable)
+}
+
 /// The daemon loop: one cycle, then sleep `poll_seconds`, forever.
 fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::ExitCode {
     // ── ★ PREFLIGHT BEFORE THE LOOP, AND EXIT IF IT FAILS ────────────────
@@ -286,7 +305,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
             .join("; ");
         tracing::error!(
             reasons = %reasons,
-            rebuild_tool = cfg.rebuild_tool.binary(),
+            rebuild_tool = cfg.rebuild_binary(),
             "sentinela: PREFLIGHT FAILED — refusing to start. \
              A daemon that cannot probe or rebuild must not report itself healthy; \
              every tick would fail closed while every liveness surface read green. \
@@ -957,8 +976,8 @@ mod config_reload_tests {
 
 #[cfg(test)]
 mod preflight_tests {
-    use super::{PreflightFailure, flake_ref_failure};
-    use sentinela_config::{RebuildTool, SentinelaConfig};
+    use super::{PreflightFailure, flake_ref_failure, sui_mode_failure};
+    use sentinela_config::{RebuildTool, SentinelaConfig, SuiConfig, SuiMode};
 
     fn cfg_with(tool: RebuildTool, flake_url: &str) -> SentinelaConfig {
         SentinelaConfig {
@@ -969,24 +988,61 @@ mod preflight_tests {
         }
     }
 
-    /// ── ★ THE REFUSAL THAT MAKES `RebuildTool::Sui` SAFE TO SHIP ─────────
-    /// sui cannot parse a `github:` flake ref (`sui-compat/src/flake_ref.rs`
-    /// treats the left half of `<ref>#<attr>` as a filesystem path; measured
-    /// live on cid 2026-08-05 against sui 0.1.154). Without this refusal, a
-    /// node that selected sui would start, tick, fail closed on every build
-    /// with `getFlake: … No such file or directory`, and report `active
-    /// (running)` with a fresh heartbeat forever — the exact rio 2026-08-05
-    /// shape, reintroduced by a config knob.
     #[test]
-    fn sui_against_a_remote_flake_url_is_refused_before_the_loop_starts() {
+    fn sui_resolves_the_rev_pinned_remote_ref_the_loop_builds() {
         assert_eq!(
             flake_ref_failure(&cfg_with(RebuildTool::Sui, "github:pleme-io/nix")),
-            Some(PreflightFailure::FlakeRefUnsupported {
-                tool: RebuildTool::Sui.binary(),
-                flake_url: "github:pleme-io/nix".to_owned(),
-            }),
-            "selecting sui against a remote repo must refuse at startup"
+            None
         );
+    }
+
+    fn sui_cfg(mode: SuiMode) -> SentinelaConfig {
+        SentinelaConfig {
+            sui: SuiConfig {
+                mode,
+                ..SuiConfig::default()
+            },
+            ..cfg_with(RebuildTool::Sui, "github:pleme-io/nix")
+        }
+    }
+
+    #[test]
+    fn embedded_sui_without_the_driver_build_is_refused_at_startup() {
+        assert_eq!(
+            sui_mode_failure(&sui_cfg(SuiMode::Embedded), false),
+            Some(PreflightFailure::SuiEmbeddedUnavailable)
+        );
+        assert!(
+            PreflightFailure::SuiEmbeddedUnavailable
+                .to_string()
+                .contains("sui-driver")
+        );
+    }
+
+    #[test]
+    fn embedded_sui_with_the_driver_build_and_subprocess_sui_both_start() {
+        assert_eq!(sui_mode_failure(&sui_cfg(SuiMode::Embedded), true), None);
+        assert_eq!(sui_mode_failure(&sui_cfg(SuiMode::Subprocess), false), None);
+    }
+
+    #[test]
+    fn the_sui_mode_never_refuses_a_nix_tool() {
+        for tool in [RebuildTool::DarwinRebuild, RebuildTool::NixosRebuild] {
+            let cfg = SentinelaConfig {
+                rebuild_tool: tool,
+                ..sui_cfg(SuiMode::Embedded)
+            };
+            assert_eq!(sui_mode_failure(&cfg, false), None, "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn subprocess_sui_runs_the_configured_binary_and_the_nix_tools_their_own() {
+        let mut cfg = sui_cfg(SuiMode::Subprocess);
+        cfg.sui.binary = "/nix/store/x-sui-0.1.219/bin/sui".to_owned();
+        assert_eq!(cfg.rebuild_binary(), "/nix/store/x-sui-0.1.219/bin/sui");
+        cfg.rebuild_tool = RebuildTool::NixosRebuild;
+        assert_eq!(cfg.rebuild_binary(), RebuildTool::NixosRebuild.binary());
     }
 
     /// The refusal must be SCOPED to the tool that cannot do it — otherwise
