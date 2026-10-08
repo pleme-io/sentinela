@@ -744,6 +744,7 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         // The DISTILLED cause of the most recent failure. See
         // `distill_failure` — the raw receipt is mostly cascade.
         "last_failure": last_failure_lines(&chain),
+        "recent_failures": recent_failures(&chain, env.now_unix_ms(), RECENT_FAILURE_WINDOW_MS),
         "converged": convergence_gate(
             &beat,
             env.now_unix_ms(),
@@ -1495,6 +1496,8 @@ impl std::fmt::Display for StatusView<'_> {
             }
         }
 
+        write_recent_failures(f, v, now_ms)?;
+
         write_probation(f, v, now_ms)?;
 
         let verified = v.get("chain_verified").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -1610,7 +1613,12 @@ fn last_failure_lines(chain: &sentinela_core::ReceiptChain) -> Option<Vec<String
         match &r.outcome {
             sentinela_core::Outcome::Activated { .. } => seen_success = true,
             sentinela_core::Outcome::Failed { error } if !seen_success => {
-                return Some(distill_failure(error));
+                let mut lines = distill_failure(error);
+                if let Some(cause) = failure_cause(error) {
+                    lines.retain(|l| *l != cause);
+                    lines.insert(0, cause);
+                }
+                return Some(lines);
             }
             sentinela_core::Outcome::RolledBack {
                 from,
@@ -1701,6 +1709,368 @@ fn distill_failure(raw: &str) -> Vec<String> {
         out.push(note);
     }
     out
+}
+
+const RECENT_FAILURE_WINDOW_MS: u64 = 24 * 3600 * 1000;
+
+fn is_cascade_error(t: &str) -> bool {
+    t.contains("Cannot build '")
+        || t.contains("Build failed due to failed dependency")
+        || t.contains("dependency failed")
+        || t.contains("dependencies of derivation")
+}
+
+fn failure_cause(raw: &str) -> Option<String> {
+    let last_error = raw
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|t| t.len() > "error: ".len() && t.starts_with("error: ") && !is_cascade_error(t));
+    last_error
+        .or_else(|| {
+            raw.lines().map(str::trim).find(|t| {
+                !t.is_empty()
+                    && !t.ends_with("building the system configuration...")
+                    && !t.starts_with('…')
+                    && !t.starts_with("warning:")
+                    && !t.starts_with("disabling binary cache")
+                    && !t.starts_with("unpacking ")
+                    && !t.starts_with("copying ")
+                    && !t.starts_with("building '")
+                    && !t.starts_with("these ")
+                    && !t.starts_with("/nix/store/")
+                    && !is_cascade_error(t)
+            })
+        })
+        .map(elide_store_hashes)
+}
+
+fn elide_store_hashes(s: &str) -> String {
+    const PREFIX: &str = "/nix/store/";
+    const HASH_LEN: usize = 32;
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(PREFIX) {
+        let after = &rest[i + PREFIX.len()..];
+        let bytes = after.as_bytes();
+        let hashed = bytes.len() > HASH_LEN
+            && bytes[HASH_LEN] == b'-'
+            && bytes[..HASH_LEN].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        out.push_str(&rest[..i + PREFIX.len()]);
+        if hashed {
+            out.push('…');
+            rest = &after[HASH_LEN..];
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn receipt_failure_cause(outcome: &sentinela_core::Outcome) -> Option<String> {
+    match outcome {
+        sentinela_core::Outcome::Failed { error } => Some(
+            failure_cause(error).unwrap_or_else(|| "no cause line in the receipt".to_owned()),
+        ),
+        sentinela_core::Outcome::RolledBack { from, to, probe, .. } => Some(
+            [
+                "rolled back generation ",
+                &from.to_string(),
+                " → ",
+                &to.to_string(),
+                ": probe `",
+                probe,
+                "` failed",
+            ]
+            .concat(),
+        ),
+        _ => None,
+    }
+}
+
+fn recent_failures(
+    chain: &sentinela_core::ReceiptChain,
+    now_ms: u64,
+    window_ms: u64,
+) -> serde_json::Value {
+    let since = now_ms.saturating_sub(window_ms);
+    let mut causes: Vec<(String, u64, u64, String)> = Vec::new();
+    let mut failed_ticks = 0_u64;
+    let mut last_failure_at = 0_u64;
+    let mut last_activation_at = 0_u64;
+    for r in chain.entries().iter().filter(|r| r.at_unix_ms >= since) {
+        if matches!(r.outcome, sentinela_core::Outcome::Activated { .. }) {
+            last_activation_at = r.at_unix_ms;
+            continue;
+        }
+        let Some(cause) = receipt_failure_cause(&r.outcome) else {
+            continue;
+        };
+        failed_ticks += 1;
+        last_failure_at = r.at_unix_ms;
+        let rev = r.rev.as_str().to_owned();
+        match causes.iter_mut().find(|c| c.0 == cause) {
+            Some(c) => {
+                c.1 += 1;
+                c.2 = r.at_unix_ms;
+                c.3 = rev;
+            }
+            None => causes.push((cause, 1, r.at_unix_ms, rev)),
+        }
+    }
+    causes.sort_by(|a, b| b.2.cmp(&a.2));
+    let recovered_at = (failed_ticks > 0 && last_activation_at > last_failure_at)
+        .then_some(last_activation_at);
+    serde_json::json!({
+        "window_hours": window_ms / 3_600_000,
+        "failed_ticks": failed_ticks,
+        "recovered_at_unix_ms": recovered_at,
+        "causes": causes
+            .iter()
+            .map(|(cause, count, at, rev)| serde_json::json!({
+                "cause": cause,
+                "count": count,
+                "last_at_unix_ms": at,
+                "last_rev": rev,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn clip_middle(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_owned();
+    }
+    let head = max_chars * 2 / 5;
+    let tail = max_chars.saturating_sub(head + 3);
+    let front: String = s.chars().take(head).collect();
+    let back: String = s.chars().skip(total - tail).collect();
+    [front.as_str(), " … ", back.as_str()].concat()
+}
+
+fn write_recent_failures(
+    f: &mut std::fmt::Formatter<'_>,
+    v: &serde_json::Value,
+    now_ms: u64,
+) -> std::fmt::Result {
+    const SHOWN: usize = 3;
+    const CAUSE_CHARS: usize = 110;
+    let Some(r) = v.get("recent_failures").filter(|r| !r.is_null()) else {
+        return Ok(());
+    };
+    let ticks = r.get("failed_ticks").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if ticks == 0 {
+        return Ok(());
+    }
+    let hours = r.get("window_hours").and_then(serde_json::Value::as_u64).unwrap_or(24);
+    let state = match r.get("recovered_at_unix_ms").and_then(serde_json::Value::as_u64) {
+        Some(t) => paint(&["recovered ", &human_age(t, now_ms), " ago"].concat(), "32"),
+        None => paint("still failing", "31;1"),
+    };
+    writeln!(f)?;
+    writeln!(
+        f,
+        "    {:<11} {} · {}",
+        "recent",
+        paint(
+            &[&ticks.to_string(), " failed tick(s) in the last ", &hours.to_string(), "h"].concat(),
+            "33;1"
+        ),
+        state
+    )?;
+    let causes = r.get("causes").and_then(serde_json::Value::as_array).map_or(&[][..], Vec::as_slice);
+    for c in causes.iter().take(SHOWN) {
+        let u = |k: &str| c.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let cause = c.get("cause").and_then(serde_json::Value::as_str).unwrap_or("?");
+        let clipped = clip_middle(cause, CAUSE_CHARS);
+        writeln!(
+            f,
+            "      ×{:<5} {:>9} ago  {}  {}",
+            u("count"),
+            human_age(u("last_at_unix_ms"), now_ms),
+            short(c.get("last_rev").and_then(serde_json::Value::as_str).unwrap_or("—")),
+            paint(&clipped, "33")
+        )?;
+    }
+    if causes.len() > SHOWN {
+        writeln!(
+            f,
+            "      {}",
+            paint(
+                &["… ", &(causes.len() - SHOWN).to_string(), " more cause(s) in `sentinela status --json`"].concat(),
+                "2"
+            )
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recent_failure_tests {
+    use super::{StatusView, clip_middle, failure_cause, last_failure_lines, recent_failures};
+
+    #[test]
+    fn a_clipped_cause_keeps_the_reason_at_its_end() {
+        let raw = "error: opening Git repository \"/var/root/.cache/nix/tarball-cache\": could not open '/private/var/root/.cache/nix/tarball-cache/config': Too many open files";
+        let out = clip_middle(raw, 110);
+        assert!(out.chars().count() <= 110, "{out}");
+        assert!(out.starts_with("error: opening Git repository"), "{out}");
+        assert!(out.ends_with("Too many open files"), "{out}");
+        assert_eq!(clip_middle("short", 110), "short");
+    }
+    use sentinela_core::{Generation, Outcome, ReceiptChain, Rev};
+
+    const HOUR: u64 = 3600 * 1000;
+    const NOW: u64 = 100 * HOUR;
+    const WINDOW: u64 = 24 * HOUR;
+
+    fn rev(c: char) -> Rev {
+        Rev::parse(&c.to_string().repeat(40)).unwrap()
+    }
+
+    const IROHA_EVAL: &str = "build failed: building the system configuration...\n\
+        error:\n       … while evaluating the attribute 'optionalValue.value'\n\
+        \n         at /nix/store/0123456789abcdfghijklmnpqrsvwxyz-source/lib/modules.nix:1118:7:\n\
+        \n       … while calling the 'throw' builtin\n\
+        \n       (stack trace truncated; use '--show-trace' to show the full, detailed trace)\n\
+        \n       error: iroha gate (kata-fleet-pleme): FAILED — 45/46 passed";
+
+    const RESTART_GATE: &str = "switch failed: building the system configuration...\n\
+        engenho-restart-gate: HELD. This generation changes engenho-daemon's unit\n\
+        (its binary, its config or its PATH), and switching restarts every engenho";
+
+    const BUILDER: &str = "build failed: building the system configuration...\n\
+        error: builder for '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-foo.drv' failed with exit code 1\n\
+        error: 1 dependencies of derivation '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-bar.drv' failed to build\n\
+        error: Cannot build '/nix/store/0123456789abcdfghijklmnpqrsvwxyz-system.drv'.\n\
+               Reason: 1 dependency failed.";
+
+    #[test]
+    fn an_eval_failure_is_named_by_its_final_message_not_its_trace() {
+        assert_eq!(
+            failure_cause(IROHA_EVAL).as_deref(),
+            Some("error: iroha gate (kata-fleet-pleme): FAILED — 45/46 passed")
+        );
+    }
+
+    const FD_CRASH: &str = "build failed: building the system configuration...\n\
+        unpacking 'github:pleme-io/nix/0d73d7a864abeefba1df27a73d0c23df91648c82' into the Git cache...\n\
+        warning: error: unable to download 'http://rio:5000/nix-cache-info': Timeout was reached (28)\n\
+        disabling binary cache 'http://rio:5000' for 60 seconds\n\
+        warning: unable to download 'http://rio:5000/nix-cache-info': Timeout was reached (28)\n\
+        copying path '/nix/store/mn8gk4r87grls81sp5bjgfwcanrfqhlj-source' from 'https://cache.nixos.org'...\n\
+        *** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated\n\
+        Command 'nix build' died with SIGABRT";
+
+    #[test]
+    fn a_crashed_nix_is_named_by_the_crash_not_the_substituter_noise() {
+        assert_eq!(
+            failure_cause(FD_CRASH).as_deref(),
+            Some("*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated")
+        );
+    }
+
+    #[test]
+    fn a_held_switch_is_named_by_the_gate_line() {
+        assert_eq!(
+            failure_cause(RESTART_GATE).as_deref(),
+            Some("engenho-restart-gate: HELD. This generation changes engenho-daemon's unit")
+        );
+    }
+
+    #[test]
+    fn a_build_failure_is_named_by_the_builder_not_its_cascade() {
+        assert_eq!(
+            failure_cause(BUILDER).as_deref(),
+            Some("error: builder for '/nix/store/…-foo.drv' failed with exit code 1")
+        );
+    }
+
+    #[test]
+    fn the_failure_block_leads_with_the_cause() {
+        let mut c = ReceiptChain::new();
+        c.append(c.next_receipt(rev('a'), Outcome::Failed { error: IROHA_EVAL.into() }, 1))
+            .unwrap();
+        let lines = last_failure_lines(&c).expect("a failure to report");
+        assert_eq!(lines[0], "error: iroha gate (kata-fleet-pleme): FAILED — 45/46 passed");
+    }
+
+    fn week_like_chain() -> ReceiptChain {
+        let mut c = ReceiptChain::new();
+        let mut push = |r: char, o: Outcome, at: u64| {
+            let next = c.next_receipt(rev(r), o, at);
+            c.append(next).unwrap();
+        };
+        push('a', Outcome::Failed { error: IROHA_EVAL.into() }, NOW - 30 * HOUR);
+        push('b', Outcome::Failed { error: RESTART_GATE.into() }, NOW - 5 * HOUR);
+        push('b', Outcome::Failed { error: RESTART_GATE.into() }, NOW - 4 * HOUR);
+        push('c', Outcome::Failed { error: IROHA_EVAL.into() }, NOW - 3 * HOUR);
+        push('d', Outcome::Activated { generation: Generation(7) }, NOW - 2 * HOUR);
+        c
+    }
+
+    #[test]
+    fn a_recovered_failure_stays_visible_inside_the_window() {
+        let r = recent_failures(&week_like_chain(), NOW, WINDOW);
+        assert_eq!(r["failed_ticks"], 3, "the 30h-old failure is outside the window: {r}");
+        assert_eq!(r["recovered_at_unix_ms"], NOW - 2 * HOUR);
+        let causes = r["causes"].as_array().unwrap();
+        assert_eq!(causes.len(), 2, "{r}");
+        assert_eq!(causes[0]["cause"], "error: iroha gate (kata-fleet-pleme): FAILED — 45/46 passed");
+        assert_eq!(causes[0]["count"], 1);
+        assert_eq!(causes[1]["count"], 2);
+        assert!(last_failure_lines(&week_like_chain()).is_none(), "the current-failure block stays recovery-aware");
+    }
+
+    #[test]
+    fn a_failure_after_the_last_activation_is_still_failing() {
+        let mut c = week_like_chain();
+        let next = c.next_receipt(rev('e'), Outcome::Failed { error: BUILDER.into() }, NOW - HOUR);
+        c.append(next).unwrap();
+        let r = recent_failures(&c, NOW, WINDOW);
+        assert!(r["recovered_at_unix_ms"].is_null(), "{r}");
+        assert_eq!(r["failed_ticks"], 4);
+    }
+
+    #[test]
+    fn a_clean_window_reports_nothing_and_the_panel_stays_quiet() {
+        let mut c = ReceiptChain::new();
+        let next = c.next_receipt(rev('a'), Outcome::Activated { generation: Generation(1) }, NOW - HOUR);
+        c.append(next).unwrap();
+        let r = recent_failures(&c, NOW, WINDOW);
+        assert_eq!(r["failed_ticks"], 0);
+        let v = serde_json::json!({"hostname": "plo", "converged": {"ok": true, "why": null}, "recent_failures": r});
+        assert!(!StatusView(&v).to_string().contains("recent"));
+    }
+
+    #[test]
+    fn the_panel_names_each_recent_cause_even_when_converged() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let mut c = ReceiptChain::new();
+        let mut push = |r: char, o: Outcome, at: u64| {
+            let next = c.next_receipt(rev(r), o, at);
+            c.append(next).unwrap();
+        };
+        push('b', Outcome::Failed { error: RESTART_GATE.into() }, now - 5 * HOUR);
+        push('c', Outcome::Failed { error: IROHA_EVAL.into() }, now - 3 * HOUR);
+        push('d', Outcome::Activated { generation: Generation(7) }, now - 2 * HOUR);
+        let v = serde_json::json!({
+            "hostname": "plo",
+            "converged": {"ok": true, "why": null},
+            "recent_failures": recent_failures(&c, now, WINDOW),
+        });
+        let out = StatusView(&v).to_string();
+        assert!(out.contains("CONVERGED"), "{out}");
+        assert!(out.contains("2 failed tick(s) in the last 24h"), "{out}");
+        assert!(out.contains("recovered 2h0m ago"), "{out}");
+        assert!(out.contains("iroha gate (kata-fleet-pleme): FAILED"), "{out}");
+        assert!(out.contains("engenho-restart-gate: HELD"), "{out}");
+        assert!(out.contains("cccccccc"), "{out}");
+    }
 }
 
 #[cfg(test)]
