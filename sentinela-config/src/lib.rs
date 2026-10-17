@@ -195,6 +195,24 @@ pub enum SuiMode {
     Embedded,
 }
 
+pub const LEGACY_REBUILD_LOCK_PATH: &str = "/tmp/fleet-rebuild.lock";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwitchLockConfig {
+    pub path: String,
+    pub hold: bool,
+}
+
+impl Default for SwitchLockConfig {
+    fn default() -> Self {
+        Self {
+            path: LEGACY_REBUILD_LOCK_PATH.to_owned(),
+            hold: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlannerConfig {
@@ -354,6 +372,7 @@ pub struct SentinelaConfig {
     pub rebuild_tool: RebuildTool,
     pub sui: SuiConfig,
     pub planner: PlannerConfig,
+    pub switch_lock: SwitchLockConfig,
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
@@ -769,6 +788,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             rebuild_tool: RebuildTool::DarwinRebuild,
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
+            switch_lock: SwitchLockConfig::default(),
             rollback: RollbackConfig {
                 enabled: false,
                 window_seconds: 0,
@@ -799,6 +819,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             rebuild_tool: RebuildTool::DarwinRebuild,
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
+            switch_lock: SwitchLockConfig::default(),
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
@@ -943,6 +964,7 @@ mod tests {
             rebuild_tool: RebuildTool::NixosRebuild,
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
+            switch_lock: SwitchLockConfig::default(),
             rollback: RollbackConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
         };

@@ -54,7 +54,7 @@ const PROBE_TAIL_BYTES: usize = 1024;
 /// machine-wide writable directory; `/private/tmp` is mode `1777` (sticky,
 /// world-writable), so both root and the operator can create and open this
 /// file and neither can unlink the other's.
-const REBUILD_LOCK_PATH: &str = "/tmp/fleet-rebuild.lock";
+const REBUILD_LOCK_PATH: &str = sentinela_config::LEGACY_REBUILD_LOCK_PATH;
 
 /// The production environment. Owns the config; the receipt chain lives
 /// at `<state_dir>/receipts.json`.
@@ -759,7 +759,7 @@ impl GitopsEnv for RealEnv {
         // next tick re-converges; documented rather than engineered around,
         // because fixing it would require holding the lock in a child we
         // deliberately orphan.
-        let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
+        let _lock = self.switch_guard()?;
         self.driver()?.switch(&self.flake_ref(rev))?;
         // Read the new generation from the system profile symlink; a
         // parse miss is non-fatal (the switch succeeded) — record 0.
@@ -866,7 +866,7 @@ impl GitopsEnv for RealEnv {
         // Same machine-wide lock as a switch: an operator rebuild in flight
         // must not have its activation raced by ours, and a busy lock is a
         // deferral the FSM retries rather than a failure.
-        let _lock = acquire_switch_lock(Path::new(REBUILD_LOCK_PATH))?;
+        let _lock = self.switch_guard()?;
         let link = generation_link(generation);
         if std::fs::symlink_metadata(&link).is_err() {
             return Err(EnvError::RollbackFailed(
@@ -1000,6 +1000,15 @@ impl GitopsEnv for RealEnv {
 }
 
 impl RealEnv {
+    fn switch_guard(&self) -> Result<Option<File>, EnvError> {
+        let path = Path::new(&self.cfg.switch_lock.path);
+        if self.cfg.switch_lock.hold {
+            acquire_switch_lock(path).map(Some)
+        } else {
+            probe_switch_lock(path).map(|()| None)
+        }
+    }
+
     fn planner_env(&self, rev: Option<&Rev>) -> Vec<(&'static str, String)> {
         let kind = match self.cfg.rebuild_tool {
             sentinela_config::RebuildTool::DarwinRebuild => "darwin",
@@ -1441,6 +1450,30 @@ fn acquire_switch_lock(lock_path: &Path) -> Result<File, EnvError> {
     Ok(file)
 }
 
+fn probe_switch_lock(lock_path: &Path) -> Result<(), EnvError> {
+    use fs4::fs_std::FileExt;
+    let file = match File::open(lock_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(EnvError::SwitchBusy(format!(
+                "cannot read the activation lock at {}: {e}",
+                lock_path.display()
+            )));
+        }
+    };
+    if FileExt::try_lock_exclusive(&file).is_err() {
+        let holder = std::fs::read_to_string(lock_path)
+            .map(|h| h.trim().to_owned())
+            .ok()
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| ["an activation holds ", &lock_path.display().to_string()].concat());
+        return Err(EnvError::SwitchBusy(holder));
+    }
+    let _ = FileExt::unlock(&file);
+    Ok(())
+}
+
 /// Standard-alphabet base64, no line wrapping.
 ///
 /// Hand-rolled rather than taking the `base64` crate: this is ~20 lines used
@@ -1713,6 +1746,42 @@ mod tests {
         assert_eq!(parse_generation("system-link"), None);
         assert_eq!(parse_generation("42"), None);
         assert_eq!(parse_generation("system-abc-link"), None);
+    }
+
+    #[test]
+    fn a_probed_activation_lock_defers_while_held_and_is_never_kept() {
+        use fs4::fs_std::FileExt;
+        let dir = std::env::temp_dir().join(format!("sentinela-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("activation.lock");
+        assert_eq!(probe_switch_lock(&path), Ok(()));
+        std::fs::write(&path, "").unwrap();
+        let holder = File::options().write(true).open(&path).unwrap();
+        FileExt::lock_exclusive(&holder).unwrap();
+        assert!(matches!(probe_switch_lock(&path), Err(EnvError::SwitchBusy(_))));
+        FileExt::unlock(&holder).unwrap();
+        assert_eq!(probe_switch_lock(&path), Ok(()));
+        let next = File::options().write(true).open(&path).unwrap();
+        assert!(FileExt::try_lock_exclusive(&next).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_switch_lock_holds_by_default_and_probes_when_configured() {
+        let env = RealEnv::new(SentinelaConfig::default());
+        assert!(env.cfg.switch_lock.hold);
+        assert_eq!(env.cfg.switch_lock.path, REBUILD_LOCK_PATH);
+        let dir = std::env::temp_dir().join(format!("sentinela-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = RealEnv::new(SentinelaConfig {
+            switch_lock: sentinela_config::SwitchLockConfig {
+                path: dir.join("absent.lock").to_string_lossy().into_owned(),
+                hold: false,
+            },
+            ..SentinelaConfig::default()
+        });
+        assert!(probe.switch_guard().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
