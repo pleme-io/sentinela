@@ -13,8 +13,8 @@
 use sentinela_config::SentinelaConfig;
 use sentinela_core::{CheckResult, CheckState};
 use sentinela_core::{
-    BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, ProbeCheck,
-    ReceiptChain, RebuildDriver, Rev,
+    BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, PlanOutcome,
+    PlanVerdict, ProbeCheck, ReceiptChain, RebuildDriver, Rev,
 };
 use std::fs::File;
 use std::io::Write as _;
@@ -965,6 +965,126 @@ impl GitopsEnv for RealEnv {
         results.extend(parse_statuses(&statuses));
         Ok(results)
     }
+
+    fn plan(&self, rev: &Rev) -> Result<PlanVerdict, EnvError> {
+        if !self.cfg.planner.enabled {
+            return Ok(PlanVerdict::Proceed { key: None });
+        }
+        let out = self.run_planner(rev, &["plan"], self.cfg.planner.timeout_seconds)?;
+        if !out.status.success() {
+            return Err(EnvError::PlannerBlind(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            ));
+        }
+        parse_plan(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn record_plan(&self, key: &str, outcome: PlanOutcome, why: &str) {
+        if !self.cfg.planner.enabled {
+            return;
+        }
+        let word = match outcome {
+            PlanOutcome::Activated => "activated",
+            PlanOutcome::Failed => "failed",
+        };
+        let why: String = why.chars().take(400).collect();
+        match self.run_planner_with(&["record", key, word, &why], 120) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => tracing::warn!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "sentinela: kirikae could not record the outcome"
+            ),
+            Err(e) => tracing::warn!(error = %e, "sentinela: kirikae could not record the outcome"),
+        }
+    }
+}
+
+impl RealEnv {
+    fn planner_env(&self, rev: Option<&Rev>) -> Vec<(&'static str, String)> {
+        let kind = match self.cfg.rebuild_tool {
+            sentinela_config::RebuildTool::DarwinRebuild => "darwin",
+            _ => "nixos",
+        };
+        let mut env = vec![
+            ("KIRIKAE_HOST", self.cfg.hostname.clone()),
+            ("KIRIKAE_KIND", kind.to_owned()),
+            (
+                "KIRIKAE_HISTORY",
+                Path::new(&self.cfg.state_dir)
+                    .join("kirikae.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "KIRIKAE_BACKOFF_BASE_S",
+                self.cfg.planner.backoff_base_seconds.to_string(),
+            ),
+            (
+                "KIRIKAE_BACKOFF_CAP_S",
+                self.cfg.planner.backoff_cap_seconds.to_string(),
+            ),
+        ];
+        if let Some(rev) = rev {
+            env.push((
+                "KIRIKAE_FLAKE",
+                [self.cfg.flake_url.as_str(), "/", rev.as_str()].concat(),
+            ));
+        }
+        env
+    }
+
+    fn run_planner(&self, rev: &Rev, args: &[&str], timeout_seconds: u64) -> Result<Output, EnvError> {
+        self.run_planner_env(self.planner_env(Some(rev)), args, timeout_seconds)
+    }
+
+    fn run_planner_with(&self, args: &[&str], timeout_seconds: u64) -> Result<Output, EnvError> {
+        self.run_planner_env(self.planner_env(None), args, timeout_seconds)
+    }
+
+    fn run_planner_env(
+        &self,
+        env: Vec<(&'static str, String)>,
+        args: &[&str],
+        timeout_seconds: u64,
+    ) -> Result<Output, EnvError> {
+        let mut cmd = Command::new(&self.cfg.planner.command);
+        cmd.args(args).current_dir(self.rebuild_cwd());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let capture = Path::new(&self.cfg.state_dir).join("kirikae.out");
+        let mut run = BoundedRun::new(&capture).separate_streams();
+        if timeout_seconds > 0 {
+            run = run
+                .timeout(std::time::Duration::from_secs(timeout_seconds))
+                .on_timeout(OnTimeout::KillGroup);
+        }
+        run.run(cmd)
+            .map_err(|e| exec_err(&self.cfg.planner.command, &e, EnvError::PlannerBlind))
+    }
+}
+
+fn parse_plan(stdout: &str) -> Result<PlanVerdict, EnvError> {
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| EnvError::PlannerBlind(["no plan in: ", stdout.trim()].concat()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| EnvError::PlannerBlind(e.to_string()))?;
+    let key = v.get("key").and_then(serde_json::Value::as_str).map(str::to_owned);
+    match v.get("action").and_then(serde_json::Value::as_str) {
+        Some("hold") => Ok(PlanVerdict::Hold {
+            why: v
+                .get("why")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("held")
+                .to_owned(),
+            until_unix_ms: v.get("until_ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        }),
+        Some(_) => Ok(PlanVerdict::Proceed { key }),
+        None => Err(EnvError::PlannerBlind(["a plan with no action: ", line].concat())),
+    }
 }
 
 impl RealEnv {
@@ -1593,6 +1713,55 @@ mod tests {
         assert_eq!(parse_generation("system-link"), None);
         assert_eq!(parse_generation("42"), None);
         assert_eq!(parse_generation("system-abc-link"), None);
+    }
+
+    #[test]
+    fn a_plan_is_read_from_kirikaes_json() {
+        let hold = parse_plan(
+            "{\"action\":\"hold\",\"key\":\"/nix/store/a\",\"until_ms\":65000,\"why\":\"2 failed attempt(s)\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            hold,
+            PlanVerdict::Hold {
+                why: "2 failed attempt(s)".to_owned(),
+                until_unix_ms: 65_000
+            }
+        );
+        assert_eq!(
+            parse_plan("blue: noise\n{\"action\":\"switch\",\"key\":\"/nix/store/b\"}").unwrap(),
+            PlanVerdict::Proceed {
+                key: Some("/nix/store/b".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_plan("{\"action\":\"refuse\",\"key\":null}").unwrap(),
+            PlanVerdict::Proceed { key: None }
+        );
+        assert!(matches!(parse_plan(""), Err(EnvError::PlannerBlind(_))));
+        assert!(matches!(parse_plan("{\"why\":\"x\"}"), Err(EnvError::PlannerBlind(_))));
+    }
+
+    #[test]
+    fn the_planner_is_off_unless_configured_and_names_the_pinned_flake() {
+        let env = RealEnv::new(SentinelaConfig::default());
+        assert!(!env.cfg.planner.enabled);
+        let r = Rev::parse(&"a".repeat(40)).unwrap();
+        assert_eq!(env.plan(&r).unwrap(), PlanVerdict::Proceed { key: None });
+        let on = RealEnv::new(SentinelaConfig {
+            flake_url: "github:pleme-io/nix".to_owned(),
+            hostname: "ryn".to_owned(),
+            state_dir: "/var/log/pleme-gitops".to_owned(),
+            ..SentinelaConfig::default()
+        });
+        let vars = on.planner_env(Some(&r));
+        let get = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("KIRIKAE_FLAKE"), Some(["github:pleme-io/nix/", &"a".repeat(40)].concat()));
+        assert_eq!(get("KIRIKAE_HOST"), Some("ryn".to_owned()));
+        assert_eq!(get("KIRIKAE_KIND"), Some("darwin".to_owned()));
+        assert_eq!(get("KIRIKAE_HISTORY"), Some("/var/log/pleme-gitops/kirikae.jsonl".to_owned()));
+        assert_eq!(get("KIRIKAE_BACKOFF_BASE_S"), Some("300".to_owned()));
+        assert_eq!(on.planner_env(None).iter().find(|(n, _)| *n == "KIRIKAE_FLAKE"), None);
     }
 
     #[test]

@@ -463,6 +463,7 @@ pub struct Sentinela {
     /// asked once per revision (final answers) or once per recheck window
     /// (pending/blind), never every tick. Pruned to the current candidates.
     checks: Cache,
+    planned: Option<(Rev, String)>,
 }
 
 impl Sentinela {
@@ -476,6 +477,7 @@ impl Sentinela {
             resume_checked: false,
             policy: RevisionPolicy::Head,
             checks: Cache::new(),
+            planned: None,
         }
     }
 
@@ -689,6 +691,27 @@ impl Sentinela {
         };
         let green = matches!(self.policy, RevisionPolicy::Green(_));
 
+        self.planned = None;
+        match env.plan(&target) {
+            Ok(crate::env::PlanVerdict::Hold { why, until_unix_ms }) => {
+                tracing::info!(rev = target.short(), why = %why, "kirikae holds this plan");
+                let now = env.now_unix_ms();
+                self.state = State::CoolingDown {
+                    until_unix_ms,
+                    failed_rev: Some(target.clone()),
+                };
+                return TickOutcome::CoolingDown {
+                    remaining_ms: until_unix_ms.saturating_sub(now),
+                };
+            }
+            Ok(crate::env::PlanVerdict::Proceed { key }) => {
+                self.planned = key.map(|k| (target.clone(), k));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "sentinela: planner blind, building as before");
+            }
+        }
+
         // ── ★ PULSE BEFORE THE BUILD, NOT ONLY AFTER IT ──────────────────
         // `env.build` is the long pole — measured at 12m02s on ryn — and the
         // wrapper's pulse lands only once it RETURNS. That left the whole
@@ -728,6 +751,7 @@ impl Sentinela {
 
         // Decide → build rev-pinned.
         if let Err(e) = env.build(&target) {
+            self.record_plan(env, &target, crate::env::PlanOutcome::Failed, &e.to_string());
             let head = target.clone();
             let out = TickOutcome::BuildFailed {
                 rev: head.clone(),
@@ -1075,7 +1099,13 @@ impl Sentinela {
             .rollback
             .as_ref()
             .and_then(|_| env.current_generation());
-        match env.switch(&rev) {
+        let switched = env.switch(&rev);
+        match &switched {
+            Ok(_) => self.record_plan(env, &rev, crate::env::PlanOutcome::Activated, "activated"),
+            Err(EnvError::SwitchBusy(_)) => {}
+            Err(e) => self.record_plan(env, &rev, crate::env::PlanOutcome::Failed, &e.to_string()),
+        }
+        match switched {
             Ok(generation) => {
                 // Attest before idle. A persist failure would leave the
                 // on-disk chain behind the real system → a re-deploy loop
@@ -1480,6 +1510,22 @@ impl Sentinela {
         // receipt for this exact chain.
         let _ = chain.append(receipt);
         env.persist_chain(chain)
+    }
+
+    fn record_plan<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        rev: &Rev,
+        outcome: crate::env::PlanOutcome,
+        why: &str,
+    ) {
+        if let Some((planned, key)) = self.planned.take() {
+            if &planned == rev {
+                env.record_plan(&key, outcome, why);
+            } else {
+                self.planned = Some((planned, key));
+            }
+        }
     }
 
     /// Fail-closed helper for probe/load errors: enter cooldown, return
@@ -3096,5 +3142,76 @@ mod tests {
         chain.verify().unwrap();
         assert_eq!(chain.last_activated_rev(), Some(&rev(2)));
         assert_eq!(chain.len(), 2, "unchanged tick recorded nothing");
+    }
+
+    #[test]
+    fn a_held_plan_builds_nothing_and_cools_down_until_the_planner_says() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1)))]);
+        env.set_now_ms(5_000);
+        env.push_plan(Ok(crate::env::PlanVerdict::Hold {
+            why: "2 failed attempt(s)".into(),
+            until_unix_ms: 65_000,
+        }));
+        let mut s = Sentinela::new(cfg());
+        assert_eq!(s.tick(&env), TickOutcome::CoolingDown { remaining_ms: 60_000 });
+        assert!(env.builds.borrow().is_empty());
+        assert!(env.switches.borrow().is_empty());
+        assert!(env.chain().head().is_none());
+        assert_eq!(
+            s.state(),
+            &State::CoolingDown {
+                until_unix_ms: 65_000,
+                failed_rev: Some(rev(1))
+            }
+        );
+    }
+
+    #[test]
+    fn the_planned_key_learns_each_outcome_of_its_own_rev() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.push_plan(Ok(crate::env::PlanVerdict::Proceed {
+            key: Some("/nix/store/a".into()),
+        }));
+        env.set_switch_result(Err(EnvError::SwitchFailed("defaults".into())));
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::SwitchFailed { .. }));
+        assert_eq!(
+            *env.plan_records.borrow(),
+            vec![("/nix/store/a".to_owned(), crate::env::PlanOutcome::Failed)]
+        );
+
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(2)))]);
+        env.push_plan(Ok(crate::env::PlanVerdict::Proceed {
+            key: Some("github:o/r/2#h".into()),
+        }));
+        env.set_build_result(Err(EnvError::BuildFailed("eval".into())));
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::BuildFailed { .. }));
+        assert_eq!(
+            *env.plan_records.borrow(),
+            vec![("github:o/r/2#h".to_owned(), crate::env::PlanOutcome::Failed)]
+        );
+
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(3))), Ok(Some(rev(3)))]);
+        env.push_plan(Ok(crate::env::PlanVerdict::Proceed {
+            key: Some("/nix/store/c".into()),
+        }));
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { .. }));
+        assert_eq!(
+            *env.plan_records.borrow(),
+            vec![("/nix/store/c".to_owned(), crate::env::PlanOutcome::Activated)]
+        );
+    }
+
+    #[test]
+    fn a_blind_planner_or_no_key_changes_nothing() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        env.push_plan(Err(EnvError::PlannerBlind("kirikae not found".into())));
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { .. }));
+        assert_eq!(*env.builds.borrow(), vec![rev(1)]);
+        assert!(env.plan_records.borrow().is_empty());
+        assert_eq!(*env.plan_queries.borrow(), vec![rev(1)]);
     }
 }

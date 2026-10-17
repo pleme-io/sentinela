@@ -29,7 +29,7 @@ mod rev;
 pub use checks::{
     CheckResult, CheckState, ChecksVerdict, GreenPolicy, RevisionPolicy, verdict as checks_verdict,
 };
-pub use env::{BuildProgress, EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase, RebuildDriver};
+pub use env::{BuildProgress, EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase, PlanOutcome, PlanVerdict, RebuildDriver};
 pub use fsm::{Sentinela, State, TickOutcome};
 pub use probation::{HealthProbe, ProbeCheck, ProbeFailure, Probation, RollbackPolicy};
 pub use receipt::{

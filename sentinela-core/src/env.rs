@@ -96,6 +96,20 @@ pub enum EnvError {
     /// The branch history between two revisions could not be read.
     #[error("history unavailable: {0}")]
     HistoryFailed(String),
+    #[error("planner unavailable: {0}")]
+    PlannerBlind(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanVerdict {
+    Proceed { key: Option<String> },
+    Hold { why: String, until_unix_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanOutcome {
+    Activated,
+    Failed,
 }
 
 /// One tick's pulse: proof the loop was ALIVE at a moment, independent of
@@ -449,6 +463,12 @@ pub trait GitopsEnv {
     /// unreachable forge or a rejected token, which the loop reports as
     /// blind and never as "no checks".
     fn check_results(&self, rev: &Rev) -> Result<Vec<CheckResult>, EnvError>;
+
+    fn plan(&self, _rev: &Rev) -> Result<PlanVerdict, EnvError> {
+        Ok(PlanVerdict::Proceed { key: None })
+    }
+
+    fn record_plan(&self, _key: &str, _outcome: PlanOutcome, _why: &str) {}
 }
 
 #[cfg(any(test, feature = "mock"))]
@@ -456,7 +476,7 @@ pub use mock::MockEnv;
 
 #[cfg(any(test, feature = "mock"))]
 mod mock {
-    use super::{EnvError, GitopsEnv};
+    use super::{EnvError, GitopsEnv, PlanOutcome, PlanVerdict};
     use crate::checks::CheckResult;
     use crate::receipt::{Generation, ReceiptChain};
     use crate::rev::Rev;
@@ -514,6 +534,9 @@ mod mock {
         checks: RefCell<std::collections::HashMap<Rev, Result<Vec<CheckResult>, EnvError>>>,
         /// Every revision whose checks were fetched, in order.
         pub check_queries: RefCell<Vec<Rev>>,
+        plans: RefCell<std::collections::VecDeque<Result<PlanVerdict, EnvError>>>,
+        pub plan_queries: RefCell<Vec<Rev>>,
+        pub plan_records: RefCell<Vec<(String, PlanOutcome)>>,
     }
 
     impl Default for MockEnv {
@@ -544,11 +567,18 @@ mod mock {
                 history: RefCell::new(Vec::new()),
                 checks: RefCell::new(std::collections::HashMap::new()),
                 check_queries: RefCell::new(Vec::new()),
+                plans: RefCell::new(std::collections::VecDeque::new()),
+                plan_queries: RefCell::new(Vec::new()),
+                plan_records: RefCell::new(Vec::new()),
             }
         }
     }
 
     impl MockEnv {
+        pub fn push_plan(&self, r: Result<PlanVerdict, EnvError>) {
+            self.plans.borrow_mut().push_back(r);
+        }
+
         /// A mock whose probe queue yields these results in order.
         #[must_use]
         pub fn with_probes(probes: Vec<ProbeResult>) -> Self {
@@ -739,6 +769,18 @@ mod mock {
                 .get(rev)
                 .cloned()
                 .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn plan(&self, rev: &Rev) -> Result<PlanVerdict, EnvError> {
+            self.plan_queries.borrow_mut().push(rev.clone());
+            self.plans
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(PlanVerdict::Proceed { key: None }))
+        }
+
+        fn record_plan(&self, key: &str, outcome: PlanOutcome, _why: &str) {
+            self.plan_records.borrow_mut().push((key.to_owned(), outcome));
         }
     }
 }

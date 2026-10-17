@@ -197,6 +197,28 @@ pub enum SuiMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct PlannerConfig {
+    pub enabled: bool,
+    pub command: String,
+    pub backoff_base_seconds: u64,
+    pub backoff_cap_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: "kirikae".to_owned(),
+            backoff_base_seconds: 300,
+            backoff_cap_seconds: 21_600,
+            timeout_seconds: 5400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SuiConfig {
     pub mode: SuiMode,
     pub binary: String,
@@ -331,6 +353,7 @@ pub struct SentinelaConfig {
     /// existing config is unchanged; a NixOS node sets `nixos-rebuild`.
     pub rebuild_tool: RebuildTool,
     pub sui: SuiConfig,
+    pub planner: PlannerConfig,
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
@@ -745,6 +768,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             git_timeout_seconds: 0,
             rebuild_tool: RebuildTool::DarwinRebuild,
             sui: SuiConfig::default(),
+            planner: PlannerConfig::default(),
             rollback: RollbackConfig {
                 enabled: false,
                 window_seconds: 0,
@@ -774,6 +798,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             git_timeout_seconds: DEFAULT_GIT_TIMEOUT_SECONDS,
             rebuild_tool: RebuildTool::DarwinRebuild,
             sui: SuiConfig::default(),
+            planner: PlannerConfig::default(),
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
@@ -917,6 +942,7 @@ mod tests {
             git_timeout_seconds: 120,
             rebuild_tool: RebuildTool::NixosRebuild,
             sui: SuiConfig::default(),
+            planner: PlannerConfig::default(),
             rollback: RollbackConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
         };
