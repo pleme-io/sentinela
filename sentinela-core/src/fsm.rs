@@ -547,6 +547,7 @@ impl Sentinela {
             phase: outcome.phase(),
             head_rev: outcome.observed_head().cloned(),
             poll_seconds: self.cfg.poll_seconds,
+            budget_seconds: None,
             // A resolved tick has nothing in flight by definition. Clearing
             // it rather than carrying the last step forward: a stale drv
             // beside a finished outcome reads as a build still running.
@@ -692,6 +693,21 @@ impl Sentinela {
         let green = matches!(self.policy, RevisionPolicy::Green(_));
 
         self.planned = None;
+        if let Some(budget) = env.planning_budget_seconds() {
+            let planning = Heartbeat {
+                at_unix_ms: env.now_unix_ms(),
+                outcome: "planning".to_owned(),
+                phase: crate::env::Phase::InFlight,
+                head_rev: Some(head.clone()),
+                poll_seconds: self.cfg.poll_seconds,
+                budget_seconds: Some(budget),
+                in_flight: None,
+                verification: None,
+            };
+            if let Err(e) = env.write_heartbeat(&planning) {
+                tracing::warn!(error = %e, "sentinela: could not write the planning heartbeat (planning proceeds)");
+            }
+        }
         match env.plan(&target) {
             Ok(crate::env::PlanVerdict::Hold { why, until_unix_ms }) => {
                 tracing::info!(rev = target.short(), why = %why, "kirikae holds this plan");
@@ -736,6 +752,7 @@ impl Sentinela {
             phase: crate::env::Phase::InFlight,
             head_rev: Some(head.clone()),
             poll_seconds: self.cfg.poll_seconds,
+            budget_seconds: None,
             // Published BEFORE the build starts, so there is no step to
             // report yet. A driver that streams progress overwrites this
             // pulse as it goes; one that cannot leaves it None, which reads
@@ -3213,5 +3230,23 @@ mod tests {
         assert_eq!(*env.builds.borrow(), vec![rev(1)]);
         assert!(env.plan_records.borrow().is_empty());
         assert_eq!(*env.plan_queries.borrow(), vec![rev(1)]);
+    }
+
+    #[test]
+    fn a_planner_publishes_a_planning_pulse_with_its_budget_before_it_plans() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        *env.planning_budget.borrow_mut() = Some(5400);
+        let mut s = Sentinela::new(cfg());
+        let _ = s.tick(&env);
+        let beats = env.heartbeats.borrow();
+        let planning: Vec<_> = beats.iter().filter(|b| b.outcome == "planning").collect();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(planning[0].phase, crate::env::Phase::InFlight);
+        assert_eq!(planning[0].budget_seconds, Some(5400));
+
+        let off = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        let mut s = Sentinela::new(cfg());
+        let _ = s.tick(&off);
+        assert!(off.heartbeats.borrow().iter().all(|b| b.outcome != "planning"));
     }
 }

@@ -840,7 +840,7 @@ fn convergence_gate(
     // The operator's own configured ceiling on a build, not a second opinion
     // invented here — `build_timeout_seconds` is what the loop already agreed
     // a build may take, so a tick past it has outlived its own contract.
-    let build_budget_ms = build_timeout_seconds.max(1) * 1000;
+    let build_budget_ms = beat.budget_seconds.unwrap_or(build_timeout_seconds).max(1) * 1000;
     // ── ★ A BUILD IS NOT SILENCE ─────────────────────────────────────────
     // The poll budget answers "should another tick have happened by now?",
     // which is only a question about a loop BETWEEN ticks. A tick that is
@@ -871,8 +871,9 @@ fn convergence_gate(
         sentinela_core::Phase::InFlight => {
             if silent_ms > build_budget_ms {
                 return Err(format!(
-                    "tick has been building for {}s, past the {}s build budget \
-                     — a build this long is a hang, not progress",
+                    "tick has been `{}` for {}s, past its {}s budget \
+                     — a tick this long is a hang, not progress",
+                    beat.outcome,
                     silent_ms / 1000,
                     build_budget_ms / 1000
                 ));
@@ -1221,6 +1222,7 @@ mod gate_tests {
             phase: sentinela_core::Phase::Resolved,
             head_rev: None,
             poll_seconds: POLL,
+            budget_seconds: None,
             in_flight: None,
             verification: None,
         })
@@ -1234,12 +1236,33 @@ mod gate_tests {
             phase: sentinela_core::Phase::InFlight,
             head_rev: None,
             poll_seconds: POLL,
+            budget_seconds: None,
             // These fixtures predate per-drv progress and stay that way on
             // purpose: the gate's staleness verdict must not depend on a
             // driver being able to report steps.
             in_flight: None,
             verification: None,
         })
+    }
+
+    #[test]
+    fn an_in_flight_tick_that_published_a_budget_is_judged_by_it() {
+        let planning = |budget: Option<u64>| {
+            Some(Heartbeat {
+                at_unix_ms: 0,
+                outcome: "planning".to_owned(),
+                phase: sentinela_core::Phase::InFlight,
+                head_rev: None,
+                poll_seconds: POLL,
+                budget_seconds: budget,
+                in_flight: None,
+                verification: None,
+            })
+        };
+        assert!(convergence_gate(&planning(Some(600)), 500_000, POLL, BUILD_BUDGET, 0, true).is_ok());
+        let late = convergence_gate(&planning(Some(600)), 700_000, POLL, BUILD_BUDGET, 0, true);
+        assert!(late.as_ref().is_err_and(|e| e.contains("`planning`")), "{late:?}");
+        assert!(convergence_gate(&planning(None), 700_000, POLL, BUILD_BUDGET, 0, true).is_ok());
     }
 
     #[test]
@@ -2215,6 +2238,7 @@ mod hang_gate_tests {
             phase: sentinela_core::Phase::InFlight,
             head_rev: None,
             poll_seconds: POLL,
+            budget_seconds: None,
             in_flight: None,
             verification: None,
         })
@@ -2317,4 +2341,5 @@ mod rollback_status_tests {
         assert_eq!(lines[0], "rolled back generation 42 → 41: probe `tailscale` failed");
         assert!(lines.iter().any(|l| l.contains("no route")), "{lines:?}");
     }
+
 }

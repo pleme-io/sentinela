@@ -734,6 +734,7 @@ impl GitopsEnv for RealEnv {
                 phase: sentinela_core::Phase::InFlight,
                 head_rev: Some(rev.clone()),
                 poll_seconds: self.cfg.poll_seconds,
+                budget_seconds: None,
                 in_flight: Some(p),
                 verification: None,
             };
@@ -977,6 +978,13 @@ impl GitopsEnv for RealEnv {
             ));
         }
         parse_plan(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn planning_budget_seconds(&self) -> Option<u64> {
+        self.cfg
+            .planner
+            .enabled
+            .then(|| self.cfg.planner.timeout_seconds.max(1))
     }
 
     fn record_plan(&self, key: &str, outcome: PlanOutcome, why: &str) {

@@ -215,6 +215,8 @@ pub struct Heartbeat {
     /// print. Absence is "not measured", never "nothing happening" — the same
     /// discipline as `head_rev`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_flight: Option<BuildProgress>,
     /// The activation under health probation, while one is.
     ///
@@ -469,6 +471,10 @@ pub trait GitopsEnv {
     }
 
     fn record_plan(&self, _key: &str, _outcome: PlanOutcome, _why: &str) {}
+
+    fn planning_budget_seconds(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(any(test, feature = "mock"))]
@@ -537,6 +543,7 @@ mod mock {
         plans: RefCell<std::collections::VecDeque<Result<PlanVerdict, EnvError>>>,
         pub plan_queries: RefCell<Vec<Rev>>,
         pub plan_records: RefCell<Vec<(String, PlanOutcome)>>,
+        pub planning_budget: RefCell<Option<u64>>,
     }
 
     impl Default for MockEnv {
@@ -570,6 +577,7 @@ mod mock {
                 plans: RefCell::new(std::collections::VecDeque::new()),
                 plan_queries: RefCell::new(Vec::new()),
                 plan_records: RefCell::new(Vec::new()),
+                planning_budget: RefCell::new(None),
             }
         }
     }
@@ -781,6 +789,10 @@ mod mock {
 
         fn record_plan(&self, key: &str, outcome: PlanOutcome, _why: &str) {
             self.plan_records.borrow_mut().push((key.to_owned(), outcome));
+        }
+
+        fn planning_budget_seconds(&self) -> Option<u64> {
+            *self.planning_budget.borrow()
         }
     }
 }
@@ -1049,6 +1061,7 @@ mod rebuild_driver_tests {
             phase: Phase::Resolved,
             head_rev: None,
             poll_seconds: 60,
+            budget_seconds: None,
             in_flight: None,
             verification: None,
         };
