@@ -27,7 +27,7 @@ default = []
 sui-driver = ["dep:sui-orchestrate", "dep:tokio"]
 
 [dependencies]
-sentinela-core = { path = "../sentinela-core" }
+sentinela-core = { path = "../sentinela-core", version = "0.1" }
 # ★★ The reconciler, made askable. See src/introspect.rs: this was the one
 # pleme-io daemon with no kanshou surface, and it is the one whose entire job
 # is converging state you cannot see -- so the only way to ask "is this node
@@ -45,7 +45,7 @@ sui-orchestrate = { version = "0.1.219", optional = true }
 # runtime, created per call, is enough: a rebuild is a single long await, not
 # a concurrency problem.
 tokio = { version = "1", features = ["rt"], optional = true }
-sentinela-config = { path = "../sentinela-config" }
+sentinela-config = { path = "../sentinela-config", version = "0.1" }
 serde = { workspace = true }
 serde_yaml = "0.9"
 thiserror = { workspace = true }

@@ -18,7 +18,7 @@ serde = { workspace = true }
 # refused by name while its siblings load. Already a workspace dep (core).
 serde_json = { workspace = true }
 shikumi = "0.1.496"
-sentinela-core = { path = "../sentinela-core" }
+sentinela-core = { path = "../sentinela-core", version = "0.1" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
