@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "5ef1aac12b402c216b3ac1df893943a8669c1f34f556aaa6c5c024694ea6469c",
+  "cargo_lock_sha256": "401e1d27aa1d015086a28e0e62639eb263c84ff56f14577a523fa5e8bda59956",
   "manifest_sha256": {
-    "Cargo.toml": "7ee977448683b18067b96fb1357d2fa4e98b485a17f06ae3953dd36c5b249167",
+    "Cargo.toml": "13745f7c3c9881b4039bc61d70ddd4efbe6a04ed3961f70b4230e3b00089ced7",
     "sentinela-config/Cargo.toml": "3f8e53a19dbb46469edbc79f29620ee2a848c5e9b06ad4f587c0fcd7b0e9ebf3",
     "sentinela-core/Cargo.toml": "ada01c9a8311af15993e55639c68cb258ba240c0b1aff50c72c877fec454864d",
     "sentinela/Cargo.toml": "a01547a8f6c01cfa3d60ab6f5b28fb01664124e1ad0ca8b4cf48af7d777943f9"
@@ -2195,7 +2195,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-0.1.31": {
+      "sentinela-0.1.32": {
         "runtime_dependencies": [
           {
             "name": "clap",
@@ -2232,7 +2232,7 @@
           },
           {
             "name": "sentinela_config",
-            "package_key": "sentinela-config-0.1.31",
+            "package_key": "sentinela-config-0.1.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2242,7 +2242,7 @@
           },
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.31",
+            "package_key": "sentinela-core-0.1.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2340,11 +2340,11 @@
           "default"
         ]
       },
-      "sentinela-config-0.1.31": {
+      "sentinela-config-0.1.32": {
         "runtime_dependencies": [
           {
             "name": "sentinela_core",
-            "package_key": "sentinela-core-0.1.31",
+            "package_key": "sentinela-core-0.1.32",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2388,7 +2388,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "sentinela-core-0.1.31": {
+      "sentinela-core-0.1.32": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -7080,7 +7080,7 @@
       "edition": "2021",
       "proc_macro": true
     },
-    "sentinela-0.1.31": {
+    "sentinela-0.1.32": {
       "edition": "2024",
       "binaries": [
         {
@@ -7089,14 +7089,14 @@
         }
       ]
     },
-    "sentinela-config-0.1.31": {
+    "sentinela-config-0.1.32": {
       "edition": "2024",
       "lib_target": {
         "name": "sentinela_config",
         "path": "src/lib.rs"
       }
     },
-    "sentinela-core-0.1.31": {
+    "sentinela-core-0.1.32": {
       "edition": "2024",
       "lib_target": {
         "name": "sentinela_core",
