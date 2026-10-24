@@ -76,6 +76,18 @@ Checks are read over GitHub's REST API with curl, the token on stdin; a 401 /
 403 is `checksBlind` naming the missing permission (Checks: read, Commit
 statuses: read).
 
+## Quiet window: a build starts only on a HEAD that stopped moving
+
+`head_quiet_seconds` (default 600, `0` = build every new HEAD at once, the
+pre-0.1.31 behaviour) holds a new HEAD in `settling` until it has been
+unchanged that long; a newer HEAD restarts the window, so the latest rev wins.
+`head_quiet_max_seconds` (default 3600, raised to the window when below it)
+bounds the wait from the first unbuilt HEAD, so a branch that never goes quiet
+still builds, and the deferral escape (`land_ancestor_after_deferrals`) still
+lands an ancestor. The gate is `sentinela-core/src/quiet.rs`; `tick_inner`
+moves the probed HEAD through `Quiet::admit` before anything can build it.
+The window lives in memory: a daemon restart starts it again.
+
 ## A new config is loaded by exiting between ticks
 
 The service manager never restarts this daemon on activation (it performs the

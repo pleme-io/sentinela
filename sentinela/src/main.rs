@@ -617,6 +617,9 @@ fn log_outcome(outcome: &TickOutcome) {
             tracing::debug!(rev = rev.short(), "waiting-for-green");
         }
         TickOutcome::ChecksRed { .. } | TickOutcome::ChecksBlind { .. } => {}
+        TickOutcome::Settling { rev, remaining_ms } => {
+            tracing::debug!(rev = rev.short(), remaining_ms, "settling");
+        }
         TickOutcome::Verifying(_)
         | TickOutcome::Verified { .. }
         | TickOutcome::RolledBack { .. }

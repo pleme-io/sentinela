@@ -309,6 +309,8 @@ pub struct LoopConfig {
     /// is healthy but slow, so 2 is patient. A failure streak means HEAD is
     /// red, where each extra attempt costs a full build and buys nothing.
     pub land_last_good_after_failures: usize,
+    pub head_quiet_seconds: u64,
+    pub head_quiet_max_seconds: u64,
 }
 
 impl Default for LoopConfig {
@@ -332,6 +334,8 @@ impl Default for LoopConfig {
             // would trade a self-healing retry for a knowingly-stale deploy.
             // Three is past where "transient" is a credible reading.
             land_last_good_after_failures: 3,
+            head_quiet_seconds: 0,
+            head_quiet_max_seconds: 0,
         }
     }
 }
@@ -593,6 +597,10 @@ mod mock {
             let m = Self::default();
             *m.probes.borrow_mut() = probes.into();
             m
+        }
+
+        pub fn clear_probes(&self) {
+            self.probes.borrow_mut().clear();
         }
 
         /// Queue one more probe result.

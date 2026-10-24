@@ -46,6 +46,7 @@
 use crate::checks::{Cache, Cached, ChecksVerdict, GreenPolicy, RevisionPolicy, still_valid};
 use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
 use crate::probation::{ProbeFailure, Probation, RollbackPolicy};
+use crate::quiet::{Admission, Quiet, QuietWindow};
 use crate::receipt::{Generation, Outcome, ReceiptChain, bound_text};
 use crate::rev::Rev;
 
@@ -240,6 +241,10 @@ pub enum TickOutcome {
         /// Why the checks could not be read.
         reason: String,
     },
+    Settling {
+        rev: Rev,
+        remaining_ms: u64,
+    },
 }
 
 impl TickOutcome {
@@ -270,6 +275,7 @@ impl TickOutcome {
             Self::WaitingForGreen { .. } => "waitingForGreen",
             Self::ChecksRed { .. } => "checksRed",
             Self::ChecksBlind { .. } => "checksBlind",
+            Self::Settling { .. } => "settling",
         }
     }
 
@@ -309,7 +315,8 @@ impl TickOutcome {
             | Self::Quarantined { .. }
             | Self::WaitingForGreen { .. }
             | Self::ChecksRed { .. }
-            | Self::ChecksBlind { .. } => Phase::Resolved,
+            | Self::ChecksBlind { .. }
+            | Self::Settling { .. } => Phase::Resolved,
         }
     }
 
@@ -400,6 +407,9 @@ impl TickOutcome {
             | Self::WaitingForGreen { .. }
             | Self::ChecksRed { .. }
             | Self::ChecksBlind { .. } => poll,
+            Self::Settling { remaining_ms, .. } => poll
+                .min(std::time::Duration::from_millis(*remaining_ms))
+                .max(std::time::Duration::from_secs(DEFERRED_RETRY_SECS)),
         }
     }
 
@@ -432,6 +442,7 @@ impl TickOutcome {
             | Self::WaitingForGreen { rev }
             | Self::ChecksRed { rev, .. }
             | Self::ChecksBlind { head: rev, .. }
+            | Self::Settling { rev, .. }
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::SwitchDeferred { rev, .. }
@@ -464,6 +475,7 @@ pub struct Sentinela {
     /// (pending/blind), never every tick. Pruned to the current candidates.
     checks: Cache,
     planned: Option<(Rev, String)>,
+    quiet: Quiet,
 }
 
 impl Sentinela {
@@ -478,6 +490,7 @@ impl Sentinela {
             policy: RevisionPolicy::Head,
             checks: Cache::new(),
             planned: None,
+            quiet: Quiet::default(),
         }
     }
 
@@ -527,6 +540,14 @@ impl Sentinela {
     /// structure and the invariants each branch upholds.
     pub fn tick<E: GitopsEnv>(&mut self, env: &E) -> TickOutcome {
         let outcome = self.tick_inner(env);
+        if matches!(
+            outcome,
+            TickOutcome::Unchanged { .. }
+                | TickOutcome::Deployed { .. }
+                | TickOutcome::DeployedBehind { .. }
+        ) {
+            self.quiet.caught_up();
+        }
         // ── ★ THE PULSE IS WRITTEN HERE, NOT INSIDE `tick_inner` ──────────
         // `tick_inner` has nine return points and every one of them is a
         // real outcome the operator needs counted as "the loop was alive".
@@ -677,6 +698,16 @@ impl Sentinela {
             );
             return TickOutcome::Quarantined { rev: head };
         }
+
+        let head = match self
+            .quiet
+            .admit(head, env.now_unix_ms(), QuietWindow::of(&self.cfg))
+        {
+            Admission::Settled(rev) => rev,
+            Admission::Settling { rev, remaining_ms } => {
+                return TickOutcome::Settling { rev, remaining_ms };
+            }
+        };
 
         // ── Which revision: HEAD, or the newest green one ────────────────
         // `Head` is HEAD, unchanged. `Green` walks back from HEAD to what this
@@ -1593,6 +1624,8 @@ mod tests {
             // could silently become "build failed → landed something else"
             // and still pass a weaker assertion.
             land_last_good_after_failures: 0,
+            head_quiet_seconds: 0,
+            head_quiet_max_seconds: 0,
         }
     }
 
@@ -3248,5 +3281,82 @@ mod tests {
         let mut s = Sentinela::new(cfg());
         let _ = s.tick(&off);
         assert!(off.heartbeats.borrow().iter().all(|b| b.outcome != "planning"));
+    }
+
+    fn cfg_quiet(quiet: u64, max: u64) -> LoopConfig {
+        LoopConfig {
+            head_quiet_seconds: quiet,
+            head_quiet_max_seconds: max,
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn a_head_superseded_inside_the_quiet_window_is_never_built() {
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        env.set_switch_result(Ok(Generation(7)));
+        let mut s = Sentinela::new(cfg_quiet(600, 3600));
+        let mut kinds = Vec::new();
+        for at in [0, 300_000, 899_999] {
+            env.set_now_ms(at);
+            kinds.push(s.tick(&env).kind());
+        }
+        assert!(
+            env.builds.borrow().is_empty(),
+            "rev(1) was superseded 300s after it was seen, inside the 600s window: {:?}",
+            env.builds.borrow()
+        );
+        assert_eq!(kinds, vec!["settling", "settling", "settling"]);
+        env.set_now_ms(900_000);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::Deployed {
+                rev: rev(2),
+                generation: Generation(7)
+            }
+        );
+        assert_eq!(*env.builds.borrow(), vec![rev(2)]);
+    }
+
+    #[test]
+    fn a_head_that_never_goes_quiet_builds_at_the_ceiling_and_the_node_never_starves() {
+        let env = MockEnv::default();
+        env.set_ancestry_result(Ok(true));
+        env.set_switch_result(Ok(Generation(9)));
+        let mut s = Sentinela::new(LoopConfig {
+            land_ancestor_after_deferrals: 2,
+            ..cfg_quiet(600, 3600)
+        });
+        let head_at = |t: u64| rev(u8::try_from(1 + t / 300_000).unwrap());
+        let build_ms = 1_500_000;
+        let mut t = 0;
+        let mut first_build = None;
+        let mut landed = None;
+        for _ in 0..500 {
+            env.clear_probes();
+            env.set_now_ms(t);
+            env.push_probe(Ok(Some(head_at(t))));
+            env.push_probe(Ok(Some(head_at(t + build_ms))));
+            let built = env.builds.borrow().len();
+            let out = s.tick(&env);
+            let did_build = env.builds.borrow().len() > built;
+            if did_build && first_build.is_none() {
+                first_build = Some(t);
+            }
+            if matches!(out, TickOutcome::Deployed { .. } | TickOutcome::DeployedBehind { .. }) {
+                landed = Some(t);
+                break;
+            }
+            t += if did_build { build_ms } else { 60_000 };
+        }
+        assert_eq!(first_build, Some(3_600_000), "the ceiling, not the quiet window, starts the first build");
+        assert!(landed.is_some(), "a branch that never goes quiet must still land something");
+        assert!(!env.switches.borrow().is_empty());
     }
 }

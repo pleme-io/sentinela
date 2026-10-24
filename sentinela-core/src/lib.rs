@@ -23,6 +23,7 @@ mod checks;
 mod env;
 mod fsm;
 mod probation;
+mod quiet;
 mod receipt;
 mod rev;
 
@@ -36,6 +37,7 @@ pub use receipt::{
     ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, MAX_ERROR_BYTES, Outcome,
     ReceiptChain, bound_text,
 };
+pub use quiet::QuietWindow;
 pub use rev::{Rev, RevError};
 
 #[cfg(any(test, feature = "mock"))]

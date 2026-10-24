@@ -284,6 +284,8 @@ pub struct SentinelaConfig {
     /// verified rev unactivated for as long as main stays red. See
     /// `sentinela_core::LoopConfig::land_last_good_after_failures`.
     pub land_last_good_after_failures: usize,
+    pub head_quiet_seconds: u64,
+    pub head_quiet_max_seconds: u64,
     /// Seconds a `darwin-rebuild build` may run before the daemon gives up
     /// and KILLS its process group. A build has mutated nothing, so killing
     /// is free.
@@ -658,6 +660,8 @@ pub const DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS: usize = 2;
 /// built. Higher than the deferral threshold on purpose — a failure may be
 /// transient where a deferral is not.
 pub const DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES: usize = 3;
+pub const DEFAULT_HEAD_QUIET_SECONDS: u64 = 600;
+pub const DEFAULT_HEAD_QUIET_MAX_SECONDS: u64 = 3600;
 /// Default build deadline, seconds (90 min). Well above the 7-23 min a cold
 /// cid rebuild measured, because killing a real build is a regression while
 /// the bound only has to catch a hang.
@@ -735,6 +739,8 @@ impl SentinelaConfig {
             poll_seconds: self.poll_seconds,
             land_ancestor_after_deferrals: self.land_ancestor_after_deferrals,
             land_last_good_after_failures: self.land_last_good_after_failures,
+            head_quiet_seconds: self.head_quiet_seconds,
+            head_quiet_max_seconds: self.head_quiet_max_seconds,
         }
     }
 
@@ -780,6 +786,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             cooldown_after_failure_ms: 0,
             land_ancestor_after_deferrals: 0,
             land_last_good_after_failures: 0,
+            head_quiet_seconds: 0,
+            head_quiet_max_seconds: 0,
             build_timeout_seconds: 0,
             build_silence_seconds: 0,
             build_error_quiet_seconds: 0,
@@ -811,6 +819,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             cooldown_after_failure_ms: DEFAULT_COOLDOWN_MS,
             land_ancestor_after_deferrals: DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS,
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
+            head_quiet_seconds: DEFAULT_HEAD_QUIET_SECONDS,
+            head_quiet_max_seconds: DEFAULT_HEAD_QUIET_MAX_SECONDS,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
             build_silence_seconds: DEFAULT_BUILD_SILENCE_SECONDS,
             build_error_quiet_seconds: DEFAULT_BUILD_ERROR_QUIET_SECONDS,
@@ -941,6 +951,19 @@ mod tests {
     }
 
     #[test]
+    fn head_quiet_reaches_the_loop_and_bare_is_off() {
+        let p = SentinelaConfig::prescribed_default().loop_config();
+        assert_eq!(p.head_quiet_seconds, DEFAULT_HEAD_QUIET_SECONDS);
+        assert_eq!(p.head_quiet_max_seconds, DEFAULT_HEAD_QUIET_MAX_SECONDS);
+        assert_eq!(SentinelaConfig::bare().loop_config().head_quiet_seconds, 0);
+        let rendered: SentinelaConfig = serde_yaml::from_str(
+            r#"{"head_quiet_seconds":0,"head_quiet_max_seconds":3600}"#,
+        )
+        .unwrap();
+        assert_eq!(rendered.loop_config().head_quiet_seconds, 0);
+    }
+
+    #[test]
     fn yaml_roundtrips_and_rejects_unknown_fields() {
         let cfg = SentinelaConfig {
             flake_url: "github:pleme-io/nix".to_owned(),
@@ -956,6 +979,8 @@ mod tests {
             cooldown_after_failure_ms: 300_000,
             land_ancestor_after_deferrals: 2,
             land_last_good_after_failures: 3,
+            head_quiet_seconds: 600,
+            head_quiet_max_seconds: 3600,
             build_timeout_seconds: 5400,
             build_silence_seconds: 1800,
             build_error_quiet_seconds: 60,
