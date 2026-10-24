@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "842e3503bfd76674803536889aebcfdd26fcfc77f57aeaf7805a6fd5d3c64bdc",
+  "cargo_lock_sha256": "5ef1aac12b402c216b3ac1df893943a8669c1f34f556aaa6c5c024694ea6469c",
   "manifest_sha256": {
     "Cargo.toml": "7ee977448683b18067b96fb1357d2fa4e98b485a17f06ae3953dd36c5b249167",
     "sentinela-config/Cargo.toml": "3f8e53a19dbb46469edbc79f29620ee2a848c5e9b06ad4f587c0fcd7b0e9ebf3",
@@ -525,6 +525,11 @@
         "build_dependencies": [],
         "features": []
       },
+      "dyn-clone-1.0.20": {
+        "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
       "equivalent-1.0.2": {
         "runtime_dependencies": [],
         "build_dependencies": [],
@@ -697,7 +702,7 @@
           "sync"
         ]
       },
-      "gen-macros-0.1.34": {
+      "gen-macros-0.1.52": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -736,11 +741,11 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-platform-0.1.34": {
+      "gen-platform-0.1.52": {
         "runtime_dependencies": [
           {
             "name": "gen_macros",
-            "package_key": "gen-macros-0.1.34",
+            "package_key": "gen-macros-0.1.52",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -750,7 +755,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.34",
+            "package_key": "gen-types-0.1.52",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -804,7 +809,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "gen-types-0.1.34": {
+      "gen-types-0.1.52": {
         "runtime_dependencies": [
           {
             "name": "blake3",
@@ -886,7 +891,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "getrandom-0.4.3": {
+      "getrandom-0.3.4": {
         "runtime_dependencies": [
           {
             "name": "cfg_if",
@@ -1982,6 +1987,58 @@
           "proc-macro"
         ]
       },
+      "ref-cast-1.0.27": {
+        "runtime_dependencies": [
+          {
+            "name": "ref_cast_impl",
+            "package_key": "ref-cast-impl-1.0.27",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "host"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
+      "ref-cast-impl-1.0.27": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-3.0.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "regex-automata-0.4.14": {
         "runtime_dependencies": [
           {
@@ -2024,6 +2081,117 @@
       },
       "same-file-1.0.6": {
         "runtime_dependencies": [],
+        "build_dependencies": [],
+        "features": []
+      },
+      "schemars-1.2.3": {
+        "runtime_dependencies": [
+          {
+            "name": "dyn_clone",
+            "package_key": "dyn-clone-1.0.20",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "ref_cast",
+            "package_key": "ref-cast-1.0.27",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "schemars_derive",
+            "package_key": "schemars_derive-1.2.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": true,
+            "target": null,
+            "tree": "host"
+          },
+          {
+            "name": "serde",
+            "package_key": "serde-1.0.228",
+            "kind": "normal",
+            "features": [
+              "alloc"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_json",
+            "package_key": "serde_json-1.0.150",
+            "kind": "normal",
+            "features": [
+              "alloc"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": [
+          "default",
+          "derive",
+          "schemars_derive",
+          "std"
+        ]
+      },
+      "schemars_derive-1.2.3": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "serde_derive_internals",
+            "package_key": "serde_derive_internals-0.30.0",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-3.0.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
         "build_dependencies": [],
         "features": []
       },
@@ -2208,7 +2376,7 @@
           },
           {
             "name": "shikumi",
-            "package_key": "shikumi-0.1.496",
+            "package_key": "shikumi-0.1.1083",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2307,6 +2475,7 @@
         ],
         "build_dependencies": [],
         "features": [
+          "alloc",
           "default",
           "derive",
           "serde_derive",
@@ -2317,6 +2486,7 @@
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
+          "alloc",
           "result",
           "std"
         ]
@@ -2369,6 +2539,47 @@
           "default"
         ]
       },
+      "serde_derive_internals-0.30.0": {
+        "runtime_dependencies": [
+          {
+            "name": "proc_macro2",
+            "package_key": "proc-macro2-1.0.106",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "quote",
+            "package_key": "quote-1.0.46",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          },
+          {
+            "name": "syn",
+            "package_key": "syn-3.0.3",
+            "kind": "normal",
+            "features": [
+              "clone-impls",
+              "derive",
+              "parsing",
+              "printing"
+            ],
+            "uses_default_features": false,
+            "optional": false,
+            "target": null,
+            "tree": "target"
+          }
+        ],
+        "build_dependencies": [],
+        "features": []
+      },
       "serde_json-1.0.150": {
         "runtime_dependencies": [
           {
@@ -2414,6 +2625,7 @@
         ],
         "build_dependencies": [],
         "features": [
+          "alloc",
           "default",
           "std"
         ]
@@ -2508,7 +2720,7 @@
         "build_dependencies": [],
         "features": []
       },
-      "shikumi-0.1.496": {
+      "shikumi-0.1.1083": {
         "runtime_dependencies": [
           {
             "name": "arc_swap",
@@ -2546,7 +2758,7 @@
           },
           {
             "name": "gen_platform",
-            "package_key": "gen-platform-0.1.34",
+            "package_key": "gen-platform-0.1.52",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2556,7 +2768,7 @@
           },
           {
             "name": "gen_types",
-            "package_key": "gen-types-0.1.34",
+            "package_key": "gen-types-0.1.52",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2584,6 +2796,16 @@
             "uses_default_features": false,
             "optional": false,
             "target": "cfg(target_os = \"macos\")",
+            "tree": "target"
+          },
+          {
+            "name": "schemars",
+            "package_key": "schemars-1.2.3",
+            "kind": "normal",
+            "features": [],
+            "uses_default_features": true,
+            "optional": false,
+            "target": null,
             "tree": "target"
           },
           {
@@ -2865,7 +3087,7 @@
           },
           {
             "name": "getrandom",
-            "package_key": "getrandom-0.4.3",
+            "package_key": "getrandom-0.3.4",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -6628,6 +6850,9 @@
       "edition": "2021",
       "proc_macro": true
     },
+    "dyn-clone-1.0.20": {
+      "edition": "2018"
+    },
     "equivalent-1.0.2": {
       "edition": "2015"
     },
@@ -6653,18 +6878,18 @@
     "fsevent-sys-4.1.0": {
       "edition": "2018"
     },
-    "gen-macros-0.1.34": {
+    "gen-macros-0.1.52": {
       "edition": "2024",
       "proc_macro": true
     },
-    "gen-platform-0.1.34": {
+    "gen-platform-0.1.52": {
       "edition": "2024"
     },
-    "gen-types-0.1.34": {
+    "gen-types-0.1.52": {
       "edition": "2024"
     },
-    "getrandom-0.4.3": {
-      "edition": "2024",
+    "getrandom-0.3.4": {
+      "edition": "2021",
       "build_script": "build.rs"
     },
     "hashbrown-0.17.1": {
@@ -6815,6 +7040,14 @@
       "edition": "2021",
       "build_script": "build.rs"
     },
+    "ref-cast-1.0.27": {
+      "edition": "2021",
+      "build_script": "build.rs"
+    },
+    "ref-cast-impl-1.0.27": {
+      "edition": "2021",
+      "proc_macro": true
+    },
     "regex-automata-0.4.14": {
       "edition": "2021"
     },
@@ -6839,6 +7072,13 @@
     },
     "same-file-1.0.6": {
       "edition": "2018"
+    },
+    "schemars-1.2.3": {
+      "edition": "2021"
+    },
+    "schemars_derive-1.2.3": {
+      "edition": "2021",
+      "proc_macro": true
     },
     "sentinela-0.1.31": {
       "edition": "2024",
@@ -6875,6 +7115,13 @@
       "edition": "2021",
       "proc_macro": true
     },
+    "serde_derive_internals-0.30.0": {
+      "edition": "2021",
+      "lib_target": {
+        "name": "serde_derive_internals",
+        "path": "lib.rs"
+      }
+    },
     "serde_json-1.0.150": {
       "edition": "2021",
       "build_script": "build.rs"
@@ -6888,7 +7135,7 @@
     "sharded-slab-0.1.7": {
       "edition": "2018"
     },
-    "shikumi-0.1.496": {
+    "shikumi-0.1.1083": {
       "edition": "2024"
     },
     "shlex-2.0.1": {
