@@ -286,6 +286,11 @@ pub struct SentinelaConfig {
     pub land_last_good_after_failures: usize,
     pub head_quiet_seconds: u64,
     pub head_quiet_max_seconds: u64,
+    /// See `sentinela_core::LoopConfig::build_newer_after_deferral`.
+    pub build_newer_after_deferral: bool,
+    /// Consecutive deferrals before the loop's health reads STARVED; fewer
+    /// read as deferring. `0` and `1` call every deferral starved.
+    pub starved_after_deferrals: usize,
     /// Seconds a `darwin-rebuild build` may run before the daemon gives up
     /// and KILLS its process group. A build has mutated nothing, so killing
     /// is free.
@@ -662,6 +667,9 @@ pub const DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS: usize = 2;
 pub const DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES: usize = 3;
 pub const DEFAULT_HEAD_QUIET_SECONDS: u64 = 600;
 pub const DEFAULT_HEAD_QUIET_MAX_SECONDS: u64 = 3600;
+/// The streak at which the deferral escape fires is the streak that means
+/// the loop cannot keep up.
+pub const DEFAULT_STARVED_AFTER_DEFERRALS: usize = DEFAULT_LAND_ANCESTOR_AFTER_DEFERRALS;
 /// Default build deadline, seconds (90 min). Well above the 7-23 min a cold
 /// cid rebuild measured, because killing a real build is a regression while
 /// the bound only has to catch a hang.
@@ -741,6 +749,7 @@ impl SentinelaConfig {
             land_last_good_after_failures: self.land_last_good_after_failures,
             head_quiet_seconds: self.head_quiet_seconds,
             head_quiet_max_seconds: self.head_quiet_max_seconds,
+            build_newer_after_deferral: self.build_newer_after_deferral,
         }
     }
 
@@ -788,6 +797,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: 0,
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
+            build_newer_after_deferral: false,
+            starved_after_deferrals: 0,
             build_timeout_seconds: 0,
             build_silence_seconds: 0,
             build_error_quiet_seconds: 0,
@@ -821,6 +832,8 @@ impl shikumi::TieredConfig for SentinelaConfig {
             land_last_good_after_failures: DEFAULT_LAND_LAST_GOOD_AFTER_FAILURES,
             head_quiet_seconds: DEFAULT_HEAD_QUIET_SECONDS,
             head_quiet_max_seconds: DEFAULT_HEAD_QUIET_MAX_SECONDS,
+            build_newer_after_deferral: true,
+            starved_after_deferrals: DEFAULT_STARVED_AFTER_DEFERRALS,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
             build_silence_seconds: DEFAULT_BUILD_SILENCE_SECONDS,
             build_error_quiet_seconds: DEFAULT_BUILD_ERROR_QUIET_SECONDS,
@@ -964,6 +977,25 @@ mod tests {
     }
 
     #[test]
+    fn deferral_knobs_reach_the_loop_and_bare_is_off() {
+        let p = SentinelaConfig::prescribed_default();
+        assert!(p.loop_config().build_newer_after_deferral);
+        assert_eq!(p.starved_after_deferrals, DEFAULT_STARVED_AFTER_DEFERRALS);
+        assert_eq!(
+            p.starved_after_deferrals,
+            p.loop_config().land_ancestor_after_deferrals
+        );
+        let b = SentinelaConfig::bare();
+        assert!(!b.loop_config().build_newer_after_deferral);
+        assert_eq!(b.starved_after_deferrals, 0);
+        let absent: SentinelaConfig = serde_yaml::from_str(r#"{"head_quiet_seconds":600}"#).unwrap();
+        assert!(absent.loop_config().build_newer_after_deferral);
+        let off: SentinelaConfig =
+            serde_yaml::from_str(r#"{"build_newer_after_deferral":false}"#).unwrap();
+        assert!(!off.loop_config().build_newer_after_deferral);
+    }
+
+    #[test]
     fn yaml_roundtrips_and_rejects_unknown_fields() {
         let cfg = SentinelaConfig {
             flake_url: "github:pleme-io/nix".to_owned(),
@@ -981,6 +1013,8 @@ mod tests {
             land_last_good_after_failures: 3,
             head_quiet_seconds: 600,
             head_quiet_max_seconds: 3600,
+            build_newer_after_deferral: true,
+            starved_after_deferrals: 2,
             build_timeout_seconds: 5400,
             build_silence_seconds: 1800,
             build_error_quiet_seconds: 60,

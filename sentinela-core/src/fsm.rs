@@ -548,6 +548,12 @@ impl Sentinela {
         ) {
             self.quiet.caught_up();
         }
+        // A deferral already waited out the quiet window and spent a build;
+        // making the HEAD that superseded it wait a fresh window again is what
+        // held rio for 10+ minutes after one deferral on 2026-10-27.
+        if self.cfg.build_newer_after_deferral && matches!(outcome, TickOutcome::Deferred { .. }) {
+            self.quiet.release();
+        }
         // ── ★ THE PULSE IS WRITTEN HERE, NOT INSIDE `tick_inner` ──────────
         // `tick_inner` has nine return points and every one of them is a
         // real outcome the operator needs counted as "the loop was alive".
@@ -1632,6 +1638,7 @@ mod tests {
             land_last_good_after_failures: 0,
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
+            build_newer_after_deferral: true,
         }
     }
 
@@ -3352,6 +3359,65 @@ mod tests {
             }
         );
         assert_eq!(*env.builds.borrow(), vec![rev(2)]);
+    }
+
+    /// rio 2026-10-27: `7a2434c` built after its quiet window, deferred to
+    /// `6134909`, and the next tick restarted the window on `6134909` instead
+    /// of building it; nothing built for the next 10+ minutes.
+    #[test]
+    fn a_deferral_builds_the_newer_head_on_the_next_tick() {
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        env.set_switch_result(Ok(Generation(7)));
+        let mut s = Sentinela::new(LoopConfig {
+            land_ancestor_after_deferrals: 2,
+            ..cfg_quiet(600, 3600)
+        });
+        env.set_now_ms(0);
+        assert_eq!(s.tick(&env).kind(), "settling");
+        env.set_now_ms(600_000);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::Deferred {
+                built: rev(1),
+                newer: rev(2)
+            }
+        );
+        env.set_now_ms(660_000);
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::Deployed {
+                rev: rev(2),
+                generation: Generation(7)
+            }
+        );
+        assert_eq!(*env.builds.borrow(), vec![rev(1), rev(2)]);
+    }
+
+    #[test]
+    fn a_deferral_waits_out_the_quiet_window_when_configured_off() {
+        let env = MockEnv::with_probes(vec![
+            Ok(Some(rev(1))),
+            Ok(Some(rev(1))),
+            Ok(Some(rev(2))),
+            Ok(Some(rev(2))),
+        ]);
+        let mut s = Sentinela::new(LoopConfig {
+            build_newer_after_deferral: false,
+            ..cfg_quiet(600, 3600)
+        });
+        env.set_now_ms(0);
+        let _ = s.tick(&env);
+        env.set_now_ms(600_000);
+        assert_eq!(s.tick(&env).kind(), "deferred");
+        env.set_now_ms(660_000);
+        assert_eq!(s.tick(&env).kind(), "settling");
+        assert_eq!(*env.builds.borrow(), vec![rev(1)]);
     }
 
     #[test]

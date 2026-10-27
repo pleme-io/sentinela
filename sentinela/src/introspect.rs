@@ -97,6 +97,9 @@ pub enum Health {
     /// for real on cid 2026-08-02, freshly migrated onto this engine.
     NeverDeployed,
     Degraded { streak: usize, last_ok: String },
+    /// A deferral streak below the starvation threshold: one build lost a
+    /// race with a push, and the next tick builds the newer HEAD.
+    Deferring { deferrals: usize, last_ok: String },
     Starved { deferrals: usize, last_ok: String },
     Converged { last_ok: String },
     /// An unreadable chain is worth saying out loud: the audit trail — the
@@ -112,6 +115,7 @@ impl Health {
         match self {
             Self::NeverDeployed => "never-deployed",
             Self::Degraded { .. } => "degraded",
+            Self::Deferring { .. } => "deferring",
             Self::Starved { .. } => "starved",
             Self::Converged { .. } => "converged",
             Self::Unreadable { .. } => "unreadable",
@@ -120,7 +124,8 @@ impl Health {
 }
 
 /// Derive the loop's health from the persisted chain. The ONE derivation.
-pub fn health_of(env: &dyn ChainView) -> Health {
+/// `starved_after` is `SentinelaConfig::starved_after_deferrals`.
+pub fn health_of(env: &dyn ChainView, starved_after: usize) -> Health {
     let chain = match env.load_chain() {
         Ok(c) => c,
         Err(e) => {
@@ -140,8 +145,11 @@ pub fn health_of(env: &dyn ChainView) -> Health {
         return Health::Degraded { streak, last_ok };
     }
     let deferrals = chain.consecutive_deferrals();
-    if deferrals > 0 {
+    if deferrals >= starved_after.max(1) {
         return Health::Starved { deferrals, last_ok };
+    }
+    if deferrals > 0 {
+        return Health::Deferring { deferrals, last_ok };
     }
     Health::Converged { last_ok }
 }
@@ -149,16 +157,17 @@ pub fn health_of(env: &dyn ChainView) -> Health {
 /// The kanshou consumer.
 pub struct SentinelaIntrospect<E: ChainView> {
     env: Arc<E>,
+    starved_after: usize,
 }
 
 impl<E: ChainView> SentinelaIntrospect<E> {
     #[must_use]
-    pub fn new(env: Arc<E>) -> Arc<Self> {
-        Arc::new(Self { env })
+    pub fn new(env: Arc<E>, starved_after: usize) -> Arc<Self> {
+        Arc::new(Self { env, starved_after })
     }
 
     fn health_json(&self) -> serde_json::Value {
-        let h = health_of(&*self.env);
+        let h = health_of(&*self.env, self.starved_after);
         let mut v = serde_json::json!({ "state": h.tag() });
         let obj = v.as_object_mut().expect("json object");
         match &h {
@@ -166,7 +175,7 @@ impl<E: ChainView> SentinelaIntrospect<E> {
                 obj.insert("consecutive_failures".into(), (*streak).into());
                 obj.insert("last_activated".into(), last_ok.clone().into());
             }
-            Health::Starved { deferrals, last_ok } => {
+            Health::Deferring { deferrals, last_ok } | Health::Starved { deferrals, last_ok } => {
                 obj.insert("consecutive_deferrals".into(), (*deferrals).into());
                 obj.insert("last_activated".into(), last_ok.clone().into());
             }
@@ -301,6 +310,34 @@ mod tests {
         Rev::parse(s).expect("rev")
     }
     const R1: &str = "1111111111111111111111111111111111111111";
+    const R2: &str = "2222222222222222222222222222222222222222";
+    const STARVED: usize = sentinela_config::DEFAULT_STARVED_AFTER_DEFERRALS;
+
+    fn deferred_chain(deferrals: usize) -> ReceiptChain {
+        let mut c = activated_chain(1_000);
+        for i in 0..deferrals {
+            let r = c.next_receipt(
+                rev(R2),
+                Outcome::Deferred { newer: rev(R1) },
+                2_000 + i as u64,
+            );
+            c.append(r).expect("append");
+        }
+        c
+    }
+
+    /// rio 2026-10-27 logged STARVED every minute at consecutive_deferrals=1.
+    #[test]
+    fn one_deferral_is_deferring_and_the_threshold_is_starved() {
+        let at = |n, t| health_of(&*Fake::with(deferred_chain(n), 9_000), t);
+        assert!(matches!(at(1, STARVED), Health::Deferring { deferrals: 1, .. }));
+        assert!(matches!(at(STARVED, STARVED), Health::Starved { .. }));
+        assert!(matches!(at(1, 0), Health::Starved { deferrals: 1, .. }));
+        let i = SentinelaIntrospect::new(Fake::with(deferred_chain(1), 9_000), STARVED);
+        let v = i.query(&Query::field(["health"])).expect("ok");
+        assert_eq!(v["state"], "deferring");
+        assert_eq!(v["consecutive_deferrals"], 1);
+    }
 
     fn activated_chain(at: u64) -> ReceiptChain {
         let mut c = ReceiptChain::new();
@@ -321,7 +358,7 @@ mod tests {
         // twenty-minute-old verdict as current, which is the failure that
         // motivated it.
         let env = Fake::with(activated_chain(1_000), 1_000 + 20 * 60 * 1_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["chain", "head"])).expect("ok");
         assert_eq!(v["age_ms"], 20 * 60 * 1_000);
         assert_eq!(v["status"], "found");
@@ -332,7 +369,7 @@ mod tests {
         // A wrapped subtraction reads as ~584 million years and looks like
         // corruption rather than clock skew.
         let env = Fake::with(activated_chain(9_000), 1_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["chain", "head"])).expect("ok");
         assert_eq!(v["age_ms"], 0);
     }
@@ -341,7 +378,7 @@ mod tests {
     fn an_empty_chain_is_a_finding_not_an_error() {
         // kotae: `empty` and `refused` must not render as the same bytes.
         let env = Fake::with(ReceiptChain::new(), 5_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["chain", "head"])).expect("not an Err");
         assert_eq!(v["status"], "empty");
     }
@@ -351,14 +388,14 @@ mod tests {
         // An empty chain has a zero failure streak; `streak == 0` alone would
         // call a node that never deployed healthy. Seen on cid 2026-08-02.
         let env = Fake::with(ReceiptChain::new(), 5_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["health"])).expect("ok");
         assert_eq!(v["state"], "never-deployed");
     }
 
     #[test]
     fn an_unreadable_chain_says_so_rather_than_reporting_health() {
-        let i = SentinelaIntrospect::new(Fake::unreadable());
+        let i = SentinelaIntrospect::new(Fake::unreadable(), STARVED);
         let v = i.query(&Query::field(["health"])).expect("ok");
         assert_eq!(v["state"], "unreadable");
     }
@@ -366,7 +403,7 @@ mod tests {
     #[test]
     fn a_converged_loop_reports_its_last_activation() {
         let env = Fake::with(activated_chain(1_000), 2_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["health"])).expect("ok");
         assert_eq!(v["state"], "converged");
         // `Rev::short()` is 7 chars, git's abbreviation length -- measured,
@@ -377,7 +414,7 @@ mod tests {
     #[test]
     fn every_answer_carries_when_it_was_answered() {
         let env = Fake::with(activated_chain(1_000), 4_242);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         for leaf in [
             vec!["health"],
             vec!["chain", "head"],
@@ -394,7 +431,7 @@ mod tests {
         // A schema entry nothing answers is a lie to an operator enumerating
         // the surface.
         let env = Fake::with(activated_chain(1_000), 2_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         for leaf in i.schema() {
             let path: Vec<&str> = leaf.split('.').collect();
             assert!(
@@ -407,7 +444,7 @@ mod tests {
     #[test]
     fn an_unknown_leaf_is_refused_by_name() {
         let env = Fake::with(activated_chain(1_000), 2_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let e = i
             .query(&Query::field(["chain", "nope"]))
             .expect_err("must refuse");
@@ -422,7 +459,7 @@ mod tests {
     #[test]
     fn the_chain_verifies() {
         let env = Fake::with(activated_chain(1_000), 2_000);
-        let i = SentinelaIntrospect::new(env);
+        let i = SentinelaIntrospect::new(env, STARVED);
         let v = i.query(&Query::field(["chain", "verify"])).expect("ok");
         assert_eq!(v["ok"], true);
     }

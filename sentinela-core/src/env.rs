@@ -313,6 +313,10 @@ pub struct LoopConfig {
     pub land_last_good_after_failures: usize,
     pub head_quiet_seconds: u64,
     pub head_quiet_max_seconds: u64,
+    /// A deferral releases the quiet window for the next admission, so the
+    /// HEAD that superseded the build is built on the next tick rather than
+    /// after a fresh `head_quiet_seconds`. `false` makes every HEAD wait.
+    pub build_newer_after_deferral: bool,
 }
 
 impl Default for LoopConfig {
@@ -338,6 +342,7 @@ impl Default for LoopConfig {
             land_last_good_after_failures: 3,
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
+            build_newer_after_deferral: true,
         }
     }
 }

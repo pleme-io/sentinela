@@ -43,11 +43,16 @@ pub(crate) enum Admission {
 pub(crate) struct Quiet {
     seen: Option<(Rev, u64)>,
     waiting_since: Option<u64>,
+    released: bool,
 }
 
 impl Quiet {
     pub(crate) fn admit(&mut self, head: Rev, now_ms: u64, window: QuietWindow) -> Admission {
         if window.quiet_ms == 0 {
+            return Admission::Settled(head);
+        }
+        if std::mem::take(&mut self.released) {
+            self.seen = Some((head.clone(), now_ms));
             return Admission::Settled(head);
         }
         let since = match &self.seen {
@@ -73,6 +78,11 @@ impl Quiet {
 
     pub(crate) fn caught_up(&mut self) {
         self.waiting_since = None;
+        self.released = false;
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.released = true;
     }
 }
 
@@ -126,6 +136,21 @@ mod tests {
             }
         ));
         assert_eq!(q.admit(rev(4), 1_000_000, w), Admission::Settled(rev(4)));
+    }
+
+    #[test]
+    fn a_release_admits_the_next_head_once() {
+        let w = QuietWindow::new(600, 3600);
+        let mut q = Quiet::default();
+        q.release();
+        assert_eq!(q.admit(rev(2), 0, w), Admission::Settled(rev(2)));
+        assert!(matches!(
+            q.admit(rev(3), 60_000, w),
+            Admission::Settling {
+                remaining_ms: 600_000,
+                ..
+            }
+        ));
     }
 
     #[test]

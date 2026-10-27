@@ -322,6 +322,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     // the outcome produces, so "sleep the wrong interval" has no expression
     // rather than being a rule someone has to remember.
     let loop_cfg = cfg.loop_config();
+    let starved_after = cfg.starved_after_deferrals;
     // Resolved before `cfg` moves into the env: the plan checks probe
     // binaries against this filesystem, once, at startup.
     let rollback = cfg.rollback_plan();
@@ -346,7 +347,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     // ask what converged, never a precondition for converging.
     match kanshou::Server::spawn_sidecar(
         "sentinela",
-        introspect::SentinelaIntrospect::new(std::sync::Arc::clone(&env)),
+        introspect::SentinelaIntrospect::new(std::sync::Arc::clone(&env), starved_after),
     ) {
         Some(sock) => tracing::info!(socket = %sock.display(), "introspection live"),
         None => tracing::warn!("introspection unavailable — the loop still converges"),
@@ -368,7 +369,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     // thousand failed. MEASURED on ryn 2026-08-02: 4136 consecutive
     // failures across 27.9 days, and 15 `daemon started` lines in that same
     // log — every restart had the number available and printed none of it.
-    let mut prev = health(&env);
+    let mut prev = health(&env, starved_after);
     log_health(&prev);
 
     // The config document as loaded, resolved to what it points at (a store
@@ -401,7 +402,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
         log_outcome(&outcome);
         checks_report.log(&outcome);
 
-        let now = health(&env);
+        let now = health(&env, starved_after);
         if should_report(&prev, &now) {
             log_health(&now);
         }
@@ -515,8 +516,8 @@ use introspect::Health;
 
 /// The loop's health. A thin alias over the one derivation, kept so every
 /// call site and test here reads unchanged.
-fn health(env: &RealEnv) -> Health {
-    introspect::health_of(env)
+fn health(env: &RealEnv, starved_after: usize) -> Health {
+    introspect::health_of(env, starved_after)
 }
 
 /// Say something whenever anything is wrong, and once more on the transition
@@ -541,6 +542,11 @@ fn log_health(h: &Health) {
             consecutive_failures = streak,
             last_activated = %last_ok,
             "gitops: DEGRADED — this node is not tracking the branch"
+        ),
+        Health::Deferring { deferrals, last_ok } => tracing::info!(
+            consecutive_deferrals = deferrals,
+            last_activated = %last_ok,
+            "gitops: deferring — a build finished against a moved HEAD; the newer HEAD builds next"
         ),
         Health::Starved { deferrals, last_ok } => tracing::warn!(
             consecutive_deferrals = deferrals,
