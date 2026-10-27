@@ -78,7 +78,7 @@ build and no receipt: `waitingForGreen` (quiet), `checksRed <rev>` or
 
 A new HEAD waits in `settling` for `head_quiet_seconds` (default 600, `0` =
 off); a newer HEAD restarts the wait. `head_quiet_max_seconds` (default 3600)
-bounds it, so a busy branch still builds; a deferral releases it once. [Detail](docs/quiet-window.md).
+bounds it; a deferral releases it once. [Detail](docs/quiet-window.md).
 
 ## A new config is loaded by exiting between ticks
 
