@@ -737,6 +737,7 @@ impl GitopsEnv for RealEnv {
                 budget_seconds: None,
                 in_flight: Some(p),
                 verification: None,
+                probe_error: None,
             };
             let _ = self.write_heartbeat(&beat);
         };

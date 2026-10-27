@@ -227,6 +227,8 @@ pub struct Heartbeat {
     /// field existed, so the fleet reader's golden sample still holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Probation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_error: Option<String>,
 }
 
 /// A driver's report of what a running build is doing.
@@ -1072,6 +1074,7 @@ mod rebuild_driver_tests {
             budget_seconds: None,
             in_flight: None,
             verification: None,
+            probe_error: None,
         };
         let json = serde_json::to_string(&quiet).unwrap();
         assert!(

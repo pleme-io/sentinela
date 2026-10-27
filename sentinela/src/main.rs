@@ -766,6 +766,7 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         // The DISTILLED cause of the most recent failure. See
         // `distill_failure` — the raw receipt is mostly cascade.
         "last_failure": last_failure_lines(&chain),
+        "probe_error": beat.as_ref().and_then(|b| b.probe_error.as_deref()),
         "recent_failures": recent_failures(&chain, env.now_unix_ms(), RECENT_FAILURE_WINDOW_MS),
         "converged": convergence_gate(
             &beat,
@@ -1228,6 +1229,7 @@ mod gate_tests {
             budget_seconds: None,
             in_flight: None,
             verification: None,
+            probe_error: None,
         })
     }
 
@@ -1245,6 +1247,7 @@ mod gate_tests {
             // driver being able to report steps.
             in_flight: None,
             verification: None,
+            probe_error: None,
         })
     }
 
@@ -1260,6 +1263,7 @@ mod gate_tests {
                 budget_seconds: budget,
                 in_flight: None,
                 verification: None,
+                probe_error: None,
             })
         };
         assert!(convergence_gate(&planning(Some(600)), 500_000, POLL, BUILD_BUDGET, 0, true).is_ok());
@@ -1566,10 +1570,23 @@ impl std::fmt::Display for StatusView<'_> {
         // eye already is once `last tick` says `buildFailed`, and the very
         // next question is always "failed at what". Everything here was
         // already on disk; the only thing missing was showing it.
+        let probe_error = v.get("probe_error").and_then(serde_json::Value::as_str);
+        if let Some(e) = probe_error {
+            writeln!(f)?;
+            writeln!(f, "    {:<11} {}", "probe", paint("the branch probe fails now", "31;1"))?;
+            for l in e.lines().take(5) {
+                writeln!(f, "      {}", paint(l, "31"))?;
+            }
+        }
         if let Some(lines) = v.get("last_failure").and_then(serde_json::Value::as_array) {
             if !lines.is_empty() {
+                let label = if probe_error.is_some() {
+                    "an earlier build failed at"
+                } else {
+                    "the last tick failed at"
+                };
                 writeln!(f)?;
-                writeln!(f, "    {:<11} {}", "failure", paint("the last tick failed at", "31;1"))?;
+                writeln!(f, "    {:<11} {}", "failure", paint(label, "31;1"))?;
                 for l in lines {
                     if let Some(t) = l.as_str() {
                         writeln!(f, "      {}", paint(t, "31"))?;
@@ -2153,6 +2170,38 @@ mod recent_failure_tests {
         assert!(out.contains("engenho-restart-gate: HELD"), "{out}");
         assert!(out.contains("cccccccc"), "{out}");
     }
+
+    #[test]
+    fn a_failing_probe_is_the_current_fault_not_the_old_build() {
+        let tls = "probe failed: fatal: unable to access 'https://github.com/pleme-io/nix.git/': \
+                   SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)";
+        let v = serde_json::json!({
+            "hostname": "ryn",
+            "converged": {"ok": false, "why": "76 consecutive failed ticks"},
+            "last_failure": ["build failed: run timed out after 0s"],
+            "probe_error": tls,
+        });
+        let out = StatusView(&v).to_string();
+        assert!(out.contains("the branch probe fails now"), "{out}");
+        assert!(out.contains("unable to get local issuer certificate"), "{out}");
+        assert!(out.contains("an earlier build failed at"), "{out}");
+        assert!(!out.contains("the last tick failed at"), "{out}");
+        let probe_at = out.find("the branch probe fails now").unwrap();
+        let build_at = out.find("an earlier build failed at").unwrap();
+        assert!(probe_at < build_at, "{out}");
+    }
+
+    #[test]
+    fn without_a_probe_error_the_last_failure_reads_as_before() {
+        let v = serde_json::json!({
+            "hostname": "ryn",
+            "converged": {"ok": false, "why": "1 consecutive failed ticks"},
+            "last_failure": ["error: builder failed"],
+        });
+        let out = StatusView(&v).to_string();
+        assert!(out.contains("the last tick failed at"), "{out}");
+        assert!(!out.contains("probe fails now"), "{out}");
+    }
 }
 
 #[cfg(test)]
@@ -2244,6 +2293,7 @@ mod hang_gate_tests {
             budget_seconds: None,
             in_flight: None,
             verification: None,
+            probe_error: None,
         })
     }
 

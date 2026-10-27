@@ -580,6 +580,10 @@ impl Sentinela {
                 State::Verifying(p) => Some(p.clone()),
                 State::Idle | State::CoolingDown { .. } => None,
             },
+            probe_error: match &outcome {
+                TickOutcome::ProbeError { error } => Some(error.clone()),
+                _ => None,
+            },
         };
         if let Err(e) = env.write_heartbeat(&beat) {
             tracing::warn!(error = %e, "sentinela: could not write heartbeat (loop is fine)");
@@ -734,6 +738,7 @@ impl Sentinela {
                 budget_seconds: Some(budget),
                 in_flight: None,
                 verification: None,
+                probe_error: None,
             };
             if let Err(e) = env.write_heartbeat(&planning) {
                 tracing::warn!(error = %e, "sentinela: could not write the planning heartbeat (planning proceeds)");
@@ -791,6 +796,7 @@ impl Sentinela {
             in_flight: None,
             // A tick reaching a build is by construction not on probation.
             verification: None,
+            probe_error: None,
         };
         if let Err(e) = env.write_heartbeat(&in_flight) {
             tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");
@@ -2455,6 +2461,30 @@ mod tests {
             0,
             "a held lock is not a failure"
         );
+    }
+
+    #[test]
+    fn a_probe_error_tick_publishes_its_cause_and_a_good_tick_clears_it() {
+        let env = MockEnv::with_probes(vec![
+            Err(EnvError::ProbeFailed("unable to get local issuer certificate".into())),
+            Ok(Some(rev(1))),
+        ]);
+        env.set_now_ms(0);
+        let mut s = Sentinela::new(cfg());
+        assert!(matches!(s.tick(&env), TickOutcome::ProbeError { .. }));
+        let first = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(first.outcome, "probeError");
+        assert!(
+            first
+                .probe_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unable to get local issuer certificate")),
+            "{first:?}"
+        );
+        env.set_now_ms(10_000_000);
+        let _ = s.tick(&env);
+        let second = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(second.probe_error, None, "{second:?}");
     }
 
     #[test]
