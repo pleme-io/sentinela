@@ -43,6 +43,7 @@
 //!   until HEAD moves. See [`crate::probation`] for why this is not the
 //!   no-downgrade rule.
 
+use crate::busy::{BusyDeferral, BusyGate, BusyOverride, first_busy};
 use crate::checks::{Cache, Cached, ChecksVerdict, GreenPolicy, RevisionPolicy, still_valid};
 use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
 use crate::probation::{ProbeFailure, Probation, RollbackPolicy};
@@ -79,6 +80,8 @@ pub enum State {
     /// activation on an unverified one would make the unverified one the
     /// rollback target. The window bounds how long that can last.
     Verifying(Probation),
+    /// A built rev waits to be activated because a busy probe holds it.
+    AwaitingIdle(BusyDeferral),
 }
 
 /// What one [`Sentinela::tick`] did — a total sum over every terminal
@@ -245,6 +248,14 @@ pub enum TickOutcome {
         rev: Rev,
         remaining_ms: u64,
     },
+    /// A busy probe held the activation of a built rev; it is rechecked
+    /// until idle or until the wait reaches its bound.
+    BusyDeferred {
+        /// The held activation.
+        deferral: BusyDeferral,
+        /// Branch HEAD as this tick observed it.
+        head: Rev,
+    },
 }
 
 impl TickOutcome {
@@ -276,6 +287,7 @@ impl TickOutcome {
             Self::ChecksRed { .. } => "checksRed",
             Self::ChecksBlind { .. } => "checksBlind",
             Self::Settling { .. } => "settling",
+            Self::BusyDeferred { .. } => "busyDeferred",
         }
     }
 
@@ -316,7 +328,8 @@ impl TickOutcome {
             | Self::WaitingForGreen { .. }
             | Self::ChecksRed { .. }
             | Self::ChecksBlind { .. }
-            | Self::Settling { .. } => Phase::Resolved,
+            | Self::Settling { .. }
+            | Self::BusyDeferred { .. } => Phase::Resolved,
         }
     }
 
@@ -406,7 +419,8 @@ impl TickOutcome {
             // the per-revision cache keeps it from asking the forge each time.
             | Self::WaitingForGreen { .. }
             | Self::ChecksRed { .. }
-            | Self::ChecksBlind { .. } => poll,
+            | Self::ChecksBlind { .. }
+            | Self::BusyDeferred { .. } => poll,
             Self::Settling { remaining_ms, .. } => poll
                 .min(std::time::Duration::from_millis(*remaining_ms))
                 .max(std::time::Duration::from_secs(DEFERRED_RETRY_SECS)),
@@ -443,6 +457,7 @@ impl TickOutcome {
             | Self::ChecksRed { rev, .. }
             | Self::ChecksBlind { head: rev, .. }
             | Self::Settling { rev, .. }
+            | Self::BusyDeferred { head: rev, .. }
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::SwitchDeferred { rev, .. }
@@ -476,6 +491,8 @@ pub struct Sentinela {
     checks: Cache,
     planned: Option<(Rev, String)>,
     quiet: Quiet,
+    busy: Option<BusyGate>,
+    busy_since: Option<u64>,
 }
 
 impl Sentinela {
@@ -491,6 +508,8 @@ impl Sentinela {
             checks: Cache::new(),
             planned: None,
             quiet: Quiet::default(),
+            busy: None,
+            busy_since: None,
         }
     }
 
@@ -512,6 +531,14 @@ impl Sentinela {
         self
     }
 
+    /// Attach (or, with `None`, keep off) the busy gate that defers an
+    /// activation while the machine is busy.
+    #[must_use]
+    pub fn with_busy_gate(mut self, gate: Option<BusyGate>) -> Self {
+        self.busy = gate;
+        self
+    }
+
     /// How long the caller should sleep before the next tick.
     ///
     /// The outcome's own [`TickOutcome::next_delay`], except while an
@@ -526,6 +553,9 @@ impl Sentinela {
             && !matches!(outcome, TickOutcome::RollbackFailed { .. })
         {
             return std::time::Duration::from_secs(policy.interval_seconds.max(1));
+        }
+        if let (State::AwaitingIdle(_), Some(gate)) = (&self.state, &self.busy) {
+            return std::time::Duration::from_secs(gate.recheck_seconds.max(1));
         }
         outcome.next_delay(&self.cfg)
     }
@@ -584,11 +614,15 @@ impl Sentinela {
             // is waiting on and which probe failed last.
             verification: match &self.state {
                 State::Verifying(p) => Some(p.clone()),
-                State::Idle | State::CoolingDown { .. } => None,
+                State::Idle | State::CoolingDown { .. } | State::AwaitingIdle(_) => None,
             },
             probe_error: match &outcome {
                 TickOutcome::ProbeError { error } => Some(error.clone()),
                 _ => None,
+            },
+            busy: match &self.state {
+                State::AwaitingIdle(d) => Some(d.clone()),
+                State::Idle | State::CoolingDown { .. } | State::Verifying(_) => None,
             },
         };
         if let Err(e) = env.write_heartbeat(&beat) {
@@ -693,6 +727,10 @@ impl Sentinela {
             }
         };
         if chain.last_activated_rev() == Some(&head) {
+            self.busy_since = None;
+            if matches!(self.state, State::AwaitingIdle(_)) {
+                self.state = State::Idle;
+            }
             return TickOutcome::Unchanged { rev: head };
         }
         // ── Quarantine — a rev this machine already rolled back ──────────
@@ -707,6 +745,12 @@ impl Sentinela {
                 "HEAD is a rev this node rolled back — not re-attempting until HEAD moves"
             );
             return TickOutcome::Quarantined { rev: head };
+        }
+
+        if let State::AwaitingIdle(d) = &self.state
+            && d.rev == head
+        {
+            return self.activate(chain, env, head, None);
         }
 
         let head = match self
@@ -745,6 +789,7 @@ impl Sentinela {
                 in_flight: None,
                 verification: None,
                 probe_error: None,
+                busy: None,
             };
             if let Err(e) = env.write_heartbeat(&planning) {
                 tracing::warn!(error = %e, "sentinela: could not write the planning heartbeat (planning proceeds)");
@@ -803,6 +848,7 @@ impl Sentinela {
             // A tick reaching a build is by construction not on probation.
             verification: None,
             probe_error: None,
+            busy: None,
         };
         if let Err(e) = env.write_heartbeat(&in_flight) {
             tracing::warn!(error = %e, "sentinela: could not write in-flight heartbeat (build proceeds)");
@@ -1152,6 +1198,10 @@ impl Sentinela {
         rev: Rev,
         behind: Option<Rev>,
     ) -> TickOutcome {
+        let over_busy = match self.hold_while_busy(env, &rev, behind.as_ref()) {
+            Ok(over) => over,
+            Err(out) => return out,
+        };
         // Read BEFORE the switch: afterwards the profile points at the new
         // generation and "the one before" is no longer a fact we observed.
         // Only when rollback is on — off means no new env calls at all.
@@ -1179,6 +1229,20 @@ impl Sentinela {
                 ) {
                     Ok(()) => {
                         self.state = State::Idle;
+                        if let Some(over) = over_busy
+                            && let Err(e) = self.record(
+                                &mut chain,
+                                env,
+                                rev.clone(),
+                                Outcome::BusyOverridden {
+                                    probe: over.probe,
+                                    reading: over.reading,
+                                    waited_ms: over.waited_ms,
+                                },
+                            )
+                        {
+                            tracing::warn!(error = %e, "busy override receipt not persisted");
+                        }
                         self.begin_probation(&mut chain, env, &rev, generation, previous);
                         match behind {
                             None => TickOutcome::Deployed { rev, generation },
@@ -1244,6 +1308,60 @@ impl Sentinela {
                 self.enter_cooldown(env, out)
             }
         }
+    }
+
+    /// The busy gate in front of a switch. `Err` carries the deferral
+    /// outcome; `Ok` lets the switch run, naming the busy probe it overrode
+    /// when the wait reached its bound.
+    fn hold_while_busy<E: GitopsEnv>(
+        &mut self,
+        env: &E,
+        rev: &Rev,
+        behind: Option<&Rev>,
+    ) -> Result<Option<BusyOverride>, TickOutcome> {
+        let Some(gate) = &self.busy else {
+            return Ok(None);
+        };
+        let now = env.now_unix_ms();
+        let since = *self.busy_since.get_or_insert(now);
+        let waited_ms = now.saturating_sub(since);
+        let Some((probe, reading)) = first_busy(&gate.probes, |p| env.read_probe(p)) else {
+            self.busy_since = None;
+            return Ok(None);
+        };
+        let reading = match reading {
+            crate::busy::BusyReading::Unknown { reason } => crate::busy::BusyReading::Unknown {
+                reason: bound_text(reason),
+            },
+            busy @ crate::busy::BusyReading::Busy => busy,
+        };
+        if waited_ms >= gate.max_wait_ms {
+            tracing::warn!(
+                rev = rev.short(),
+                probe = %probe,
+                waited_ms,
+                "busy probe still holds the activation at its bound; activating anyway"
+            );
+            self.busy_since = None;
+            return Ok(Some(BusyOverride {
+                probe,
+                reading,
+                waited_ms,
+            }));
+        }
+        let deferral = BusyDeferral {
+            rev: rev.clone(),
+            probe,
+            reading,
+            since_unix_ms: since,
+            waited_ms,
+            max_wait_ms: gate.max_wait_ms,
+        };
+        self.state = State::AwaitingIdle(deferral.clone());
+        Err(TickOutcome::BusyDeferred {
+            deferral,
+            head: behind.unwrap_or(rev).clone(),
+        })
     }
 
     /// Open a probation for the activation just attested, when rollback is on
@@ -2720,6 +2838,7 @@ mod tests {
                 Outcome::Probation { .. } => "probation",
                 Outcome::Verified { .. } => "verified",
                 Outcome::RolledBack { .. } => "rolledBack",
+                Outcome::BusyOverridden { .. } => "busyOverridden",
             })
             .collect()
     }
@@ -3454,5 +3573,245 @@ mod tests {
         assert_eq!(first_build, Some(3_600_000), "the ceiling, not the quiet window, starts the first build");
         assert!(landed.is_some(), "a branch that never goes quiet must still land something");
         assert!(!env.switches.borrow().is_empty());
+    }
+
+    use crate::busy::{BusyGate, BusyReading, ProbeReading};
+
+    fn busy_gate(max_wait_ms: u64) -> BusyGate {
+        let probe = |name: &str| HealthProbe {
+            name: name.to_owned(),
+            check: ProbeCheck::Command {
+                argv: vec!["/usr/bin/pgrep".to_owned()],
+                expect_exit: 0,
+                timeout_seconds: 10,
+            },
+        };
+        BusyGate {
+            probes: vec![probe("runner-job"), probe("nix-build")],
+            max_wait_ms,
+            recheck_seconds: 30,
+        }
+    }
+
+    fn busy_loop(max_wait_ms: u64) -> Sentinela {
+        Sentinela::new(cfg()).with_busy_gate(Some(busy_gate(max_wait_ms)))
+    }
+
+    fn offer_rev2_with_a_build(env: &MockEnv) {
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+    }
+
+    fn deferral_of(out: &TickOutcome) -> BusyDeferral {
+        match out {
+            TickOutcome::BusyDeferred { deferral, .. } => deferral.clone(),
+            other => panic!("expected a busy deferral, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_busy_gate_activates_without_reading_a_probe() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let mut s = Sentinela::new(cfg()).with_busy_gate(None);
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(2)));
+        assert!(env.busy_reads.borrow().is_empty());
+    }
+
+    #[test]
+    fn idle_probes_activate_and_every_probe_is_read() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Unmatched {
+            evidence: "exit 1 (expected 0)".to_owned(),
+        });
+        offer_rev2_with_a_build(&env);
+        let mut s = busy_loop(600_000);
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(2)));
+        assert_eq!(*env.busy_reads.borrow(), ["runner-job", "nix-build"]);
+        assert_eq!(*s.state(), State::Idle);
+    }
+
+    #[test]
+    fn a_busy_probe_defers_the_activation_and_names_the_probe() {
+        let env = node_on_rev1();
+        env.set_now_ms(5_000);
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let receipts_before = env.chain().len();
+        let mut s = busy_loop(600_000);
+        let out = s.tick(&env);
+        let d = deferral_of(&out);
+        assert_eq!(d.rev, rev(2));
+        assert_eq!(d.probe, "runner-job");
+        assert_eq!(d.reading, BusyReading::Busy);
+        assert_eq!(
+            (d.since_unix_ms, d.waited_ms, d.max_wait_ms),
+            (5_000, 0, 600_000)
+        );
+        assert!(
+            env.switches.borrow().is_empty(),
+            "nothing activates while busy"
+        );
+        assert_eq!(*env.builds.borrow(), [rev(2)], "the build is not held");
+        assert_eq!(*s.state(), State::AwaitingIdle(d.clone()));
+        assert_eq!(s.next_delay(&out), std::time::Duration::from_secs(30));
+        assert_eq!(env.heartbeats.borrow().last().unwrap().busy, Some(d));
+        assert_eq!(
+            env.chain().len(),
+            receipts_before,
+            "a busy wait writes no receipt"
+        );
+        assert_eq!(
+            env.chain().consecutive_deferrals(),
+            0,
+            "the deferral streak is untouched"
+        );
+    }
+
+    #[test]
+    fn busy_then_idle_activates_the_built_rev_without_rebuilding_it() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let mut s = busy_loop(600_000);
+        deferral_of(&s.tick(&env));
+        env.set_now_ms(30_000);
+        env.push_probe(Ok(Some(rev(2))));
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(2)));
+        assert_eq!(
+            env.builds.borrow().len(),
+            1,
+            "the held rev is not built again"
+        );
+        assert_eq!(*env.switches.borrow(), [rev(2)]);
+        assert_eq!(*s.state(), State::Idle);
+        assert_eq!(env.heartbeats.borrow().last().unwrap().busy, None);
+    }
+
+    #[test]
+    fn busy_past_the_bound_activates_anyway_and_records_the_override() {
+        let env = node_on_rev1();
+        let mut s = guarded().with_busy_gate(Some(busy_gate(120_000)));
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        deferral_of(&s.tick(&env));
+        env.set_now_ms(60_000);
+        env.push_busy_reading(ProbeReading::Matched);
+        env.push_probe(Ok(Some(rev(2))));
+        assert_eq!(deferral_of(&s.tick(&env)).waited_ms, 60_000);
+        env.set_now_ms(120_000);
+        env.push_busy_reading(ProbeReading::Matched);
+        env.push_probe(Ok(Some(rev(2))));
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(2)));
+        assert_eq!(
+            outcomes(&env),
+            ["activated", "activated", "busyOverridden", "probation"]
+        );
+        let chain = env.chain();
+        let Outcome::BusyOverridden {
+            probe,
+            reading,
+            waited_ms,
+        } = &chain.entries()[2].outcome
+        else {
+            panic!("the override is recorded after its activation");
+        };
+        assert_eq!(
+            (probe.as_str(), reading, *waited_ms),
+            ("runner-job", &BusyReading::Busy, 120_000)
+        );
+        assert_eq!(chain.last_activated_rev(), Some(&rev(2)));
+        assert!(
+            matches!(s.state(), State::Verifying(_)),
+            "probation still follows the activation"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_probe_defers_as_unknown_and_is_still_bounded() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Unreadable {
+            reason: "not found: /usr/bin/pgrep".to_owned(),
+        });
+        offer_rev2_with_a_build(&env);
+        let mut s = busy_loop(60_000);
+        let d = deferral_of(&s.tick(&env));
+        assert_eq!(d.probe, "runner-job");
+        assert_eq!(
+            d.reading,
+            BusyReading::Unknown {
+                reason: "not found: /usr/bin/pgrep".to_owned()
+            }
+        );
+        env.set_now_ms(60_000);
+        env.push_busy_reading(ProbeReading::Unreadable {
+            reason: "timed out".to_owned(),
+        });
+        env.push_probe(Ok(Some(rev(2))));
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { rev: r, .. } if r == rev(2)));
+        assert!(matches!(
+            &env.chain().entries().last().unwrap().outcome,
+            Outcome::BusyOverridden { reading: BusyReading::Unknown { reason }, .. } if reason == "timed out"
+        ));
+    }
+
+    #[test]
+    fn a_matching_probe_outranks_an_earlier_unreadable_one() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Unreadable {
+            reason: "timed out".to_owned(),
+        });
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let d = deferral_of(&busy_loop(600_000).tick(&env));
+        assert_eq!(
+            (d.probe.as_str(), d.reading),
+            ("nix-build", BusyReading::Busy)
+        );
+    }
+
+    #[test]
+    fn a_newer_head_while_held_is_built_and_the_wait_clock_carries_over() {
+        let env = node_on_rev1();
+        env.set_now_ms(1_000);
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let mut s = busy_loop(600_000);
+        deferral_of(&s.tick(&env));
+        env.set_now_ms(31_000);
+        env.push_busy_reading(ProbeReading::Matched);
+        env.push_probe(Ok(Some(rev(3))));
+        env.push_probe(Ok(Some(rev(3))));
+        let d = deferral_of(&s.tick(&env));
+        assert_eq!(
+            *env.builds.borrow(),
+            [rev(2), rev(3)],
+            "a busy wait never blocks a build"
+        );
+        assert_eq!(
+            (d.rev, d.since_unix_ms, d.waited_ms),
+            (rev(3), 1_000, 30_000)
+        );
+    }
+
+    #[test]
+    fn head_returning_to_the_running_rev_ends_the_wait() {
+        let env = node_on_rev1();
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        let mut s = busy_loop(600_000);
+        deferral_of(&s.tick(&env));
+        env.set_now_ms(500_000);
+        env.push_probe(Ok(Some(rev(1))));
+        assert!(matches!(s.tick(&env), TickOutcome::Unchanged { .. }));
+        assert_eq!(*s.state(), State::Idle);
+        env.push_busy_reading(ProbeReading::Matched);
+        offer_rev2_with_a_build(&env);
+        assert_eq!(
+            deferral_of(&s.tick(&env)).waited_ms,
+            0,
+            "a new wait starts its own clock"
+        );
     }
 }

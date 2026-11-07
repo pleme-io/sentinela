@@ -327,6 +327,8 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     // binaries against this filesystem, once, at startup.
     let rollback = cfg.rollback_plan();
     log_rollback_plan(&rollback);
+    let defer_while = cfg.defer_while_plan();
+    log_defer_while_plan(&defer_while);
     let revision_policy = match cfg.revision_policy() {
         Ok(p) => p,
         Err(e) => {
@@ -354,6 +356,7 @@ fn run(cfg: SentinelaConfig, config_path: &std::path::Path) -> std::process::Exi
     }
     let mut sentinela = Sentinela::new(loop_cfg)
         .with_rollback(rollback.policy)
+        .with_busy_gate(defer_while.gate)
         .with_revision_policy(revision_policy);
     let mut checks_report = ChecksReport::default();
     tracing::info!(
@@ -501,6 +504,20 @@ fn log_rollback_plan(plan: &sentinela_config::RollbackPlan) {
     }
 }
 
+fn log_defer_while_plan(plan: &sentinela_config::DeferWhilePlan) {
+    for r in &plan.refused {
+        tracing::warn!(probe = %r.name, reason = %r.reason, "defer_while: probe entry refused (its siblings still load)");
+    }
+    if let Some(g) = &plan.gate {
+        tracing::info!(
+            probes = g.probes.len(),
+            max_wait_seconds = g.max_wait_ms / 1000,
+            recheck_seconds = g.recheck_seconds,
+            "defer_while: activation waits while the machine is busy"
+        );
+    }
+}
+
 /// Emit one tick's outcome as a typed structured log line.
 // ── ★ `Health` + its derivation MOVED to `introspect` (2026-08-28) ─────
 // They used to live here, private to the binary, which is exactly why the
@@ -626,6 +643,21 @@ fn log_outcome(outcome: &TickOutcome) {
         TickOutcome::Settling { rev, remaining_ms } => {
             tracing::debug!(rev = rev.short(), remaining_ms, "settling");
         }
+        TickOutcome::BusyDeferred { deferral, .. } => match &deferral.reading {
+            sentinela_core::BusyReading::Busy => tracing::info!(
+                rev = deferral.rev.short(),
+                probe = %deferral.probe,
+                waited_ms = deferral.waited_ms,
+                "activation deferred: the machine is busy"
+            ),
+            sentinela_core::BusyReading::Unknown { reason } => tracing::warn!(
+                rev = deferral.rev.short(),
+                probe = %deferral.probe,
+                %reason,
+                waited_ms = deferral.waited_ms,
+                "activation deferred: busy probe unreadable, counted as busy"
+            ),
+        },
         TickOutcome::Verifying(_)
         | TickOutcome::Verified { .. }
         | TickOutcome::RolledBack { .. }
@@ -769,6 +801,7 @@ fn status(cfg: &SentinelaConfig, gate: bool, json: bool) -> std::process::ExitCo
         "verification": beat.as_ref().and_then(|b| b.verification.as_ref()),
         "last_rollback": chain.last_rollback(),
         "quarantined_rev": chain.quarantined_rev().map(sentinela_core::Rev::as_str),
+        "busy_deferral": beat.as_ref().and_then(|b| b.busy.as_ref()),
         // The DISTILLED cause of the most recent failure. See
         // `distill_failure` — the raw receipt is mostly cascade.
         "last_failure": last_failure_lines(&chain),
@@ -929,7 +962,11 @@ fn tick_once(cfg: &SentinelaConfig) -> std::process::ExitCode {
     let env = RealEnv::new(cfg.clone());
     let rollback = cfg.rollback_plan();
     log_rollback_plan(&rollback);
-    let mut sentinela = Sentinela::new(cfg.loop_config()).with_rollback(rollback.policy);
+    let defer_while = cfg.defer_while_plan();
+    log_defer_while_plan(&defer_while);
+    let mut sentinela = Sentinela::new(cfg.loop_config())
+        .with_rollback(rollback.policy)
+        .with_busy_gate(defer_while.gate);
     let outcome = sentinela.tick(&env);
     log_outcome(&outcome);
     if matches!(sentinela.state(), State::CoolingDown { .. }) {
@@ -1236,6 +1273,7 @@ mod gate_tests {
             in_flight: None,
             verification: None,
             probe_error: None,
+            busy: None,
         })
     }
 
@@ -1254,6 +1292,7 @@ mod gate_tests {
             in_flight: None,
             verification: None,
             probe_error: None,
+            busy: None,
         })
     }
 
@@ -1270,6 +1309,7 @@ mod gate_tests {
                 in_flight: None,
                 verification: None,
                 probe_error: None,
+                busy: None,
             })
         };
         assert!(convergence_gate(&planning(Some(600)), 500_000, POLL, BUILD_BUDGET, 0, true).is_ok());
@@ -1524,6 +1564,42 @@ fn write_probation(
     Ok(())
 }
 
+fn write_busy_deferral(
+    f: &mut std::fmt::Formatter<'_>,
+    v: &serde_json::Value,
+    now_ms: u64,
+) -> std::fmt::Result {
+    let Some(d) = v.get("busy_deferral").filter(|d| !d.is_null()) else {
+        return Ok(());
+    };
+    let u = |k: &str| d.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let rev = d
+        .get("rev")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("—");
+    let probe = d
+        .get("probe")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let reading = d.get("reading");
+    let why = match reading
+        .and_then(|r| r.get("reason"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(reason) => ["probe `", probe, "` unreadable, counted busy: ", reason].concat(),
+        None => ["probe `", probe, "` busy"].concat(),
+    };
+    writeln!(
+        f,
+        "    {:<11} {} {} · waited {} of {}",
+        "deferred",
+        paint(short(rev), "33;1"),
+        paint(&why, "33"),
+        human_age(u("since_unix_ms"), now_ms),
+        human_age(0, u("max_wait_ms")),
+    )
+}
+
 impl std::fmt::Display for StatusView<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let v = self.0;
@@ -1604,6 +1680,8 @@ impl std::fmt::Display for StatusView<'_> {
         write_recent_failures(f, v, now_ms)?;
 
         write_probation(f, v, now_ms)?;
+
+        write_busy_deferral(f, v, now_ms)?;
 
         let verified = v.get("chain_verified").and_then(serde_json::Value::as_bool).unwrap_or(false);
         writeln!(f, "    {:<11} {} · chain {}", "receipts", n("receipts").unwrap_or(0),
@@ -2300,6 +2378,7 @@ mod hang_gate_tests {
             in_flight: None,
             verification: None,
             probe_error: None,
+            busy: None,
         })
     }
 
@@ -2376,6 +2455,41 @@ mod rollback_status_tests {
         assert!(out.contains("probe `tailscale` failing"), "{out}");
         assert!(out.contains("tailscaled not running"), "{out}");
         assert!(out.contains("bbbbbbbb rolled back"), "{out}");
+    }
+
+    #[test]
+    fn the_panel_shows_an_activation_deferred_for_a_busy_machine() {
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let busy = |reading: serde_json::Value| {
+            serde_json::json!({
+                "hostname": "rio",
+                "busy_deferral": {
+                    "rev": "c".repeat(40), "probe": "runner-job", "reading": reading,
+                    "since_unix_ms": now - 312_000, "waited_ms": 300_000, "max_wait_ms": 7_200_000
+                },
+            })
+        };
+        let out = StatusView(&busy(serde_json::json!({"kind": "busy"}))).to_string();
+        assert!(out.contains("deferred"), "{out}");
+        assert!(out.contains("cccccccc"), "{out}");
+        assert!(out.contains("probe `runner-job` busy"), "{out}");
+        assert!(out.contains("waited 5m12s of 2h0m"), "{out}");
+        let out = StatusView(&busy(
+            serde_json::json!({"kind": "unknown", "reason": "not found: /x"}),
+        ))
+        .to_string();
+        assert!(
+            out.contains("probe `runner-job` unreadable, counted busy: not found: /x"),
+            "{out}"
+        );
+        let quiet = StatusView(&serde_json::json!({"hostname": "rio"})).to_string();
+        assert!(!quiet.contains("deferred"), "{quiet}");
     }
 
     /// A rollback is the most recent failure, reported with its probe and

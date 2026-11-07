@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod busy;
 mod checks;
 mod env;
 mod fsm;
@@ -27,6 +28,7 @@ mod quiet;
 mod receipt;
 mod rev;
 
+pub use busy::{BusyDeferral, BusyGate, BusyOverride, BusyReading, ProbeReading};
 pub use checks::{
     CheckResult, CheckState, ChecksVerdict, GreenPolicy, RevisionPolicy, verdict as checks_verdict,
 };

@@ -229,6 +229,9 @@ pub struct Heartbeat {
     pub verification: Option<Probation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_error: Option<String>,
+    /// The activation a busy probe holds back, while one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy: Option<crate::busy::BusyDeferral>,
 }
 
 /// A driver's report of what a running build is doing.
@@ -443,6 +446,10 @@ pub trait GitopsEnv {
     /// The probe's evidence when it did not pass.
     fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String>;
 
+    /// Run one probe and report what it observed, through the same runner as
+    /// [`Self::run_health_probe`].
+    fn read_probe(&self, probe: &HealthProbe) -> crate::busy::ProbeReading;
+
     /// Re-activate `generation` — the system profile's previous generation —
     /// the way `darwin-rebuild --switch-generation` /
     /// `nixos-rebuild switch --rollback` do. Returns the generation the
@@ -535,6 +542,9 @@ mod mock {
         probe_results: RefCell<std::collections::VecDeque<Result<(), String>>>,
         /// Every probe run, by name, in order.
         pub probe_runs: RefCell<Vec<String>>,
+        busy_readings: RefCell<std::collections::VecDeque<crate::busy::ProbeReading>>,
+        /// Every busy-probe read, by name, in order.
+        pub busy_reads: RefCell<Vec<String>>,
         rollback_result: RefCell<Result<(), EnvError>>,
         /// Every rollback target, in order.
         pub rollbacks: RefCell<Vec<Generation>>,
@@ -579,6 +589,8 @@ mod mock {
                 generation: RefCell::new(None),
                 probe_results: RefCell::new(std::collections::VecDeque::new()),
                 probe_runs: RefCell::new(Vec::new()),
+                busy_readings: RefCell::new(std::collections::VecDeque::new()),
+                busy_reads: RefCell::new(Vec::new()),
                 rollback_result: RefCell::new(Ok(())),
                 rollbacks: RefCell::new(Vec::new()),
                 switch_moves_on_error: RefCell::new(None),
@@ -671,6 +683,11 @@ mod mock {
             self.probe_results.borrow_mut().push_back(r);
         }
 
+        /// Queue one busy-probe reading; an empty queue reads as idle.
+        pub fn push_busy_reading(&self, r: crate::busy::ProbeReading) {
+            self.busy_readings.borrow_mut().push_back(r);
+        }
+
         /// Make a failed switch leave the machine on `g` (see the field).
         pub fn set_switch_moves_on_error(&self, g: Option<Generation>) {
             *self.switch_moves_on_error.borrow_mut() = g;
@@ -755,6 +772,15 @@ mod mock {
         fn run_health_probe(&self, probe: &crate::probation::HealthProbe) -> Result<(), String> {
             self.probe_runs.borrow_mut().push(probe.name.clone());
             self.probe_results.borrow_mut().pop_front().unwrap_or(Ok(()))
+        }
+
+        fn read_probe(&self, probe: &crate::probation::HealthProbe) -> crate::busy::ProbeReading {
+            self.busy_reads.borrow_mut().push(probe.name.clone());
+            self.busy_readings.borrow_mut().pop_front().unwrap_or(
+                crate::busy::ProbeReading::Unmatched {
+                    evidence: String::new(),
+                },
+            )
         }
 
         fn rollback_to(&self, generation: Generation) -> Result<Generation, EnvError> {
@@ -1080,6 +1106,7 @@ mod rebuild_driver_tests {
             in_flight: None,
             verification: None,
             probe_error: None,
+            busy: None,
         };
         let json = serde_json::to_string(&quiet).unwrap();
         assert!(

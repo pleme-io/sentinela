@@ -14,7 +14,7 @@ use sentinela_config::SentinelaConfig;
 use sentinela_core::{CheckResult, CheckState};
 use sentinela_core::{
     BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, PlanOutcome,
-    PlanVerdict, ProbeCheck, ReceiptChain, RebuildDriver, Rev,
+    PlanVerdict, ProbeCheck, ProbeReading, RebuildDriver, ReceiptChain, Rev,
 };
 use std::fs::File;
 use std::io::Write as _;
@@ -738,6 +738,7 @@ impl GitopsEnv for RealEnv {
                 in_flight: Some(p),
                 verification: None,
                 probe_error: None,
+                busy: None,
             };
             let _ = self.write_heartbeat(&beat);
         };
@@ -824,6 +825,14 @@ impl GitopsEnv for RealEnv {
     }
 
     fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String> {
+        match self.read_probe(probe) {
+            ProbeReading::Matched => Ok(()),
+            ProbeReading::Unmatched { evidence } => Err(evidence),
+            ProbeReading::Unreadable { reason } => Err(reason),
+        }
+    }
+
+    fn read_probe(&self, probe: &HealthProbe) -> ProbeReading {
         match &probe.check {
             ProbeCheck::Command {
                 argv,
@@ -831,7 +840,9 @@ impl GitopsEnv for RealEnv {
                 timeout_seconds,
             } => {
                 let Some((program, args)) = argv.split_first() else {
-                    return Err("empty argv".to_owned());
+                    return ProbeReading::Unreadable {
+                        reason: "empty argv".to_owned(),
+                    };
                 };
                 // argv, never a shell string — the config layer already
                 // refused anything but an absolute program path.
@@ -849,16 +860,25 @@ impl GitopsEnv for RealEnv {
                     Ok(out) => {
                         let tail = String::from_utf8_lossy(&out.stderr);
                         match out.status.code() {
-                            Some(c) if c == *expect_exit => Ok(()),
-                            code => Err(probe_evidence(code, *expect_exit, tail.trim())),
+                            Some(c) if c == *expect_exit => ProbeReading::Matched,
+                            Some(c) => ProbeReading::Unmatched {
+                                evidence: probe_evidence(Some(c), *expect_exit, tail.trim()),
+                            },
+                            None => ProbeReading::Unreadable {
+                                reason: probe_evidence(None, *expect_exit, tail.trim()),
+                            },
                         }
                     }
                     // A probe that cannot start is a FAILING probe: its
                     // absence may be exactly what the new generation broke.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Err(["not found: ", program].concat())
+                        ProbeReading::Unreadable {
+                            reason: ["not found: ", program].concat(),
+                        }
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => ProbeReading::Unreadable {
+                        reason: e.to_string(),
+                    },
                 }
             }
         }
@@ -2503,6 +2523,47 @@ mod tests {
             env.run_health_probe(&probe(&["/nonexistent/probe"], 0)),
             Err("not found: /nonexistent/probe".to_owned())
         );
+    }
+
+    #[test]
+    fn busy_reading_matches_expect_exit_both_ways_and_a_dead_probe_is_unreadable() {
+        let _fork_free = fork_free();
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        let probe = |argv: &[&str], expect_exit, timeout_seconds| HealthProbe {
+            name: "p".to_owned(),
+            check: ProbeCheck::Command {
+                argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+                expect_exit,
+                timeout_seconds,
+            },
+        };
+        assert_eq!(
+            env.read_probe(&probe(&["/usr/bin/true"], 0, 10)),
+            ProbeReading::Matched
+        );
+        assert!(matches!(
+            env.read_probe(&probe(&["/usr/bin/false"], 0, 10)),
+            ProbeReading::Unmatched { evidence } if evidence.starts_with("exit 1 (expected 0)")
+        ));
+        assert_eq!(
+            env.read_probe(&probe(&["/usr/bin/false"], 1, 10)),
+            ProbeReading::Matched
+        );
+        assert!(matches!(
+            env.read_probe(&probe(&["/usr/bin/true"], 1, 10)),
+            ProbeReading::Unmatched { .. }
+        ));
+        assert_eq!(
+            env.read_probe(&probe(&["/nonexistent/probe"], 0, 10)),
+            ProbeReading::Unreadable {
+                reason: "not found: /nonexistent/probe".to_owned()
+            }
+        );
+        assert!(matches!(
+            env.read_probe(&probe(&["/bin/sleep", "30"], 0, 1)),
+            ProbeReading::Unreadable { .. }
+        ));
     }
 
     /// The timeout is a hard bound, and a timed-out probe fails.

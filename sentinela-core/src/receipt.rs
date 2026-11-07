@@ -73,6 +73,14 @@ pub enum Outcome {
         probe: String,
         evidence: String,
     },
+    /// The activation just recorded went ahead over a busy probe because
+    /// its wait reached the bound. Written right after its
+    /// [`Outcome::Activated`].
+    BusyOverridden {
+        probe: String,
+        reading: crate::busy::BusyReading,
+        waited_ms: u64,
+    },
 }
 
 impl Outcome {
@@ -89,9 +97,10 @@ impl Outcome {
             // that already happened, so they classify exactly as the
             // `Activated` they follow: a stop point for every streak, and
             // never a "built but unactivated" candidate for the fallback.
-            Self::Activated { .. } | Self::Probation { .. } | Self::Verified { .. } => {
-                Health::Converged
-            }
+            Self::Activated { .. }
+            | Self::Probation { .. }
+            | Self::Verified { .. }
+            | Self::BusyOverridden { .. } => Health::Converged,
             Self::Deferred { .. } => Health::Benign,
             // The loop tried to converge on this rev and the machine did not
             // survive it. A failure — the DEGRADED banner and the gate must
@@ -296,7 +305,8 @@ impl ReceiptChain {
                 Outcome::Failed { .. }
                 | Outcome::Deferred { .. }
                 | Outcome::Probation { .. }
-                | Outcome::Verified { .. } => {}
+                | Outcome::Verified { .. }
+                | Outcome::BusyOverridden { .. } => {}
             }
         }
         None
@@ -326,7 +336,8 @@ impl ReceiptChain {
             | Outcome::Failed { .. }
             | Outcome::Deferred { .. }
             | Outcome::Probation { .. }
-            | Outcome::Verified { .. } => None,
+            | Outcome::Verified { .. }
+            | Outcome::BusyOverridden { .. } => None,
         }
     }
 

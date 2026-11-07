@@ -383,6 +383,9 @@ pub struct SentinelaConfig {
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
+    /// Defer an activation while declared probes say the machine is busy.
+    /// No probes is off, in both tiers.
+    pub defer_while: DeferWhileConfig,
     /// Which revision may be deployed: `head` (both tiers; today's
     /// behaviour) or `{green: {required: [...]}}`.
     pub revision_policy: RevisionPolicyConfig,
@@ -559,19 +562,7 @@ impl RollbackConfig {
     /// error is worth seeing before the day somebody turns it on.
     #[must_use]
     pub fn plan(&self, exists: &dyn Fn(&str) -> bool) -> RollbackPlan {
-        let mut probes: Vec<sentinela_core::HealthProbe> = Vec::new();
-        let mut refused = Vec::new();
-        for (index, entry) in self.probes.iter().enumerate() {
-            match parse_probe(index, &entry.0, exists) {
-                Ok(p) if probes.iter().any(|q| q.name == p.name) => refused.push(ProbeRefusal {
-                    name: p.name,
-                    reason: "duplicate name — names identify the failing probe in a receipt"
-                        .to_owned(),
-                }),
-                Ok(p) => probes.push(p),
-                Err(r) => refused.push(r),
-            }
-        }
+        let (probes, refused) = parse_probes(&self.probes, exists);
         let enabled_without_probes = self.enabled && probes.is_empty();
         let policy = (self.enabled && !probes.is_empty()).then(|| sentinela_core::RollbackPolicy {
             window_ms: self.window_seconds.saturating_mul(1000),
@@ -584,6 +575,93 @@ impl RollbackConfig {
             refused,
             enabled_without_probes,
         }
+    }
+}
+
+fn parse_probes(
+    entries: &[ProbeEntry],
+    exists: &dyn Fn(&str) -> bool,
+) -> (Vec<sentinela_core::HealthProbe>, Vec<ProbeRefusal>) {
+    let mut probes: Vec<sentinela_core::HealthProbe> = Vec::new();
+    let mut refused = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        match parse_probe(index, &entry.0, exists) {
+            Ok(p) if probes.iter().any(|q| q.name == p.name) => refused.push(ProbeRefusal {
+                name: p.name,
+                reason: "duplicate name — names identify the failing probe in a receipt".to_owned(),
+            }),
+            Ok(p) => probes.push(p),
+            Err(r) => refused.push(r),
+        }
+    }
+    (probes, refused)
+}
+
+/// Default bound on how long a busy machine may hold an activation, seconds.
+pub const DEFAULT_DEFER_MAX_WAIT_SECONDS: u64 = 2 * 60 * 60;
+/// Default seconds between busy checks while an activation is held.
+pub const DEFAULT_DEFER_RECHECK_SECONDS: u64 = 60;
+
+/// The `defer_while:` section: hold an activation while any probe says the
+/// machine is busy, up to `max_wait_seconds`, then activate anyway.
+///
+/// A probe says busy when its exit status equals `expect_exit`; one that
+/// times out or cannot start counts as busy (unknown). Entries are parsed
+/// like `rollback.probes`: a bad entry is refused by name and its siblings
+/// load.
+///
+/// ```yaml
+/// defer_while:
+///   max_wait_seconds: 7200
+///   recheck_seconds: 60
+///   probes:
+///     - name: runner-job
+///       kind: command
+///       argv: ["/run/current-system/sw/bin/pgrep", "-x", "Runner.Worker"]
+///       expect_exit: 0
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeferWhileConfig {
+    /// The busy probes, as written. Empty is off.
+    pub probes: Vec<ProbeEntry>,
+    /// Past this wait, activate over a busy probe.
+    pub max_wait_seconds: u64,
+    /// Seconds between checks while an activation is held.
+    pub recheck_seconds: u64,
+}
+
+impl Default for DeferWhileConfig {
+    fn default() -> Self {
+        Self {
+            probes: Vec::new(),
+            max_wait_seconds: DEFAULT_DEFER_MAX_WAIT_SECONDS,
+            recheck_seconds: DEFAULT_DEFER_RECHECK_SECONDS,
+        }
+    }
+}
+
+/// What the `defer_while:` section resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferWhilePlan {
+    /// The gate, `None` when no probe survived.
+    pub gate: Option<sentinela_core::BusyGate>,
+    /// Every entry that was refused, by name.
+    pub refused: Vec<ProbeRefusal>,
+}
+
+impl DeferWhileConfig {
+    /// Resolve the section; `exists` answers whether a probe's `argv[0]` is
+    /// present.
+    #[must_use]
+    pub fn plan(&self, exists: &dyn Fn(&str) -> bool) -> DeferWhilePlan {
+        let (probes, refused) = parse_probes(&self.probes, exists);
+        let gate = (!probes.is_empty()).then(|| sentinela_core::BusyGate {
+            probes,
+            max_wait_ms: self.max_wait_seconds.saturating_mul(1000),
+            recheck_seconds: self.recheck_seconds.max(1),
+        });
+        DeferWhilePlan { gate, refused }
     }
 }
 
@@ -707,6 +785,13 @@ impl SentinelaConfig {
             .plan(&|p: &str| std::path::Path::new(p).exists())
     }
 
+    /// The busy-gate plan, checking probe binaries against the filesystem.
+    #[must_use]
+    pub fn defer_while_plan(&self) -> DeferWhilePlan {
+        self.defer_while
+            .plan(&|p: &str| std::path::Path::new(p).exists())
+    }
+
     /// The revision policy, or why it is refused. A `green` policy that
     /// requires nothing would call every commit green, so it is refused
     /// (the daemon then refuses to start) rather than run vacuously.
@@ -815,6 +900,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
                 required_consecutive_passes: 0,
                 probes: Vec::new(),
             },
+            defer_while: DeferWhileConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
         }
     }
@@ -846,6 +932,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
+            defer_while: DeferWhileConfig::default(),
             // HEAD: today's behaviour. A node opts into `green`.
             revision_policy: RevisionPolicyConfig::Head,
         }
@@ -1025,6 +1112,7 @@ mod tests {
             planner: PlannerConfig::default(),
             switch_lock: SwitchLockConfig::default(),
             rollback: RollbackConfig::default(),
+            defer_while: DeferWhileConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
@@ -1043,6 +1131,68 @@ mod rollback_tests {
 
     fn from_yaml(y: &str) -> SentinelaConfig {
         serde_yaml::from_str(y).expect("the document must load")
+    }
+
+    #[test]
+    fn defer_while_is_off_unless_probes_are_declared() {
+        use shikumi::TieredConfig as _;
+        assert!(
+            SentinelaConfig::prescribed_default()
+                .defer_while
+                .probes
+                .is_empty()
+        );
+        assert!(SentinelaConfig::bare().defer_while.probes.is_empty());
+        let cfg = from_yaml("flake_url: github:pleme-io/nix\nhostname: rio\n");
+        assert!(cfg.defer_while.plan(ALL_EXIST).gate.is_none());
+    }
+
+    #[test]
+    fn defer_while_parses_its_probes_and_refuses_a_bad_entry_by_name() {
+        let cfg = from_yaml(
+            r#"
+flake_url: github:pleme-io/nix
+hostname: rio
+defer_while:
+  max_wait_seconds: 3600
+  recheck_seconds: 0
+  probes:
+    - name: runner-job
+      kind: command
+      argv: ["/run/current-system/sw/bin/pgrep", "-x", "Runner.Worker"]
+    - name: idle-script
+      kind: command
+      argv: ["/usr/bin/false"]
+      expect_exit: 1
+      timeout_seconds: 5
+    - name: bare
+      kind: command
+      argv: ["pgrep", "nix"]
+"#,
+        );
+        let plan = cfg.defer_while.plan(ALL_EXIST);
+        let gate = plan.gate.expect("valid probes make a gate");
+        assert_eq!(gate.max_wait_ms, 3_600_000);
+        assert_eq!(gate.recheck_seconds, 1, "a zero recheck is clamped to 1s");
+        assert_eq!(
+            gate.probes
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["runner-job", "idle-script"]
+        );
+        assert_eq!(
+            gate.probes[1].check,
+            sentinela_core::ProbeCheck::Command {
+                argv: vec!["/usr/bin/false".into()],
+                expect_exit: 1,
+                timeout_seconds: 5,
+            }
+        );
+        assert_eq!(plan.refused.len(), 1);
+        assert_eq!(plan.refused[0].name, "bare");
+        let typo = serde_yaml::from_str::<SentinelaConfig>("defer_while:\n  max_wiat_seconds: 1\n");
+        assert!(typo.is_err(), "the section's own keys are strict");
     }
 
     /// Off in both tiers, and absent from an existing config: nothing changes
