@@ -94,6 +94,46 @@ pub struct RollbackPolicy {
     pub required_consecutive_passes: u32,
     /// The probes, run in order each round; the first failure ends the round.
     pub probes: Vec<HealthProbe>,
+    pub max_timeout_multiplier: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "evidence")]
+pub enum ProbeFault {
+    Failed(String),
+    TimedOut(String),
+}
+
+impl ProbeFault {
+    #[must_use]
+    pub fn into_evidence(self) -> String {
+        match self {
+            Self::Failed(e) | Self::TimedOut(e) => e,
+        }
+    }
+}
+
+impl HealthProbe {
+    #[must_use]
+    pub fn with_timeout_multiplier(&self, multiplier: u32) -> Self {
+        let ProbeCheck::Command {
+            argv,
+            expect_exit,
+            timeout_seconds,
+        } = &self.check;
+        Self {
+            name: self.name.clone(),
+            check: ProbeCheck::Command {
+                argv: argv.clone(),
+                expect_exit: *expect_exit,
+                timeout_seconds: timeout_seconds.saturating_mul(u64::from(multiplier)),
+            },
+        }
+    }
+}
+
+fn unit_multiplier() -> u32 {
+    1
 }
 
 /// Which probe failed, and what it said.
@@ -128,4 +168,21 @@ pub struct Probation {
     /// The most recent round's failure, if the most recent round failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<ProbeFailure>,
+    #[serde(default = "unit_multiplier")]
+    pub timeout_multiplier: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_probation_written_before_the_multiplier_reads_back_at_one() {
+        let p: Probation = serde_json::from_str(&format!(
+            r#"{{"rev":"{}","generation":42,"previous_generation":41,"deadline_unix_ms":0,"passes":0,"required_passes":2}}"#,
+            "a".repeat(40)
+        ))
+        .unwrap();
+        assert_eq!(p.timeout_multiplier, 1);
+    }
 }

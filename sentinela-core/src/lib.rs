@@ -34,7 +34,7 @@ pub use checks::{
 };
 pub use env::{BuildProgress, EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase, PlanOutcome, PlanVerdict, RebuildDriver};
 pub use fsm::{Sentinela, State, TickOutcome};
-pub use probation::{HealthProbe, ProbeCheck, ProbeFailure, Probation, RollbackPolicy};
+pub use probation::{HealthProbe, ProbeCheck, ProbeFailure, ProbeFault, Probation, RollbackPolicy};
 pub use receipt::{
     ChainError, DeployReceipt, GENESIS_HASH, Generation, Health, MAX_ERROR_BYTES, Outcome,
     ReceiptChain, bound_text,

@@ -31,6 +31,8 @@ pub enum ProbeReading {
     Unreadable {
         /// Why it could not be read.
         reason: String,
+    },    TimedOut {
+        reason: String,
     },
 }
 
@@ -85,7 +87,7 @@ pub(crate) fn first_busy(
     for probe in probes {
         match read(probe) {
             ProbeReading::Matched => return Some((probe.name.clone(), BusyReading::Busy)),
-            ProbeReading::Unreadable { reason } => {
+            ProbeReading::Unreadable { reason } | ProbeReading::TimedOut { reason } => {
                 if unknown.is_none() {
                     unknown = Some((probe.name.clone(), BusyReading::Unknown { reason }));
                 }

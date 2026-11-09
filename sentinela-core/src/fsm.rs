@@ -46,7 +46,7 @@
 use crate::busy::{BusyDeferral, BusyGate, BusyOverride, first_busy};
 use crate::checks::{Cache, Cached, ChecksVerdict, GreenPolicy, RevisionPolicy, still_valid};
 use crate::env::{EnvError, GitopsEnv, Heartbeat, LoopConfig, Phase};
-use crate::probation::{ProbeFailure, Probation, RollbackPolicy};
+use crate::probation::{ProbeFailure, ProbeFault, Probation, RollbackPolicy};
 use crate::quiet::{Admission, Quiet, QuietWindow};
 use crate::receipt::{Generation, Outcome, ReceiptChain, bound_text};
 use crate::rev::Rev;
@@ -1405,6 +1405,7 @@ impl Sentinela {
             passes: 0,
             required_passes: policy.required_consecutive_passes.max(1),
             last_failure: None,
+            timeout_multiplier: 1,
         };
         // Durable, so a restart or reboot resumes the trial. A persist
         // failure still leaves the in-memory probation guarding this process
@@ -1476,6 +1477,7 @@ impl Sentinela {
                     passes: 0,
                     required_passes: policy.required_consecutive_passes.max(1),
                     last_failure: None,
+                    timeout_multiplier: 1,
                 });
             }
             // The rollback itself landed after the process that started it
@@ -1518,11 +1520,11 @@ impl Sentinela {
             return None;
         };
         let mut p = p.clone();
+        let multiplier = p.timeout_multiplier.max(1);
+        let ceiling = policy.max_timeout_multiplier.max(1);
         let round = policy.probes.iter().try_for_each(|probe| {
-            env.run_health_probe(probe).map_err(|evidence| ProbeFailure {
-                probe: probe.name.clone(),
-                evidence: bound_text(evidence),
-            })
+            env.run_health_probe(&probe.with_timeout_multiplier(multiplier))
+                .map_err(|fault| (probe.name.clone(), fault))
         });
         match round {
             Ok(()) => {
@@ -1553,9 +1555,25 @@ impl Sentinela {
                     generation: p.generation,
                 })
             }
-            Err(failure) => {
+            Err((probe, fault)) => {
+                let inconclusive = matches!(fault, ProbeFault::TimedOut(_)) && multiplier < ceiling;
+                let failure = ProbeFailure {
+                    probe,
+                    evidence: bound_text(fault.into_evidence()),
+                };
                 p.passes = 0;
                 p.last_failure = Some(failure.clone());
+                if inconclusive {
+                    p.timeout_multiplier = multiplier.saturating_mul(2).min(ceiling);
+                    tracing::warn!(
+                        rev = p.rev.short(),
+                        probe = %failure.probe,
+                        timeout_multiplier = p.timeout_multiplier,
+                        "health probe timed out: inconclusive, the next round waits longer"
+                    );
+                    self.state = State::Verifying(p.clone());
+                    return Some(TickOutcome::Verifying(p));
+                }
                 tracing::warn!(
                     rev = p.rev.short(),
                     probe = %failure.probe,
@@ -2782,6 +2800,7 @@ mod tests {
             interval_seconds: 15,
             required_consecutive_passes: 2,
             probes: vec![probe("network"), probe("tailscale")],
+            max_timeout_multiplier: 8,
         }
     }
 
@@ -3327,6 +3346,78 @@ mod tests {
         assert!(matches!(s.tick(&env), TickOutcome::Verifying(p) if p.passes == 1));
         assert_eq!(s.tick(&env).kind(), "verified");
         assert!(env.rollbacks.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_probe_that_times_out_past_the_deadline_is_inconclusive_and_waits_longer() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_now_ms(999_000);
+        env.push_probe_timeout("run timed out after 10s");
+        match s.tick(&env) {
+            TickOutcome::Verifying(p) => {
+                assert_eq!(p.passes, 0);
+                assert_eq!(p.timeout_multiplier, 2);
+                assert_eq!(p.last_failure.map(|f| f.evidence), Some("run timed out after 10s".to_owned()));
+            }
+            other => panic!("a timed-out probe must not roll back below the ceiling: {other:?}"),
+        }
+        assert!(env.rollbacks.borrow().is_empty());
+        assert!(matches!(s.tick(&env), TickOutcome::Verifying(p) if p.passes == 1 && p.timeout_multiplier == 2));
+        assert_eq!(s.tick(&env).kind(), "verified");
+        assert_eq!(*env.probe_timeouts.borrow(), vec![10, 20, 20, 20, 20]);
+        assert!(env.rollbacks.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_probe_that_still_times_out_at_the_ceiling_rolls_back() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_now_ms(999_000);
+        for _ in 0..3 {
+            env.push_probe_timeout("run timed out");
+            assert!(matches!(s.tick(&env), TickOutcome::Verifying(_)));
+        }
+        env.push_probe_timeout("run timed out after 80s");
+        assert_eq!(
+            s.tick(&env),
+            TickOutcome::RolledBack {
+                rev: rev(2),
+                from: Generation(42),
+                to: Generation(41),
+                failure: ProbeFailure {
+                    probe: "network".to_owned(),
+                    evidence: "run timed out after 80s".to_owned(),
+                },
+            }
+        );
+        assert_eq!(*env.probe_timeouts.borrow(), vec![10, 20, 40, 80]);
+    }
+
+    #[test]
+    fn a_ceiling_of_one_makes_a_timeout_a_failure_at_once() {
+        let env = node_on_rev1();
+        env.push_probe(Ok(Some(rev(2))));
+        env.push_probe(Ok(Some(rev(2))));
+        let mut s = Sentinela::new(cfg()).with_rollback(Some(RollbackPolicy {
+            max_timeout_multiplier: 1,
+            ..policy()
+        }));
+        assert_eq!(s.tick(&env).kind(), "deployed");
+        env.set_now_ms(999_000);
+        env.push_probe_timeout("run timed out after 10s");
+        assert_eq!(s.tick(&env).kind(), "rolledBack");
+        assert_eq!(*env.rollbacks.borrow(), vec![Generation(41)]);
+    }
+
+    #[test]
+    fn a_failed_probe_rolls_back_at_once_whatever_the_ceiling() {
+        let env = node_on_rev1();
+        let mut s = deploy_rev2_on_probation(&env);
+        env.set_now_ms(999_000);
+        env.push_probe_result(Err("exit 1".to_owned()));
+        assert_eq!(s.tick(&env).kind(), "rolledBack");
+        assert_eq!(*env.probe_timeouts.borrow(), vec![10]);
     }
 
     #[test]

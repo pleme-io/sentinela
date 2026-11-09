@@ -444,7 +444,7 @@ pub trait GitopsEnv {
     ///
     /// # Errors
     /// The probe's evidence when it did not pass.
-    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String>;
+    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), crate::probation::ProbeFault>;
 
     /// Run one probe and report what it observed, through the same runner as
     /// [`Self::run_health_probe`].
@@ -539,9 +539,10 @@ mod mock {
         generation: RefCell<Option<Generation>>,
         /// Programmed probe results, consumed one per `run_health_probe`
         /// call; an empty queue answers healthy.
-        probe_results: RefCell<std::collections::VecDeque<Result<(), String>>>,
+        probe_results: RefCell<std::collections::VecDeque<Result<(), crate::probation::ProbeFault>>>,
         /// Every probe run, by name, in order.
         pub probe_runs: RefCell<Vec<String>>,
+        pub probe_timeouts: RefCell<Vec<u64>>,
         busy_readings: RefCell<std::collections::VecDeque<crate::busy::ProbeReading>>,
         /// Every busy-probe read, by name, in order.
         pub busy_reads: RefCell<Vec<String>>,
@@ -589,6 +590,7 @@ mod mock {
                 generation: RefCell::new(None),
                 probe_results: RefCell::new(std::collections::VecDeque::new()),
                 probe_runs: RefCell::new(Vec::new()),
+                probe_timeouts: RefCell::new(Vec::new()),
                 busy_readings: RefCell::new(std::collections::VecDeque::new()),
                 busy_reads: RefCell::new(Vec::new()),
                 rollback_result: RefCell::new(Ok(())),
@@ -680,7 +682,15 @@ mod mock {
 
         /// Queue one probe result (consumed per probe run, not per round).
         pub fn push_probe_result(&self, r: Result<(), String>) {
-            self.probe_results.borrow_mut().push_back(r);
+            self.probe_results
+                .borrow_mut()
+                .push_back(r.map_err(crate::probation::ProbeFault::Failed));
+        }
+
+        pub fn push_probe_timeout(&self, evidence: &str) {
+            self.probe_results
+                .borrow_mut()
+                .push_back(Err(crate::probation::ProbeFault::TimedOut(evidence.to_owned())));
         }
 
         /// Queue one busy-probe reading; an empty queue reads as idle.
@@ -769,8 +779,10 @@ mod mock {
             *self.generation.borrow()
         }
 
-        fn run_health_probe(&self, probe: &crate::probation::HealthProbe) -> Result<(), String> {
+        fn run_health_probe(&self, probe: &crate::probation::HealthProbe) -> Result<(), crate::probation::ProbeFault> {
             self.probe_runs.borrow_mut().push(probe.name.clone());
+            let crate::probation::ProbeCheck::Command { timeout_seconds, .. } = &probe.check;
+            self.probe_timeouts.borrow_mut().push(*timeout_seconds);
             self.probe_results.borrow_mut().pop_front().unwrap_or(Ok(()))
         }
 

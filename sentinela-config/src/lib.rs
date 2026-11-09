@@ -440,6 +440,7 @@ pub const DEFAULT_ROLLBACK_INTERVAL_SECONDS: u64 = 15;
 pub const DEFAULT_ROLLBACK_REQUIRED_PASSES: u32 = 2;
 /// Default per-probe timeout, seconds, when an entry does not state one.
 pub const DEFAULT_PROBE_TIMEOUT_SECONDS: u64 = 10;
+pub const DEFAULT_ROLLBACK_MAX_TIMEOUT_MULTIPLIER: u32 = 8;
 
 /// The `rollback:` section — health-gated rollback after each activation.
 ///
@@ -479,6 +480,7 @@ pub struct RollbackConfig {
     pub required_consecutive_passes: u32,
     /// The probes, as written. See [`ProbeEntry`].
     pub probes: Vec<ProbeEntry>,
+    pub max_timeout_multiplier: u32,
 }
 
 impl Default for RollbackConfig {
@@ -489,6 +491,7 @@ impl Default for RollbackConfig {
             interval_seconds: DEFAULT_ROLLBACK_INTERVAL_SECONDS,
             required_consecutive_passes: DEFAULT_ROLLBACK_REQUIRED_PASSES,
             probes: Vec::new(),
+            max_timeout_multiplier: DEFAULT_ROLLBACK_MAX_TIMEOUT_MULTIPLIER,
         }
     }
 }
@@ -569,6 +572,7 @@ impl RollbackConfig {
             interval_seconds: self.interval_seconds.max(1),
             required_consecutive_passes: self.required_consecutive_passes.max(1),
             probes,
+            max_timeout_multiplier: self.max_timeout_multiplier.max(1),
         });
         RollbackPlan {
             policy,
@@ -899,6 +903,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
                 interval_seconds: 0,
                 required_consecutive_passes: 0,
                 probes: Vec::new(),
+                max_timeout_multiplier: 0,
             },
             defer_while: DeferWhileConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
@@ -1290,6 +1295,7 @@ rollback:
   window_seconds: 120
   interval_seconds: 5
   required_consecutive_passes: 3
+  max_timeout_multiplier: 4
   probes:
     - {name: a, kind: command, argv: ["/present"], expect_exit: 3, timeout_seconds: 4}
     - {name: b, kind: command, argv: ["/absent"]}
@@ -1302,6 +1308,7 @@ rollback:
         assert_eq!(policy.window_ms, 120_000);
         assert_eq!(policy.interval_seconds, 5);
         assert_eq!(policy.required_consecutive_passes, 3);
+        assert_eq!(policy.max_timeout_multiplier, 4);
         assert_eq!(policy.probes.len(), 1);
         let names: Vec<&str> = plan.refused.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["b", "c", "a"]);

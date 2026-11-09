@@ -14,7 +14,7 @@ use sentinela_config::SentinelaConfig;
 use sentinela_core::{CheckResult, CheckState};
 use sentinela_core::{
     BuildProgress, EnvError, Generation, GitopsEnv, HealthProbe, Heartbeat, PlanOutcome,
-    PlanVerdict, ProbeCheck, ProbeReading, RebuildDriver, ReceiptChain, Rev,
+    PlanVerdict, ProbeCheck, ProbeFault, ProbeReading, RebuildDriver, ReceiptChain, Rev,
 };
 use std::fs::File;
 use std::io::Write as _;
@@ -821,11 +821,12 @@ impl GitopsEnv for RealEnv {
         current_generation()
     }
 
-    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), String> {
+    fn run_health_probe(&self, probe: &HealthProbe) -> Result<(), ProbeFault> {
         match self.read_probe(probe) {
             ProbeReading::Matched => Ok(()),
-            ProbeReading::Unmatched { evidence } => Err(evidence),
-            ProbeReading::Unreadable { reason } => Err(reason),
+            ProbeReading::Unmatched { evidence } => Err(ProbeFault::Failed(evidence)),
+            ProbeReading::Unreadable { reason } => Err(ProbeFault::Failed(reason)),
+            ProbeReading::TimedOut { reason } => Err(ProbeFault::TimedOut(reason)),
         }
     }
 
@@ -873,6 +874,9 @@ impl GitopsEnv for RealEnv {
                             reason: ["not found: ", program].concat(),
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ProbeReading::TimedOut {
+                        reason: e.to_string(),
+                    },
                     Err(e) => ProbeReading::Unreadable {
                         reason: e.to_string(),
                     },
@@ -2542,11 +2546,13 @@ mod tests {
         let e = env
             .run_health_probe(&probe(&["/bin/sh", "-c", "echo no route to host; exit 3"], 0))
             .unwrap_err();
+        assert!(matches!(e, ProbeFault::Failed(_)), "{e:?}");
+        let e = e.into_evidence();
         assert!(e.starts_with("exit 3 (expected 0)"), "{e}");
         assert!(e.contains("no route to host"), "the output tail is the evidence: {e}");
         assert_eq!(
             env.run_health_probe(&probe(&["/nonexistent/probe"], 0)),
-            Err("not found: /nonexistent/probe".to_owned())
+            Err(ProbeFault::Failed("not found: /nonexistent/probe".to_owned()))
         );
     }
 
@@ -2587,6 +2593,10 @@ mod tests {
         );
         assert!(matches!(
             env.read_probe(&probe(&["/bin/sleep", "30"], 0, 1)),
+            ProbeReading::TimedOut { .. }
+        ));
+        assert!(matches!(
+            env.read_probe(&probe(&["/etc/hosts"], 0, 10)),
             ProbeReading::Unreadable { .. }
         ));
     }
@@ -2606,7 +2616,7 @@ mod tests {
                 timeout_seconds: 1,
             },
         });
-        assert!(r.is_err(), "a hung probe must not pass");
+        assert!(matches!(r, Err(ProbeFault::TimedOut(_))), "a hung probe must not pass: {r:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "and must not wedge the tick");
     }
 
