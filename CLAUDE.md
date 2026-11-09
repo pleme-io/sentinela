@@ -93,7 +93,7 @@ file's store path depend on the package (`main::config_moved`).
 ## Rebuild engine: nix or sui, sui as a subprocess or embedded (2026-10-08)
 
 `rebuild_tool` picks the engine: `darwin-rebuild` (default), `nixos-rebuild`,
-or `sui` (doctrine P5, `theory/RECONCILER-LIVENESS.md` §IV.3). For sui,
+or `sui` (doctrine P5). For sui,
 `sui.mode` picks how it runs:
 
 | `sui.mode` | Driver | Needs |

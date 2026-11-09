@@ -19,7 +19,7 @@
 //! `chain.head` reports `age_ms` alongside the receipt, and every response
 //! carries `answered_at_unix_ms`. A caller cannot accidentally treat a stale
 //! fact as current, because the staleness is *in the value* rather than
-//! inferable from where it was found. This is [`SHATEI`] applied to time: the
+//! inferable from where it was found. Applied to time, the
 //! fact "this verdict is from 20 minutes ago" must hold at every site that
 //! reads the verdict, so it travels with it.
 //!
@@ -38,8 +38,6 @@
 //! would create a second source of truth that drifts from the file the next
 //! tick appends to — and "the daemon says X, the receipt file says Y" is the
 //! failure mode of every status surface that caches.
-//!
-//! [`SHATEI`]: https://github.com/pleme-io/theory/blob/main/SHATEI.md
 
 use std::sync::Arc;
 

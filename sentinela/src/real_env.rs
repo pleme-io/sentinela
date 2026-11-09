@@ -597,8 +597,6 @@ impl RealEnv {
     /// (`ls-remote` is a read; `fetch` writes only the throwaway mirror),
     /// so a hung one is killed outright — the opposite of a mid-activation
     /// switch, which is why that one is `Abandon`.
-    ///
-    /// Doctrine: theory/RECONCILER-LIVENESS.md (P1) · theory/BALIZA.md 0b.
     fn run_git(&self, mut cmd: Command, err: fn(String) -> EnvError) -> Result<Output, EnvError> {
         cmd.process_group(0);
         let capture = self.git_capture_path();
@@ -644,8 +642,6 @@ impl RealEnv {
 // tsunagu was already the daemon-lifecycle library and already
 // feature-gates axum so CLI consumers can take it, which is why the
 // primitive went there rather than into a new repo.
-//
-// Doctrine: theory/RECONCILER-LIVENESS.md (P1).
 
 impl GitopsEnv for RealEnv {
     fn probe_head(&self) -> Result<Option<Rev>, EnvError> {

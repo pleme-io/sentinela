@@ -137,8 +137,8 @@ pub enum RebuildTool {
     DarwinRebuild,
     /// NixOS.
     NixosRebuild,
-    /// sui — the fleet's own pure-Rust nix (doctrine P5,
-    /// `theory/RECONCILER-LIVENESS.md` §IV.3). Resolves the rev-pinned
+    /// sui — the fleet's own pure-Rust nix (doctrine P5).
+    /// Resolves the rev-pinned
     /// `github:owner/repo/<rev>` ref this daemon builds since sui 0.1.176
     /// (`sui-compat/src/flake_ref.rs`, b53648b). How it runs, in this process
     /// or as the `sui` CLI, is [`SuiConfig::mode`]. Opt-in per node: sui's own
