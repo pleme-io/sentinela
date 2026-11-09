@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "ee6b5ce9b4db4bddd7dc57ccd0b0c0849a2e8f817bbf71a4e8a5744e5d2fb6fa",
+  "cargo_lock_sha256": "866917e1d81d2342689f625853983cfa98a0ed1eb79ed3bc3953a7428cf00ba3",
   "manifest_sha256": {
     "Cargo.toml": "405dc41fa0236cf6f5d4e8045ca54953d52e788a23b4781027bb4172fe8966f4",
     "sentinela-config/Cargo.toml": "3f8e53a19dbb46469edbc79f29620ee2a848c5e9b06ad4f587c0fcd7b0e9ebf3",
@@ -2317,7 +2317,7 @@
           },
           {
             "name": "tsunagu",
-            "package_key": "tsunagu-0.1.10",
+            "package_key": "tsunagu-0.1.12",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -3821,7 +3821,7 @@
           "tracing-log"
         ]
       },
-      "tsunagu-0.1.10": {
+      "tsunagu-0.1.12": {
         "runtime_dependencies": [
           {
             "name": "dirs",
@@ -7222,7 +7222,7 @@
     "tracing-subscriber-0.3.23": {
       "edition": "2018"
     },
-    "tsunagu-0.1.10": {
+    "tsunagu-0.1.12": {
       "edition": "2024"
     },
     "uncased-0.9.10": {

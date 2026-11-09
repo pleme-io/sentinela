@@ -599,7 +599,8 @@ impl RealEnv {
     /// switch, which is why that one is `Abandon`.
     ///
     /// Doctrine: theory/RECONCILER-LIVENESS.md (P1) · theory/BALIZA.md 0b.
-    fn run_git(&self, cmd: Command, err: fn(String) -> EnvError) -> Result<Output, EnvError> {
+    fn run_git(&self, mut cmd: Command, err: fn(String) -> EnvError) -> Result<Output, EnvError> {
+        cmd.process_group(0);
         let capture = self.git_capture_path();
         // `separate_streams` is load-bearing, not a preference: tsunagu's
         // DEFAULT capture is merged, and it delivers the merged tail in
@@ -2256,6 +2257,34 @@ mod tests {
     /// pre-bound behaviour without editing code (★★ MODULARIZE, DON'T
     /// DELETE). Proven by running with the bound off rather than by
     /// reading the branch.
+    #[test]
+    fn run_git_runs_git_in_its_own_group_so_a_timeout_kills_the_whole_tree() {
+        let _fork_free = fork_free();
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with_state(d.path());
+        let pgid_of = |pid: &str| {
+            let o = std::process::Command::new("/bin/ps")
+                .args(["-o", "pgid=", "-p", pid])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_owned()
+        };
+        let ours = pgid_of(&std::process::id().to_string());
+        let out = env
+            .run_git(
+                {
+                    let mut c = std::process::Command::new("/bin/sh");
+                    c.args(["-c", "/bin/ps -o pgid= -p $$"]);
+                    c
+                },
+                EnvError::ProbeFailed,
+            )
+            .expect("the probe must run");
+        let theirs = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        assert!(!theirs.is_empty() && !ours.is_empty());
+        assert_ne!(theirs, ours, "git must not share the daemon's group");
+    }
+
     #[test]
     fn git_timeout_zero_disables_the_bound() {
         let _fork_free = fork_free();
