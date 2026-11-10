@@ -630,6 +630,9 @@ fn log_outcome(outcome: &TickOutcome) {
                 "switch deferred — another rebuild holds the machine lock; standing aside"
             );
         }
+        TickOutcome::BuildDeferred { rev, holder } => {
+            tracing::info!(rev = rev.short(), holder = %holder, "build deferred — another build holds the host build lock");
+        }
         TickOutcome::CoolingDown { remaining_ms } => {
             tracing::debug!(remaining_ms, "cooling down");
         }

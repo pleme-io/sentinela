@@ -145,6 +145,10 @@ pub enum TickOutcome {
         /// Who holds the machine lock (`pid N · user` from the lock file).
         holder: String,
     },
+    BuildDeferred {
+        rev: Rev,
+        holder: String,
+    },
     /// Activated a rev that is a verified ANCESTOR of the current HEAD —
     /// the starvation escape. Forward progress, deliberately not the newest
     /// rev; the next tick converges toward `newer`.
@@ -274,6 +278,7 @@ impl TickOutcome {
             Self::ReprobeInconclusive { .. } => "reprobeInconclusive",
             Self::SwitchFailed { .. } => "switchFailed",
             Self::SwitchDeferred { .. } => "switchDeferred",
+            Self::BuildDeferred { .. } => "buildDeferred",
             Self::DeployedBehind { .. } => "deployedBehind",
             Self::Deployed { .. } => "deployed",
             Self::Verifying(_) => "verifying",
@@ -318,6 +323,7 @@ impl TickOutcome {
             | Self::ReprobeInconclusive { .. }
             | Self::SwitchFailed { .. }
             | Self::SwitchDeferred { .. }
+            | Self::BuildDeferred { .. }
             | Self::DeployedBehind { .. }
             | Self::Deployed { .. }
             | Self::Verified { .. }
@@ -391,7 +397,9 @@ impl TickOutcome {
             }
             // A due rollback waiting on the operator's lock waits like a
             // switch does.
-            Self::SwitchDeferred { .. } | Self::RollbackDeferred { .. } => {
+            Self::SwitchDeferred { .. }
+            | Self::RollbackDeferred { .. }
+            | Self::BuildDeferred { .. } => {
                 std::time::Duration::from_secs(SWITCH_DEFERRED_RETRY_SECS)
             }
             // Everything else waits a normal cycle. Note `CoolingDown` is
@@ -461,6 +469,7 @@ impl TickOutcome {
             | Self::BuildFailed { rev, .. }
             | Self::SwitchFailed { rev, .. }
             | Self::SwitchDeferred { rev, .. }
+            | Self::BuildDeferred { rev, .. }
             | Self::Deployed { rev, .. } => Some(rev),
             Self::Deferred { newer, .. } | Self::DeployedBehind { newer, .. } => Some(newer),
             Self::ReprobeInconclusive { built } => Some(built),
@@ -857,6 +866,10 @@ impl Sentinela {
 
         // Decide → build rev-pinned.
         if let Err(e) = env.build(&target) {
+            if let EnvError::BuildBusy(holder) = e {
+                tracing::info!(rev = target.short(), holder = %holder, "build deferred: the host build lock is held");
+                return TickOutcome::BuildDeferred { rev: target, holder };
+            }
             self.record_plan(env, &target, crate::env::PlanOutcome::Failed, &e.to_string());
             let head = target.clone();
             let out = TickOutcome::BuildFailed {
@@ -3346,6 +3359,30 @@ mod tests {
         assert!(matches!(s.tick(&env), TickOutcome::Verifying(p) if p.passes == 1));
         assert_eq!(s.tick(&env).kind(), "verified");
         assert!(env.rollbacks.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_held_host_build_lock_defers_the_build_without_a_receipt_or_a_cooldown() {
+        let env = MockEnv::default();
+        let mut s = Sentinela::new(cfg());
+        env.push_probe(Ok(Some(rev(1))));
+        env.set_build_result(Err(EnvError::BuildBusy("pid 7 · closure-gate".into())));
+        let out = s.tick(&env);
+        assert_eq!(
+            out,
+            TickOutcome::BuildDeferred {
+                rev: rev(1),
+                holder: "pid 7 · closure-gate".into()
+            }
+        );
+        assert_eq!(out.kind(), "buildDeferred");
+        assert_eq!(out.phase(), crate::env::Phase::Resolved);
+        assert_eq!(out.next_delay(&cfg()), std::time::Duration::from_secs(30));
+        assert!(env.chain().is_empty(), "a deferral writes no receipt");
+        env.set_build_result(Ok(()));
+        env.push_probe(Ok(Some(rev(1))));
+        env.push_probe(Ok(Some(rev(1))));
+        assert!(matches!(s.tick(&env), TickOutcome::Deployed { .. }), "and the next tick builds at once");
     }
 
     #[test]

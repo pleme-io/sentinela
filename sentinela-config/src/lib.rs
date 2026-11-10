@@ -213,6 +213,24 @@ impl Default for SwitchLockConfig {
     }
 }
 
+pub const HOST_BUILD_LOCK_PATH: &str = "/tmp/pleme-host-build.lock";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuildLockConfig {
+    pub enabled: bool,
+    pub path: String,
+}
+
+impl Default for BuildLockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: HOST_BUILD_LOCK_PATH.to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlannerConfig {
@@ -380,6 +398,7 @@ pub struct SentinelaConfig {
     pub sui: SuiConfig,
     pub planner: PlannerConfig,
     pub switch_lock: SwitchLockConfig,
+    pub build_lock: BuildLockConfig,
     /// Health-gated rollback after each activation. OFF in both tiers, so an
     /// existing config that never mentions it behaves exactly as before.
     pub rollback: RollbackConfig,
@@ -897,6 +916,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
             switch_lock: SwitchLockConfig::default(),
+            build_lock: BuildLockConfig::default(),
             rollback: RollbackConfig {
                 enabled: false,
                 window_seconds: 0,
@@ -934,6 +954,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
             switch_lock: SwitchLockConfig::default(),
+            build_lock: BuildLockConfig::default(),
             // Off. Shipping it on would change what every node does on its
             // next deploy; a node opts in.
             rollback: RollbackConfig::default(),
@@ -1116,6 +1137,7 @@ mod tests {
             sui: SuiConfig::default(),
             planner: PlannerConfig::default(),
             switch_lock: SwitchLockConfig::default(),
+            build_lock: BuildLockConfig::default(),
             rollback: RollbackConfig::default(),
             defer_while: DeferWhileConfig::default(),
             revision_policy: RevisionPolicyConfig::Head,
@@ -1202,6 +1224,17 @@ defer_while:
 
     /// Off in both tiers, and absent from an existing config: nothing changes
     /// for a node that never mentions it.
+    #[test]
+    fn the_host_build_lock_is_off_unless_a_node_opts_in_and_reads_its_path() {
+        use shikumi::TieredConfig;
+        assert!(!SentinelaConfig::prescribed_default().build_lock.enabled);
+        assert!(!SentinelaConfig::bare().build_lock.enabled);
+        assert_eq!(SentinelaConfig::bare().build_lock.path, HOST_BUILD_LOCK_PATH);
+        let cfg = from_yaml("build_lock:\n  enabled: true\n  path: /tmp/x.lock\n");
+        assert!(cfg.build_lock.enabled);
+        assert_eq!(cfg.build_lock.path, "/tmp/x.lock");
+    }
+
     #[test]
     fn rollback_is_off_unless_a_node_opts_in() {
         use shikumi::TieredConfig as _;

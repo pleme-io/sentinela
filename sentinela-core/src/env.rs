@@ -70,6 +70,8 @@ pub enum EnvError {
     /// machine instead of racing their activation state.
     #[error("switch deferred: another rebuild holds the machine lock ({0})")]
     SwitchBusy(String),
+    #[error("build deferred: another build holds the host build lock ({0})")]
+    BuildBusy(String),
     /// Reading or writing the receipt chain failed.
     #[error("receipt store io: {0}")]
     ReceiptIo(String),

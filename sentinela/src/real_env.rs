@@ -711,6 +711,7 @@ impl GitopsEnv for RealEnv {
     }
 
     fn build(&self, rev: &Rev) -> Result<(), EnvError> {
+        let _host = self.build_guard()?;
         // Through the driver seam, not `run_rebuild` directly: this is the
         // one axis an in-process sui driver replaces, and everything else in
         // this impl (probe, chain, generation read) stays shared.
@@ -1030,6 +1031,18 @@ impl GitopsEnv for RealEnv {
 }
 
 impl RealEnv {
+    fn build_guard(&self) -> Result<Option<File>, EnvError> {
+        if !self.cfg.build_lock.enabled {
+            return Ok(None);
+        }
+        acquire_switch_lock(Path::new(&self.cfg.build_lock.path))
+            .map(Some)
+            .map_err(|e| match e {
+                EnvError::SwitchBusy(holder) => EnvError::BuildBusy(holder),
+                other => other,
+            })
+    }
+
     fn switch_guard(&self) -> Result<Option<File>, EnvError> {
         let path = Path::new(&self.cfg.switch_lock.path);
         if self.cfg.switch_lock.hold {
@@ -1812,6 +1825,37 @@ mod tests {
         });
         assert!(probe.switch_guard().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_host_build_lock_defers_the_build_and_an_unconfigured_one_is_never_read() {
+        use fs4::fs_std::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host-build.lock");
+        let holder = File::options().create(true).truncate(false).write(true).open(&path).unwrap();
+        FileExt::try_lock_exclusive(&holder).unwrap();
+        let on = RealEnv::new(SentinelaConfig {
+            build_lock: sentinela_config::BuildLockConfig {
+                enabled: true,
+                path: path.to_string_lossy().into_owned(),
+            },
+            ..SentinelaConfig::default()
+        });
+        assert!(matches!(on.build_guard(), Err(EnvError::BuildBusy(_))));
+        assert!(matches!(on.build(&Rev::parse(&"a".repeat(40)).unwrap()), Err(EnvError::BuildBusy(_))));
+        let off = RealEnv::new(SentinelaConfig {
+            build_lock: sentinela_config::BuildLockConfig {
+                enabled: false,
+                path: path.to_string_lossy().into_owned(),
+            },
+            ..SentinelaConfig::default()
+        });
+        assert!(off.build_guard().unwrap().is_none());
+        FileExt::unlock(&holder).unwrap();
+        let held = on.build_guard().unwrap().expect("a free lock is taken");
+        assert!(FileExt::try_lock_exclusive(&File::open(&path).unwrap()).is_err(), "and held for the build");
+        drop(held);
+        assert!(FileExt::try_lock_exclusive(&File::open(&path).unwrap()).is_ok(), "and released after it");
     }
 
     #[test]
