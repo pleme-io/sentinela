@@ -99,6 +99,10 @@ pub enum TickOutcome {
         /// The current (already-deployed) rev.
         rev: Rev,
     },
+    Ahead {
+        head: Rev,
+        deployed: Rev,
+    },
     /// HEAD could not be resolved (empty ls-remote); deployed nothing.
     Unresolvable,
     /// HEAD resolution errored; deployed nothing (fail-closed).
@@ -271,6 +275,7 @@ impl TickOutcome {
         match self {
             Self::CoolingDown { .. } => "coolingDown",
             Self::Unchanged { .. } => "unchanged",
+            Self::Ahead { .. } => "ahead",
             Self::Unresolvable => "unresolvable",
             Self::ProbeError { .. } => "probeError",
             Self::BuildFailed { .. } => "buildFailed",
@@ -316,6 +321,7 @@ impl TickOutcome {
             Self::Verifying(_) | Self::RollbackDeferred { .. } => Phase::InFlight,
             Self::CoolingDown { .. }
             | Self::Unchanged { .. }
+            | Self::Ahead { .. }
             | Self::Unresolvable
             | Self::ProbeError { .. }
             | Self::BuildFailed { .. }
@@ -409,6 +415,7 @@ impl TickOutcome {
             // cooldown here instead would starve liveness reporting.
             Self::CoolingDown { .. }
             | Self::Unchanged { .. }
+            | Self::Ahead { .. }
             | Self::Unresolvable
             | Self::ProbeError { .. }
             | Self::BuildFailed { .. }
@@ -460,6 +467,7 @@ impl TickOutcome {
             | Self::RollbackFailed { .. }
             | Self::ProbationAbandoned { .. } => None,
             Self::Unchanged { rev }
+            | Self::Ahead { head: rev, .. }
             | Self::Quarantined { rev }
             | Self::WaitingForGreen { rev }
             | Self::ChecksRed { rev, .. }
@@ -502,6 +510,7 @@ pub struct Sentinela {
     quiet: Quiet,
     busy: Option<BusyGate>,
     busy_since: Option<u64>,
+    ahead_memo: Option<(Rev, Rev, bool)>,
 }
 
 impl Sentinela {
@@ -519,6 +528,7 @@ impl Sentinela {
             quiet: Quiet::default(),
             busy: None,
             busy_since: None,
+            ahead_memo: None,
         }
     }
 
@@ -582,6 +592,7 @@ impl Sentinela {
         if matches!(
             outcome,
             TickOutcome::Unchanged { .. }
+                | TickOutcome::Ahead { .. }
                 | TickOutcome::Deployed { .. }
                 | TickOutcome::DeployedBehind { .. }
         ) {
@@ -754,6 +765,10 @@ impl Sentinela {
                 "HEAD is a rev this node rolled back — not re-attempting until HEAD moves"
             );
             return TickOutcome::Quarantined { rev: head };
+        }
+
+        if let Some(out) = self.hold_if_ahead(&mut chain, env, &head) {
+            return out;
         }
 
         if let State::AwaitingIdle(d) = &self.state
@@ -1700,6 +1715,67 @@ impl Sentinela {
         }
     }
 
+    fn hold_if_ahead<E: GitopsEnv>(
+        &mut self,
+        chain: &mut ReceiptChain,
+        env: &E,
+        head: &Rev,
+    ) -> Option<TickOutcome> {
+        if !self.cfg.hold_when_ahead {
+            return None;
+        }
+        let deployed = chain.last_activated_rev()?.clone();
+        let behind = match &self.ahead_memo {
+            Some((h, d, answer)) if h == head && *d == deployed => *answer,
+            _ => match env.is_ancestor(head, &deployed) {
+                Ok(answer) => {
+                    self.ahead_memo = Some((head.clone(), deployed.clone(), answer));
+                    answer
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        head = head.short(),
+                        deployed = deployed.short(),
+                        "ancestry unanswerable — not holding; HEAD is handled as before"
+                    );
+                    false
+                }
+            },
+        };
+        if !behind {
+            return None;
+        }
+        self.busy_since = None;
+        if matches!(self.state, State::AwaitingIdle(_)) {
+            self.state = State::Idle;
+        }
+        let recorded = chain.head().is_some_and(|r| {
+            &r.rev == head && matches!(&r.outcome, Outcome::Ahead { deployed: d } if *d == deployed)
+        });
+        if !recorded {
+            tracing::info!(
+                head = head.short(),
+                deployed = deployed.short(),
+                "this node runs ahead of its branch; holding, not downgrading"
+            );
+            if let Err(e) = self.record(
+                chain,
+                env,
+                head.clone(),
+                Outcome::Ahead {
+                    deployed: deployed.clone(),
+                },
+            ) {
+                tracing::warn!(error = %e, "could not record the ahead receipt (holding anyway)");
+            }
+        }
+        Some(TickOutcome::Ahead {
+            head: head.clone(),
+            deployed,
+        })
+    }
+
     /// Append `outcome` for `rev` to `chain` and persist. Returns the
     /// persist result so the caller can distinguish a durable receipt
     /// (safe to report Deployed + idle) from a persist failure (the chain
@@ -1788,6 +1864,14 @@ mod tests {
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
             build_newer_after_deferral: true,
+            hold_when_ahead: false,
+        }
+    }
+
+    fn cfg_holding_ahead() -> LoopConfig {
+        LoopConfig {
+            hold_when_ahead: true,
+            ..cfg()
         }
     }
 
@@ -2402,6 +2486,109 @@ mod tests {
         ));
     }
 
+    fn seed_chain(env: &MockEnv, entries: Vec<(Rev, Outcome)>) {
+        let mut chain = ReceiptChain::new();
+        for (i, (r, o)) in entries.into_iter().enumerate() {
+            let receipt = chain.next_receipt(r, o, i as u64);
+            chain.append(receipt).unwrap();
+        }
+        env.persist_chain(&chain).unwrap();
+    }
+
+    fn cid_chain(env: &MockEnv) {
+        seed_chain(
+            env,
+            vec![
+                (rev(2), Outcome::Activated { generation: Generation(7) }),
+                (rev(1), Outcome::failed("checks failed on the older tree")),
+                (rev(1), Outcome::failed("checks failed on the older tree")),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_head_behind_the_running_rev_holds_instead_of_downgrading() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        cid_chain(&env);
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg_holding_ahead());
+
+        let out = s.tick(&env);
+        assert_eq!(
+            out,
+            TickOutcome::Ahead {
+                head: rev(1),
+                deployed: rev(2)
+            }
+        );
+        assert!(env.builds.borrow().is_empty(), "an older HEAD must not be built");
+        assert!(env.switches.borrow().is_empty(), "an older HEAD must not be activated");
+        assert_eq!(*env.ancestry_queries.borrow(), vec![(rev(1), rev(2))]);
+        let chain = env.chain();
+        assert!(matches!(
+            &chain.head().unwrap().outcome,
+            Outcome::Ahead { deployed } if *deployed == rev(2)
+        ));
+        assert_eq!(chain.consecutive_failures(), 0, "holding ends the failure streak");
+        assert_eq!(chain.last_activated_rev(), Some(&rev(2)), "the node still runs rev(2)");
+        let beat = env.heartbeats.borrow().last().cloned().unwrap();
+        assert_eq!(beat.outcome, "ahead");
+        assert_eq!(beat.phase, Phase::Resolved);
+        assert_eq!(beat.head_rev, Some(rev(1)));
+        assert_eq!(s.state(), &State::Idle);
+
+        let len = chain.len();
+        assert_eq!(s.tick(&env).kind(), "ahead");
+        assert_eq!(env.chain().len(), len, "one receipt per (HEAD, deployed) pair");
+        assert_eq!(env.ancestry_queries.borrow().len(), 1, "ancestry of a pair is asked once");
+        assert!(env.builds.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_head_that_descends_from_the_running_rev_deploys() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(3))), Ok(Some(rev(3)))]);
+        seed_chain(&env, vec![(rev(2), Outcome::Activated { generation: Generation(7) })]);
+        env.set_ancestry_result(Ok(false));
+        let mut s = Sentinela::new(cfg_holding_ahead());
+        assert_eq!(s.tick(&env).kind(), "deployed");
+        assert_eq!(*env.switches.borrow(), vec![rev(3)]);
+        assert_eq!(*env.ancestry_queries.borrow(), vec![(rev(3), rev(2))]);
+    }
+
+    #[test]
+    fn a_diverged_or_unanswerable_head_behaves_as_before() {
+        for answer in [
+            Ok(false),
+            Err(EnvError::AncestryFailed("not a valid commit name".to_owned())),
+        ] {
+            let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+            cid_chain(&env);
+            env.set_ancestry_result(answer.clone());
+            let mut s = Sentinela::new(cfg_holding_ahead());
+            assert_eq!(
+                s.tick(&env),
+                TickOutcome::Deployed {
+                    rev: rev(1),
+                    generation: Generation(1)
+                },
+                "ancestry {answer:?} must not hold"
+            );
+            assert_eq!(*env.builds.borrow(), vec![rev(1)]);
+        }
+    }
+
+    #[test]
+    fn the_off_switch_restores_building_an_older_head() {
+        let env = MockEnv::with_probes(vec![Ok(Some(rev(1))), Ok(Some(rev(1)))]);
+        cid_chain(&env);
+        env.set_ancestry_result(Ok(true));
+        let mut s = Sentinela::new(cfg());
+        assert_eq!(s.tick(&env).kind(), "deployed");
+        assert_eq!(*env.switches.borrow(), vec![rev(1)]);
+        assert!(env.ancestry_queries.borrow().is_empty(), "off asks nothing");
+        assert!(LoopConfig::default().hold_when_ahead, "on by default");
+    }
+
     #[test]
     fn unresolvable_head_deploys_nothing_no_cooldown() {
         let env = MockEnv::with_probes(vec![Ok(None)]);
@@ -2871,6 +3058,7 @@ mod tests {
                 Outcome::Verified { .. } => "verified",
                 Outcome::RolledBack { .. } => "rolledBack",
                 Outcome::BusyOverridden { .. } => "busyOverridden",
+                Outcome::Ahead { .. } => "ahead",
             })
             .collect()
     }

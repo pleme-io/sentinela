@@ -602,6 +602,11 @@ fn log_outcome(outcome: &TickOutcome) {
             );
         }
         TickOutcome::Unchanged { rev } => tracing::debug!(rev = rev.short(), "unchanged"),
+        TickOutcome::Ahead { head, deployed } => tracing::debug!(
+            head = head.short(),
+            deployed = deployed.short(),
+            "ahead of the branch; holding"
+        ),
         TickOutcome::Deferred { built, newer } => {
             tracing::info!(
                 built = built.short(),
@@ -1630,8 +1635,10 @@ impl std::fmt::Display for StatusView<'_> {
         let deployed = v.get("last_activated_rev").and_then(serde_json::Value::as_str);
         let head = v.get("head_rev").and_then(serde_json::Value::as_str);
         writeln!(f, "    {:<11} {}", "deployed", deployed.map_or("— never activated".to_owned(), |r| short(r).to_owned()))?;
+        let ahead = v.get("last_tick_outcome").and_then(serde_json::Value::as_str) == Some("ahead");
         match (deployed, head) {
             (Some(d), Some(h)) if d == h => writeln!(f, "    {:<11} {}  {}", "head", short(h), paint("(in sync)", "32"))?,
+            (Some(_), Some(h)) if ahead => writeln!(f, "    {:<11} {}  {}", "head", short(h), paint("→ AHEAD: this node runs past its branch; holding", "36;1"))?,
             (_, Some(h)) => writeln!(f, "    {:<11} {}  {}", "head", short(h), paint("← BEHIND", "33;1"))?,
             (_, None) => writeln!(f, "    {:<11} {}", "head", paint("— the last tick resolved no branch head", "33"))?,
         }

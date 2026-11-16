@@ -695,11 +695,6 @@ impl GitopsEnv for RealEnv {
             // URL is clean, an unauthenticated lazy fetch against a private
             // repo would exit non-0/1 → AncestryFailed → both starvation
             // escapes down, silently.
-            //
-            // Tier-honest: I could not construct a case that actually
-            // lazy-fetches (`--is-ancestor` walks commits, and blob:none
-            // keeps every commit and tree), so this is a guard against an
-            // INFERRED path, not an observed one. It costs one env var.
             self.apply_git_auth(&mut c);c }, EnvError::AncestryFailed)?;
         match out.status.code() {
             Some(0) => Ok(true),
@@ -2244,6 +2239,54 @@ mod tests {
         } else {
             assert!(matches!(emb.driver().map(|d| d.name()), Err(EnvError::ToolMissing { .. })));
         }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                "-c", "init.defaultBranch=main", "-c", "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn ancestry_is_answerable_for_a_rev_off_the_tracked_branch() {
+        let _fork_free = fork_free();
+        let d = tempfile::tempdir().unwrap();
+        let remote = d.path().join("remote");
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        git_in(&remote, &["init", "-q"]);
+        git_in(&remote, &["commit", "-q", "--no-verify", "--allow-empty", "-m", "promoted tip"]);
+        let a = Rev::parse(&git_in(&remote, &["rev-parse", "HEAD"])).unwrap();
+        git_in(&remote, &["branch", "promoted"]);
+        let env = RealEnv::new(SentinelaConfig {
+            state_dir: state.to_string_lossy().into_owned(),
+            rev_probe: sentinela_config::RevProbeConfig {
+                git_url: ["file://", &remote.to_string_lossy()].concat(),
+                branch: "promoted".to_owned(),
+                token_file: None,
+            },
+            ..SentinelaConfig::default()
+        });
+        assert_eq!(env.is_ancestor(&a, &a), Ok(true), "setup: the mirror exists");
+
+        git_in(&remote, &["commit", "-q", "--no-verify", "--allow-empty", "-m", "main moves past promoted"]);
+        let b = Rev::parse(&git_in(&remote, &["rev-parse", "HEAD"])).unwrap();
+        assert_eq!(
+            env.is_ancestor(&a, &b),
+            Ok(true),
+            "the tracked branch is behind a rev activated from main"
+        );
+        assert_eq!(env.is_ancestor(&b, &a), Ok(false));
     }
 
     fn env_with_state(dir: &std::path::Path) -> RealEnv {

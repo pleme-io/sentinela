@@ -306,6 +306,7 @@ pub struct SentinelaConfig {
     pub head_quiet_max_seconds: u64,
     /// See `sentinela_core::LoopConfig::build_newer_after_deferral`.
     pub build_newer_after_deferral: bool,
+    pub hold_when_ahead: bool,
     /// Consecutive deferrals before the loop's health reads STARVED; fewer
     /// read as deferring. `0` and `1` call every deferral starved.
     pub starved_after_deferrals: usize,
@@ -858,6 +859,7 @@ impl SentinelaConfig {
             head_quiet_seconds: self.head_quiet_seconds,
             head_quiet_max_seconds: self.head_quiet_max_seconds,
             build_newer_after_deferral: self.build_newer_after_deferral,
+            hold_when_ahead: self.hold_when_ahead,
         }
     }
 
@@ -906,6 +908,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
             build_newer_after_deferral: false,
+            hold_when_ahead: false,
             starved_after_deferrals: 0,
             build_timeout_seconds: 0,
             build_silence_seconds: 0,
@@ -944,6 +947,7 @@ impl shikumi::TieredConfig for SentinelaConfig {
             head_quiet_seconds: DEFAULT_HEAD_QUIET_SECONDS,
             head_quiet_max_seconds: DEFAULT_HEAD_QUIET_MAX_SECONDS,
             build_newer_after_deferral: true,
+            hold_when_ahead: true,
             starved_after_deferrals: DEFAULT_STARVED_AFTER_DEFERRALS,
             build_timeout_seconds: DEFAULT_BUILD_TIMEOUT_SECONDS,
             build_silence_seconds: DEFAULT_BUILD_SILENCE_SECONDS,
@@ -1109,6 +1113,16 @@ mod tests {
     }
 
     #[test]
+    fn hold_when_ahead_is_on_by_default_and_the_off_switch_reaches_the_loop() {
+        assert!(SentinelaConfig::prescribed_default().loop_config().hold_when_ahead);
+        let absent: SentinelaConfig = serde_yaml::from_str(r#"{"head_quiet_seconds":600}"#).unwrap();
+        assert!(absent.loop_config().hold_when_ahead);
+        let off: SentinelaConfig = serde_yaml::from_str(r#"{"hold_when_ahead":false}"#).unwrap();
+        assert!(!off.loop_config().hold_when_ahead);
+        assert!(!SentinelaConfig::bare().loop_config().hold_when_ahead);
+    }
+
+    #[test]
     fn yaml_roundtrips_and_rejects_unknown_fields() {
         let cfg = SentinelaConfig {
             flake_url: "github:pleme-io/nix".to_owned(),
@@ -1127,6 +1141,7 @@ mod tests {
             head_quiet_seconds: 600,
             head_quiet_max_seconds: 3600,
             build_newer_after_deferral: true,
+            hold_when_ahead: true,
             starved_after_deferrals: 2,
             build_timeout_seconds: 5400,
             build_silence_seconds: 1800,

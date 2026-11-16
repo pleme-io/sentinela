@@ -81,6 +81,7 @@ pub enum Outcome {
         reading: crate::busy::BusyReading,
         waited_ms: u64,
     },
+    Ahead { deployed: Rev },
 }
 
 impl Outcome {
@@ -106,6 +107,7 @@ impl Outcome {
             // survive it. A failure — the DEGRADED banner and the gate must
             // both say this node is not tracking the branch.
             Self::Failed { .. } | Self::RolledBack { .. } => Health::Broken,
+            Self::Ahead { .. } => Health::Held,
         }
     }
 
@@ -242,6 +244,7 @@ pub enum Health {
     Benign,
     /// The loop tried to converge and could not.
     Broken,
+    Held,
 }
 
 /// An append-only, verifiable chain of deploy receipts.
@@ -306,7 +309,8 @@ impl ReceiptChain {
                 | Outcome::Deferred { .. }
                 | Outcome::Probation { .. }
                 | Outcome::Verified { .. }
-                | Outcome::BusyOverridden { .. } => {}
+                | Outcome::BusyOverridden { .. }
+                | Outcome::Ahead { .. } => {}
             }
         }
         None
@@ -337,7 +341,8 @@ impl ReceiptChain {
             | Outcome::Deferred { .. }
             | Outcome::Probation { .. }
             | Outcome::Verified { .. }
-            | Outcome::BusyOverridden { .. } => None,
+            | Outcome::BusyOverridden { .. }
+            | Outcome::Ahead { .. } => None,
         }
     }
 
@@ -383,7 +388,7 @@ impl ReceiptChain {
                 Health::Benign => return Some(&r.rev),
                 // Reached what this node is already running; anything older
                 // is backwards for us.
-                Health::Converged => return None,
+                Health::Converged | Health::Held => return None,
                 // A failure says nothing about older revs — keep looking.
                 Health::Broken => {}
             }
@@ -418,7 +423,7 @@ impl ReceiptChain {
         let mut broken = 0;
         for r in self.entries.iter().rev() {
             match r.health() {
-                Health::Converged => break,
+                Health::Converged | Health::Held => break,
                 Health::Broken => broken += 1,
                 Health::Benign => {}
             }
@@ -454,7 +459,7 @@ impl ReceiptChain {
         for r in self.entries.iter().rev() {
             match r.health() {
                 Health::Benign => benign += 1,
-                Health::Converged | Health::Broken => break,
+                Health::Converged | Health::Broken | Health::Held => break,
             }
         }
         benign

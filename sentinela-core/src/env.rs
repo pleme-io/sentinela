@@ -322,6 +322,7 @@ pub struct LoopConfig {
     /// HEAD that superseded the build is built on the next tick rather than
     /// after a fresh `head_quiet_seconds`. `false` makes every HEAD wait.
     pub build_newer_after_deferral: bool,
+    pub hold_when_ahead: bool,
 }
 
 impl Default for LoopConfig {
@@ -348,6 +349,7 @@ impl Default for LoopConfig {
             head_quiet_seconds: 0,
             head_quiet_max_seconds: 0,
             build_newer_after_deferral: true,
+            hold_when_ahead: true,
         }
     }
 }
